@@ -3,7 +3,7 @@ name = "pipt"
 version = "0.1.0"
 description = "Prefect scaffolding for automated pentest pipelines — raw-on-disk + light SQLite projection."
 requires-python = ">=3.11"
-dependencies = ["prefect>=3.0"]
+dependencies = ["prefect>=3.0", "fastapi<0.137"]
 
 [project.scripts]
 pipt = "pipt.cli:main"
