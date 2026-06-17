@@ -44,9 +44,29 @@ def ingest_services(conn: sqlite3.Connection, records: list[dict]) -> None:
         )
 
 
+def ingest_hypotheses(conn: sqlite3.Connection, records: list[dict]) -> None:
+    for r in records:
+        service_id = None
+        key = r.get("service_key")
+        if key:
+            ip, _, port = key.rpartition(":")
+            service_id = db.service_id_by_ip_port(conn, ip, int(port))
+        db.insert_hypothesis(
+            conn,
+            title=r["title"],
+            service_id=service_id,
+            subject=r.get("subject"),
+            rationale=r.get("rationale"),
+            technique=r.get("technique"),
+            confidence=r.get("confidence"),
+            source=r.get("source"),
+        )
+
+
 CORE_HANDLERS: dict[str, Handler] = {
     "hosts": ingest_hosts,
     "services": ingest_services,
+    "hypotheses": ingest_hypotheses,
 }
 
 

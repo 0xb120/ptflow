@@ -3,7 +3,10 @@ name = "pipt"
 version = "0.1.0"
 description = "Prefect scaffolding for automated pentest pipelines — raw-on-disk + light SQLite projection."
 requires-python = ">=3.11"
-dependencies = ["prefect>=3.0", "fastapi<0.137"]
+dependencies = [
+    "prefect>=3.0",
+    "fastapi<0.137",  # Prefect 3.7.x ephemeral server crashes with FastAPI 0.137+ (del router.routes)
+]
 
 [project.scripts]
 pipt = "pipt.cli:main"

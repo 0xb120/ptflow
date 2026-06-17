@@ -1,18 +1,24 @@
 # src/pipt/core/agent.py
 """Vuln/exploitation hypothesis stage — seam + stub provider.
 
-Input: inventory queried from the DB. Output: rows in `hypothesis`. The real
-Claude-backed provider is a future drop-in behind HypothesisProvider.
+Input: inventory queried from the DB. Output: a raw JSONL artifact (role
+'hypotheses') keyed by the service NATURAL key (ip:port). The serialized ingest
+projects this into the `hypothesis` table, so a rebuild from raw reproduces it
+faithfully.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from pipt.core import db
+from pipt.core import db, workspace
+
+if TYPE_CHECKING:
+    from pipt.core.paths import Engagement
 
 
 @dataclass(frozen=True)
@@ -61,20 +67,34 @@ class StubProvider:
 
 def propose_hypotheses(
     conn: sqlite3.Connection,
+    eng: Engagement,
     provider: HypothesisProvider | None = None,
 ) -> int:
+    """Read inventory from the DB, ask the provider for drafts, and persist them
+    to a raw JSONL artifact (role 'hypotheses') keyed by the service NATURAL key
+    (ip:port), NOT the surrogate id. The serialized ingest projects this into the
+    `hypothesis` table, so a rebuild from raw reproduces it faithfully.
+    Returns the number of drafts written.
+    """
     prov = provider or StubProvider()
-    drafts = prov.propose(db.list_hosts(conn), db.list_services(conn))
-    for d in drafts:
-        db.insert_hypothesis(
-            conn,
-            title=d.title,
-            service_id=d.service_id,
-            subject=d.subject,
-            rationale=d.rationale,
-            technique=d.technique,
-            confidence=d.confidence,
-            source=prov.name,
-        )
-    conn.commit()
-    return len(drafts)
+    services = db.list_services(conn)
+    id_to_key = {s["id"]: f'{s["ip"]}:{s["port"]}' for s in services}
+    drafts = prov.propose(db.list_hosts(conn), services)
+    records = [
+        {
+            "title": d.title,
+            "service_key": id_to_key.get(d.service_id) if d.service_id is not None else None,
+            "subject": d.subject,
+            "rationale": d.rationale,
+            "technique": d.technique,
+            "confidence": d.confidence,
+            "source": prov.name,
+        }
+        for d in drafts
+    ]
+    out = eng.surface_canonical("hypotheses.jsonl")
+    out.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    workspace.record(
+        eng.surface_manifest, role="hypotheses", path=out, tool=prov.name, inputs="db:service,host"
+    )
+    return len(records)

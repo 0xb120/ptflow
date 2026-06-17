@@ -104,8 +104,9 @@ def orchestrate(
     for ws in eng.list_targets():
         ingest.ingest_manifest(conn, ws.manifest, handlers)
 
-    # 4. Agent stage (terminal)
-    propose_hypotheses(conn, pipeline.provider())
+    # 4. Agent stage (terminal): propose hypotheses -> raw, then project via ingest.
+    propose_hypotheses(conn, eng, pipeline.provider())
+    ingest.ingest_manifest(conn, eng.surface_manifest, handlers)
 
     conn.close()
     return eng.base

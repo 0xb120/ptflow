@@ -87,6 +87,11 @@ def target_id_by_tid(conn: sqlite3.Connection, tid: str) -> int | None:
     return row[0] if row is not None else None
 
 
+def service_id_by_ip_port(conn: sqlite3.Connection, ip: str, port: int) -> int | None:
+    row = conn.execute("SELECT id FROM service WHERE ip=? AND port=?", (ip, port)).fetchone()
+    return row[0] if row is not None else None
+
+
 def link_host_target(conn: sqlite3.Connection, host_id: int, target_id: int) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO host_target(host_id, target_id) VALUES(?,?)",

@@ -31,12 +31,17 @@ def test_rebuild_db_matches_run(tmp_path):
     root = str(tmp_path / "scans")
     base = orchestrate(load_pipeline("example"), "demo", str(scope_file), root=root)
     conn = db.connect(base / "db" / "engagement.db")
-    before = conn.execute("SELECT COUNT(*) FROM service").fetchone()[0]
+    before_service = conn.execute("SELECT COUNT(*) FROM service").fetchone()[0]
+    before_hypothesis = conn.execute("SELECT COUNT(*) FROM hypothesis").fetchone()[0]
     conn.close()
+
     rebuild_db("demo", root=root, pipeline_name="example")
     conn = db.connect(base / "db" / "engagement.db")
-    after = conn.execute("SELECT COUNT(*) FROM service").fetchone()[0]
-    assert after == before
+    after_service = conn.execute("SELECT COUNT(*) FROM service").fetchone()[0]
+    after_hypothesis = conn.execute("SELECT COUNT(*) FROM hypothesis").fetchone()[0]
+    assert after_service == before_service
+    assert after_hypothesis == before_hypothesis
+    assert after_hypothesis >= 1
 
 
 def test_cli_run_and_ingest(tmp_path):

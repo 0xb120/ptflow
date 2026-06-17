@@ -31,6 +31,8 @@ def classify(token: str) -> str:
     return "domain"
 
 
+# TODO(domain): normalize() keeps :port in URL hosts; _IP/_CIDR don't validate  # noqa: TD003,FIX002
+# octet ranges. Acceptable for the stub scaffolding; tighten when wiring a real toolset.
 def normalize(token: str, kind: str) -> str:
     t = token.strip().lower()
     if kind == "url":
