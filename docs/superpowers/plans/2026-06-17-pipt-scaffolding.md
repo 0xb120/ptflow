@@ -2011,8 +2011,8 @@ def test_orchestrate_end_to_end(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM host").fetchone()[0] == 4
     assert conn.execute("SELECT COUNT(*) FROM service").fetchone()[0] >= 1
     assert conn.execute("SELECT COUNT(*) FROM hypothesis").fetchone()[0] >= 1
-    # extension table exists
-    conn.execute("SELECT COUNT(*) FROM example_note")
+    # extension table exists and is queryable (created by the pipeline's schema.sql)
+    assert conn.execute("SELECT COUNT(*) FROM example_note").fetchone()[0] == 0
 
 
 def test_rebuild_db_matches_run(tmp_path):
