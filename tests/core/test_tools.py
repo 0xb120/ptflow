@@ -30,3 +30,19 @@ def test_require_raises_for_missing_tool():
 
     with pytest.raises(tools.ToolNotFoundError):
         tools.require("definitely-not-a-real-binary-xyz")
+
+
+def test_pipe_single_stage_stdin():
+    out = tools.pipe([["sort", "-u"]], stdin="b\na\nb\n")
+    assert out.splitlines() == ["a", "b"]
+
+
+def test_pipe_multi_stage_stdin():
+    out = tools.pipe([["cat"], ["sort", "-u"]], stdin="b\na\nb\n")
+    assert out.splitlines() == ["a", "b"]
+
+
+def test_read_lines_strips(tmp_path):
+    p = tmp_path / "f.txt"
+    p.write_text("  a  \n\n b\n")
+    assert tools.read_lines(p) == ["a", "b"]

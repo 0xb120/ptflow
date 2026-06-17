@@ -63,7 +63,14 @@ def pipe(stages: Sequence[Command], *, stdin: str | None = None) -> str:
         if prev.stdout is not None:
             prev.stdout.close()
         procs.append(nxt)
-    out, _ = procs[-1].communicate(input=stdin.encode() if stdin is not None else None)
+    # Feed stdin to the FIRST process (works for single- AND multi-stage):
+    # communicate(input=) can't target the last process because its stdin is
+    # the prior stage's stdout, not a PIPE. Inputs here are small (host/scope
+    # lists), so write+close before draining the tail is safe.
+    if stdin is not None and first.stdin is not None:
+        first.stdin.write(stdin.encode())
+        first.stdin.close()
+    out, _ = procs[-1].communicate()
     for p in procs[:-1]:
         p.wait()
     return out.decode(errors="replace")
@@ -83,7 +90,7 @@ def dedupe(lines: Iterable[str]) -> list[str]:
 def read_lines(path: Path) -> list[str]:
     if not path.exists():
         return []
-    return [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
 
 def write_lines(path: Path, lines: Iterable[str]) -> int:
