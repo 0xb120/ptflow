@@ -1,0 +1,32 @@
+[project]
+name = "pipt"
+version = "0.1.0"
+description = "Prefect scaffolding for automated pentest pipelines — raw-on-disk + light SQLite projection."
+requires-python = ">=3.11"
+dependencies = ["prefect>=3.0"]
+
+[project.scripts]
+pipt = "pipt.cli:main"
+
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [{ include-group = "lint" }, { include-group = "test" }]
+lint = ["ruff", "ty"]
+test = ["pytest", "pytest-cov"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["D", "COM812", "ISC001", "S603", "S607", "TC001", "TC003", "ERA001", "ANN401", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "ANN", "INP001", "PLR2004", "PLC0415"]
+
+[tool.ty.environment]
+python-version = "3.11"
