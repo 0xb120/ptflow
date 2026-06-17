@@ -41,7 +41,7 @@ def discover(eng: Engagement, targets: list[Target]) -> None:
 
 def enum(eng: Engagement, target: Target) -> None:
     """DEPTH stub: 'fingerprint' each assigned host into a service row."""
-    ws = eng.target(target.tid)
+    ws = eng.target(target.tid).ensure()
     hosts = tools.read_lines(ws.canonical("hosts.txt"))
     records = [
         {

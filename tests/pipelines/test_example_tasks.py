@@ -14,6 +14,7 @@ def test_discover_writes_hosts_jsonl(tmp_path):
     names = {r["name"] for r in records}
     assert names == {"example.com", "www.example.com"}
     assert all(r["targets"] == ["t_aaa111"] for r in records)
+    assert (eng.surface_raw("discover") / "out.jsonl").exists()
 
 
 def test_enum_reads_hosts_txt_writes_services(tmp_path):
@@ -25,6 +26,7 @@ def test_enum_reads_hosts_txt_writes_services(tmp_path):
     records = [json.loads(ln) for ln in ws.canonical("services.jsonl").read_text().splitlines()]
     assert len(records) == 2
     assert all(r["port"] == 443 for r in records)
+    assert (ws.raw("enum") / "out.jsonl").exists()
 
 
 def test_pipeline_object_shape():
