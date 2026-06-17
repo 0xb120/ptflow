@@ -21,6 +21,13 @@ def test_upsert_target_is_idempotent(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM target").fetchone()[0] == 1
 
 
+def test_target_id_by_tid(tmp_path):
+    conn = _fresh(tmp_path)
+    tid_pk = db.upsert_target(conn, tid="t_aaa111", raw="example.com", kind="domain")
+    assert db.target_id_by_tid(conn, "t_aaa111") == tid_pk
+    assert db.target_id_by_tid(conn, "t_nope00") is None
+
+
 def test_upsert_host_enriches_ip(tmp_path):
     conn = _fresh(tmp_path)
     hid = db.upsert_host(conn, name="a.example.com", source="dns")

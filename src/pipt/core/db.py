@@ -82,6 +82,11 @@ def upsert_service(  # noqa: PLR0913
     return conn.execute("SELECT id FROM service WHERE ip=? AND port=?", (ip, port)).fetchone()[0]
 
 
+def target_id_by_tid(conn: sqlite3.Connection, tid: str) -> int | None:
+    row = conn.execute("SELECT id FROM target WHERE tid=?", (tid,)).fetchone()
+    return row[0] if row is not None else None
+
+
 def link_host_target(conn: sqlite3.Connection, host_id: int, target_id: int) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO host_target(host_id, target_id) VALUES(?,?)",

@@ -26,9 +26,9 @@ def ingest_hosts(conn: sqlite3.Connection, records: list[dict]) -> None:
     for r in records:
         hid = db.upsert_host(conn, name=r["name"], ip=r.get("ip"), source=r.get("source"))
         for tid in r.get("targets", []):
-            row = conn.execute("SELECT id FROM target WHERE tid=?", (tid,)).fetchone()
-            if row is not None:
-                db.link_host_target(conn, hid, row[0])
+            target_pk = db.target_id_by_tid(conn, tid)
+            if target_pk is not None:
+                db.link_host_target(conn, hid, target_pk)
 
 
 def ingest_services(conn: sqlite3.Connection, records: list[dict]) -> None:
