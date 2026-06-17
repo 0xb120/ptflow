@@ -75,7 +75,8 @@ def upsert_service(  # noqa: PLR0913
         "ON CONFLICT(ip, port) DO UPDATE SET "
         "protocol=COALESCE(excluded.protocol, service.protocol), "
         "service=COALESCE(excluded.service, service.service), "
-        "version=COALESCE(excluded.version, service.version)",
+        "version=COALESCE(excluded.version, service.version), "
+        "source=COALESCE(excluded.source, service.source)",
         (ip, port, protocol, service, version, source),
     )
     return conn.execute("SELECT id FROM service WHERE ip=? AND port=?", (ip, port)).fetchone()[0]

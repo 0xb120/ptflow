@@ -36,6 +36,7 @@ def test_upsert_service_unique_per_ip_port(tmp_path):
     s2 = db.upsert_service(conn, ip="10.0.0.1", port=443, version="1.0", source="fingerprintx")
     assert s1 == s2
     assert conn.execute("SELECT version FROM service WHERE id=?", (s1,)).fetchone()["version"] == "1.0"
+    assert conn.execute("SELECT source FROM service WHERE id=?", (s1,)).fetchone()["source"] == "fingerprintx"
 
 
 def test_link_host_target_and_insert_hypothesis(tmp_path):
