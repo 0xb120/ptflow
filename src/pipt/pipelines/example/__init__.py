@@ -1,1 +1,1 @@
-"""Example pipeline module (TBD in Task 12)."""
+"""Minimal example pipeline (stub tools) — exercises the framework end-to-end."""

@@ -7,10 +7,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol
 
-from pipt.core.ingest import Handler
-
 if TYPE_CHECKING:
     from pipt.core.agent import HypothesisProvider
+    from pipt.core.ingest import Handler
 
 
 class Mode(Enum):

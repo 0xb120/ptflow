@@ -1,4 +1,8 @@
-"""Agent and hypothesis provider abstractions (TBD in later task)."""
+"""Temporary stub — the real agent module is built in Task 10.
+
+Exists only so pipt.core.stage can resolve the HypothesisProvider type under
+TYPE_CHECKING before Task 10 lands.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,4 @@ from typing import Protocol
 
 
 class HypothesisProvider(Protocol):
-    """Protocol for hypothesis providers (TBD)."""
-
-    def __call__(self) -> None: ...
+    name: str
