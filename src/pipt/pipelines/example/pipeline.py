@@ -1,21 +1,33 @@
-"""Temporary stub — the real example pipeline is built in Task 12.
-
-Exists only so `ty` can resolve the lazy import in pipt.pipelines.load_pipeline
-and the Pipeline protocol reference. Importing it raises, so a premature
-`load_pipeline("example")` fails loudly instead of returning None.
-"""
+"""The example Pipeline object."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Sequence
+from pathlib import Path
 
-if TYPE_CHECKING:
-    from pipt.core.stage import Pipeline
+from pipt.core.agent import HypothesisProvider, StubProvider
+from pipt.core.ingest import Handler
+from pipt.core.stage import Mode, Stage
+from pipt.pipelines.example import tasks
+
+_SCHEMA = Path(__file__).parent / "schema.sql"
 
 
-def _unbuilt() -> Pipeline:
-    msg = "example pipeline not built yet (replaced in Task 12)"
-    raise NotImplementedError(msg)
+class ExamplePipeline:
+    name = "example"
+    stages: Sequence[Stage] = (
+        Stage(name="discover", mode=Mode.BREADTH, run=tasks.discover, produces=("hosts",)),
+        Stage(name="enum", mode=Mode.DEPTH, run=tasks.enum, produces=("services",)),
+    )
+
+    def extension_schema(self) -> str:
+        return _SCHEMA.read_text(encoding="utf-8")
+
+    def ingest_handlers(self) -> dict[str, Handler]:
+        return {}
+
+    def provider(self) -> HypothesisProvider:
+        return StubProvider()
 
 
-PIPELINE: Pipeline = _unbuilt()
+PIPELINE = ExamplePipeline()
