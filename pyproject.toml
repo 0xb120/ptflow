@@ -1,7 +1,7 @@
 [project]
 name = "pipt"
 version = "0.1.0"
-description = "Prefect scaffolding for automated pentest pipelines — raw-on-disk + light SQLite projection."
+description = "Prefect scaffolding for automated pentest pipelines — files on disk are the only state."
 requires-python = ">=3.11"
 dependencies = [
     "prefect>=3.0",
