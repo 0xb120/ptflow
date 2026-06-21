@@ -1,9 +1,10 @@
 """Real asset_discovery (breadth) — faithful port of scope2surface.sh.
 
-Each external tool writes its raw output to scans/asset_discovery/raw/<tool>/,
-and consolidated results are promoted to fixed canonical names under
-scans/asset_discovery/. Pure transforms (scope split, honeypot filter, unique
-webapp selection) are module-level functions so they can be unit-tested.
+Each tool's output is written ONCE. Intermediate steps that only feed later
+steps go to scans/asset_discovery/raw/<tool>/ (provenance). A tool whose output
+IS a final artifact is written straight to its canonical name — no duplicate raw
+copy. Derived artifacts (unique IPs, honeypots, unique webapps) are computed in
+memory. Pure transforms are module-level so they can be unit-tested.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
 
 log = get_logger()
 
-# --- tunables (mirror scope2surface.sh 1:1; conservative — live infra) ---
+# --- tunables (mirror scope2surface.sh; conservative — live infra) ---
 NAABU_TLS_TOP_PORTS = "1000"
 NAABU_TLS_RATE = "1000"
 NAABU_TLS_CONC = "50"
@@ -38,10 +39,7 @@ HTTPX = str(_HTTPX_BIN) if _HTTPX_BIN.exists() else "httpx"
 
 # --- pure transforms (unit-tested) ---
 def split_scope(targets: list[Target]) -> tuple[list[str], list[str], list[str], list[str]]:
-    """Return (urls, dns_names, wildcards, ips_cidr) from classified targets.
-
-    URL hosts are folded into dns_names (their normalized form is the host).
-    """
+    """Return (urls, dns_names, wildcards, ips_cidr) from classified targets."""
     urls = [t.raw for t in targets if t.kind == "url"]
     dns = [t.normalized for t in targets if t.kind == "domain"]
     dns += [t.normalized for t in targets if t.kind == "url"]
@@ -76,26 +74,24 @@ def _lines(text: str) -> list[str]:
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
 
-def _tool(activity: Activity, tool: str, cmd: list[str], *, stdin: str, label: str) -> str:
-    """Run a tool over `stdin`, persist its raw output, return stdout. No-op on empty input.
+def _run(tool: str, cmd: list[str], *, stdin: str, dest: Path, label: str) -> str:
+    """Run a tool over `stdin`, write its stdout to `dest` exactly once, return stdout.
 
-    Logs one INFO line per invocation (step visibility); in verbose (DEBUG) mode
+    `dest` is either a raw path (intermediate provenance) or a canonical artifact
+    name. No-op on empty input. Logs one INFO line per invocation; in verbose mode
     logs the exact command, streams the tool's stderr live, and dumps its stdout.
     """
     if not stdin.strip():
         log.debug("  · skip %s/%s (no input)", tool, label)
         return ""
-    n_in = len([ln for ln in stdin.splitlines() if ln.strip()])
-    log.info("  → %s (%s) — %d input(s)", tool, label, n_in)
+    log.info("  → %s (%s) — %d input(s)", tool, label, len(_lines(stdin)))
     verbose = log.isEnabledFor(logging.DEBUG)
     if verbose:
         log.debug("    $ %s", shlex.join(cmd))
     out = tools.run(cmd, stdin=stdin, stream_stderr=verbose)
-    raw_dir = activity.asset_discovery_raw(tool)
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    (raw_dir / f"{label}.txt").write_text(out, encoding="utf-8")
-    n_out = len([ln for ln in out.splitlines() if ln.strip()])
-    log.info("    %s (%s) → %d line(s)", tool, label, n_out)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(out, encoding="utf-8")
+    log.info("    %s (%s) → %d line(s) → %s", tool, label, len(_lines(out)), dest.name)
     if verbose and out.strip():
         log.debug("    stdout:\n%s", out.rstrip())
     return out
@@ -109,116 +105,92 @@ def asset_discovery(activity: Activity, targets: list[Target]) -> None:
     tools.write_lines(activity.scope_dns, [*dns, *wildcards])
     tools.write_lines(activity.scope_ip, ips_cidr)
 
-    dns_names: list[str] = list(dns)
-    tlsx_names: list[str] = []
+    def raw(tool: str, label: str) -> Path:
+        return activity.asset_discovery_raw(tool) / f"{label}.txt"
+
+    canon = activity.asset_discovery_canonical
+    dns_names = list(dns)
 
     log.info(" · scope expansion (DNS/TLS/PTR/wildcards)")
-    # expand IPs / CIDRs
     scope_ips = _lines(
-        _tool(activity, "mapcidr", ["mapcidr", "-silent"], stdin="\n".join(ips_cidr), label="expand")
+        _run("mapcidr", ["mapcidr", "-silent"],
+             stdin="\n".join(ips_cidr), dest=raw("mapcidr", "expand"), label="expand")
     ) or ips_cidr
 
-    # TLS-cert harvest from open ports on scope IPs
     naabu_tls = _lines(
-        _tool(
-            activity, "naabu",
-            ["naabu", "-silent", "-top-ports", NAABU_TLS_TOP_PORTS, "-exclude-cdn",
-             "-c", NAABU_TLS_CONC, "-rate", NAABU_TLS_RATE],
-            stdin="\n".join(scope_ips), label="tls_ports",
-        )
+        _run("naabu",
+             ["naabu", "-silent", "-top-ports", NAABU_TLS_TOP_PORTS, "-exclude-cdn",
+              "-c", NAABU_TLS_CONC, "-rate", NAABU_TLS_RATE],
+             stdin="\n".join(scope_ips), dest=raw("naabu", "tls_ports"), label="tls_ports")
     )
-    tls_from_ports = _lines(
-        _tool(activity, "tlsx", ["tlsx", "-san", "-cn", "-silent", "-resp-only"],
-              stdin="\n".join(naabu_tls), label="from_ports")
+    tls_names = _lines(
+        _run("tlsx", ["tlsx", "-san", "-cn", "-silent", "-resp-only"],
+             stdin="\n".join(naabu_tls), dest=canon("tlsx_raw.txt"), label="from_ports")
     )
-    tlsx_names += tls_from_ports
     dns_names += _lines(
-        _tool(activity, "dnsx", ["dnsx", "-silent"], stdin="\n".join(tls_from_ports), label="tls_resolve")
+        _run("dnsx", ["dnsx", "-silent"],
+             stdin="\n".join(tls_names), dest=raw("dnsx", "tls_resolve"), label="tls_resolve")
     )
-
-    # reverse-DNS (PTR) harvest
     dns_names += _lines(
-        _tool(activity, "dnsx", ["dnsx", "-ptr", "-resp-only", "-silent"],
-              stdin="\n".join(scope_ips), label="ptr")
+        _run("dnsx", ["dnsx", "-ptr", "-resp-only", "-silent"],
+             stdin="\n".join(scope_ips), dest=raw("dnsx", "ptr"), label="ptr")
     )
-
-    # wildcard expansion (passive subdomain enum)
     for wc in wildcards:
         dns_names += _lines(
-            _tool(activity, "assetfinder", ["assetfinder", "-subs-only"], stdin=wc, label=wc)
+            _run("assetfinder", ["assetfinder", "-subs-only"],
+                 stdin=wc, dest=raw("assetfinder", wc), label=wc)
         )
     if wildcards:
         dns_names += _lines(
-            _tool(activity, "subfinder", ["subfinder", "-silent"],
-                  stdin="\n".join(wildcards), label="wildcards")
+            _run("subfinder", ["subfinder", "-silent"],
+                 stdin="\n".join(wildcards), dest=raw("subfinder", "wildcards"), label="wildcards")
         )
-
-    tools.write_lines(activity.asset_discovery_canonical("tlsx_raw.txt"), tlsx_names)
 
     log.info(" · resolve subdomains + consolidate IPs")
-    # resolve every candidate name to live subdomains (shuffledns; dnsx fallback)
     all_dns = "\n".join(tools.dedupe(dns_names))
-    resolved = _lines(
-        _tool(activity, "shuffledns",
-              ["shuffledns", "-mode", "resolve", "-r", RESOLVERS, "-silent"],
-              stdin=all_dns, label="resolve")
+    subdomains = _lines(
+        _run("shuffledns",
+             ["shuffledns", "-mode", "resolve", "-r", RESOLVERS, "-silent"],
+             stdin=all_dns, dest=canon("subdomains.txt"), label="resolve")
     )
-    if not resolved:
-        resolved = _lines(
-            _tool(activity, "dnsx", ["dnsx", "-silent"], stdin=all_dns, label="resolve_fallback")
+    if not subdomains:
+        subdomains = _lines(
+            _run("dnsx", ["dnsx", "-silent"],
+                 stdin=all_dns, dest=canon("subdomains.txt"), label="resolve_fallback")
         )
-    subdomains = tools.dedupe(resolved)
-    tools.write_lines(activity.asset_discovery_canonical("subdomains.txt"), subdomains)
 
-    # consolidate unique IPs + domain:ip map
-    a_input = "\n".join([*subdomains, *tlsx_names])
+    a_input = "\n".join([*subdomains, *tls_names])
     resolved_ips = _lines(
-        _tool(activity, "dnsx", ["dnsx", "-a", "-resp-only", "-silent"], stdin=a_input, label="a_responly")
+        _run("dnsx", ["dnsx", "-a", "-resp-only", "-silent"],
+             stdin=a_input, dest=raw("dnsx", "a_responly"), label="a_responly")
     )
     unique_ips = tools.dedupe([*resolved_ips, *scope_ips])
-    tools.write_lines(activity.asset_discovery_canonical("unique_ips.txt"), unique_ips)
-    dmap = _tool(activity, "dnsx", ["dnsx", "-a", "-resp", "-nc", "-silent"], stdin=a_input, label="a_resp")
-    activity.asset_discovery_canonical("domain_ip_map.txt").write_text(dmap, encoding="utf-8")
+    tools.write_lines(canon("unique_ips.txt"), unique_ips)
+    _run("dnsx", ["dnsx", "-a", "-resp", "-nc", "-silent"],
+         stdin=a_input, dest=canon("domain_ip_map.txt"), label="a_resp")
 
     log.info(" · port scan (tiered) + honeypot filter")
-    # tiered port scan + honeypot filter
     naabu_1k = _lines(
-        _tool(activity, "naabu", ["naabu", "-silent", "-top-ports", "1000", "-exclude-cdn"],
-              stdin="\n".join(unique_ips), label="top1k")
+        _run("naabu", ["naabu", "-silent", "-top-ports", "1000", "-exclude-cdn"],
+             stdin="\n".join(unique_ips), dest=canon("naabu_1k.txt"), label="top1k")
     )
-    tools.write_lines(activity.asset_discovery_canonical("naabu_1k.txt"), naabu_1k)
     valid_ips, honeypots = honeypot_split(naabu_1k)
-    tools.write_lines(activity.asset_discovery_canonical("honeypots.txt"), honeypots)
+    tools.write_lines(canon("honeypots.txt"), honeypots)
     naabu_full = _lines(
-        _tool(activity, "naabu", ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn"],
-              stdin="\n".join(valid_ips), label="full")
+        _run("naabu", ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn"],
+             stdin="\n".join(valid_ips), dest=canon("naabu_full.txt"), label="full")
     )
-    tools.write_lines(activity.asset_discovery_canonical("naabu_full.txt"), naabu_full)
 
-    log.info(" · fingerprinting (httpx / fingerprintx / nerva)")
-    # HTTP fingerprinting (httpx) — the rich per-vhost metadata clustering will consume
-    httpx_input = "\n".join(tools.dedupe([*tlsx_names, *subdomains, *naabu_full, *honeypots]))
-    httpx_out = _tool(
-        activity, "httpx",
+    log.info(" · fingerprinting (httpx / nerva)")
+    httpx_input = "\n".join(tools.dedupe([*tls_names, *subdomains, *naabu_full, *honeypots]))
+    httpx_out = _run(
+        "httpx",
         [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
          "-location", "-fr", "-j"],
-        stdin=httpx_input, label="fingerprint",
+        stdin=httpx_input, dest=canon("httpx_full_metadata.jsonl"), label="fingerprint",
     )
-    activity.asset_discovery_canonical("httpx_full_metadata.jsonl").write_text(httpx_out, encoding="utf-8")
+    _run("nerva", ["nerva", "--json"],
+         stdin="\n".join(naabu_full), dest=canon("nerva_full_metadata.jsonl"), label="json")
 
-    # non-HTTP service fingerprinting
-    activity.asset_discovery_canonical("fingerprintx_full_metadata.jsonl").write_text(
-        _tool(activity, "fingerprintx", ["fingerprintx", "--json"],
-              stdin="\n".join(naabu_full), label="json"),
-        encoding="utf-8",
-    )
-    activity.asset_discovery_canonical("nerva_full_metadata.jsonl").write_text(
-        _tool(activity, "nerva", ["nerva", "--json"], stdin="\n".join(naabu_full), label="json"),
-        encoding="utf-8",
-    )
-
-    # unique web applications (dedup by Title+CL+Webserver) — clustering input next round
     httpx_records = [json.loads(ln) for ln in httpx_out.splitlines() if ln.strip()]
-    tools.write_lines(
-        activity.asset_discovery_canonical("unique_webapps.txt"), select_unique_webapps(httpx_records)
-    )
+    tools.write_lines(canon("unique_webapps.txt"), select_unique_webapps(httpx_records))
