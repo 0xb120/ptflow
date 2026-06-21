@@ -12,7 +12,6 @@ from pathlib import Path
 from prefect import flow, task
 from prefect.task_runners import ThreadPoolTaskRunner
 
-from pipt.core import scope
 from pipt.core.agent import propose_hypotheses
 from pipt.core.config import CONFIG
 from pipt.core.log import get_logger
@@ -58,16 +57,14 @@ def orchestrate(
     scope_text = Path(scope_file).read_text(encoding="utf-8")
     activity.scope.write_text(scope_text, encoding="utf-8")
     activity.scope_init.write_text(scope_text, encoding="utf-8")
-    targets = scope.parse_scope(scope_text)
-    log.info("▶ pipeline '%s' on '%s' — %d target(s) → %s",
-             pipeline.name, activity_name, len(targets), activity.base)
+    log.info("▶ pipeline '%s' on '%s' → %s", pipeline.name, activity_name, activity.base)
 
     breadth, depth = split_stages(list(pipeline.stages))
 
-    # 1. asset_discovery (breadth): one invocation over the whole scope
+    # 1. breadth phases (asset discovery sub-stages): each reads/writes via disk
     for stage in breadth:
         log.info("▶ breadth stage: %s", stage.name)
-        stage.run(activity, targets)
+        stage.run(activity)
 
     # 2. cluster discovery output into application groups
     log.info("▶ cluster")

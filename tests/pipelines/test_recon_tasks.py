@@ -41,7 +41,20 @@ def test_pipeline_object_shape():
     from pipt.pipelines.recon.pipeline import PIPELINE
 
     assert PIPELINE.name == "recon"
-    assert [s.name for s in PIPELINE.stages] == ["asset_discovery"]
+    assert [s.name for s in PIPELINE.stages] == ["expand", "resolve", "portscan", "fingerprint"]
+
+
+def test_expand_splits_scope_offline(tmp_path):
+    """A domain-only scope invokes no external tools, so expand is testable offline."""
+    from pipt.core import tools
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    act.scope_init.write_text("example.com\nnmap.org\n", encoding="utf-8")
+    tasks.expand(act)
+    assert tools.read_lines(act.scope_urls) == []
+    assert tools.read_lines(act.scope_ip) == []
+    assert sorted(tools.read_lines(act.scope_dns)) == ["example.com", "nmap.org"]
 
 
 def test_cluster_groups_by_signature(tmp_path):

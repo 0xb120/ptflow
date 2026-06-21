@@ -5,11 +5,10 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING
 
-from pipt.core import tools, workspace
+from pipt.core import scope, tools, workspace
 
 if TYPE_CHECKING:
     from pipt.core.paths import Activity
-    from pipt.core.scope import Target
 
 
 def fake_ip(seed: str) -> str:
@@ -21,12 +20,13 @@ def _app_id(signature: str) -> str:
     return hashlib.sha1(signature.encode()).hexdigest()[:12]  # noqa: S324
 
 
-def discover(activity: Activity, targets: list[Target]) -> None:
+def discover(activity: Activity) -> None:
     """BREADTH stub: expand the scope into scope/ and discover hosts.
 
-    Writes scope/scope_{urls,dns,ip}.txt (split by kind) and the canonical
-    asset_discovery/hosts.jsonl (apex + www host per target).
+    Reads the scope from scope/scope_init.txt; writes scope/scope_{urls,dns,ip}.txt
+    (split by kind) and the canonical asset_discovery/hosts.jsonl (apex + www host).
     """
+    targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8"))
     tools.write_lines(activity.scope_urls, [t.raw for t in targets if t.kind == "url"])
     tools.write_lines(
         activity.scope_dns, [t.normalized for t in targets if t.kind in ("domain", "wildcard")]

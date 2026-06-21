@@ -1,19 +1,17 @@
 from pipt.core import tools, workspace
 from pipt.core.paths import Activity
-from pipt.core.scope import Target
 from pipt.pipelines.example import tasks
 
 
-def _targets():
-    return [
-        Target(raw="https://example.com/", kind="url", normalized="example.com", tid="t_a"),
-        Target(raw="nmap.org", kind="domain", normalized="nmap.org", tid="t_b"),
-    ]
+def _activity_with_scope(tmp_path):
+    act = Activity.named("demo", root=tmp_path).ensure()
+    act.scope_init.write_text("https://example.com/\nnmap.org\n", encoding="utf-8")
+    return act
 
 
 def test_discover_writes_scope_split_and_hosts(tmp_path):
-    act = Activity.named("demo", root=tmp_path).ensure()
-    tasks.discover(act, _targets())
+    act = _activity_with_scope(tmp_path)
+    tasks.discover(act)
     assert tools.read_lines(act.scope_urls) == ["https://example.com/"]
     assert tools.read_lines(act.scope_dns) == ["nmap.org"]
     assert tools.read_lines(act.scope_ip) == []
@@ -23,8 +21,8 @@ def test_discover_writes_scope_split_and_hosts(tmp_path):
 
 
 def test_cluster_groups_apex_and_www(tmp_path):
-    act = Activity.named("demo", root=tmp_path).ensure()
-    tasks.discover(act, _targets())
+    act = _activity_with_scope(tmp_path)
+    tasks.discover(act)
     app_ids = tasks.cluster(act)
     assert len(app_ids) == 2
     for app_id in app_ids:

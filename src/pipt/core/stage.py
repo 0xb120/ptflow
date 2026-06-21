@@ -13,12 +13,20 @@ if TYPE_CHECKING:
 
 
 class Mode(Enum):
-    BREADTH = "breadth"   # one invocation over all targets (barrier)
-    DEPTH = "depth"       # per-app-group chain (fan-out)
+    BREADTH = "breadth"   # whole-scope phase, run once in order (barrier)
+    DEPTH = "depth"       # per-app-group phase (fan-out)
 
 
 @dataclass(frozen=True)
 class Stage:
+    """A pipeline phase. Stages communicate only via on-disk artifacts.
+
+    Call convention (the orchestrator follows it):
+      - BREADTH: ``run(activity)`` — reads/writes canonical files; sub-phases of
+        the same pipeline chain through disk (e.g. expand → resolve → portscan).
+      - DEPTH:   ``run(activity, app_id)`` — one fan-out invocation per app group.
+    """
+
     name: str
     mode: Mode
     run: Callable[..., None]

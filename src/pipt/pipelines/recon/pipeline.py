@@ -16,12 +16,13 @@ if TYPE_CHECKING:
 class ReconPipeline:
     name = "recon"
     stages: Sequence[Stage] = (
-        Stage(
-            name="asset_discovery",
-            mode=Mode.BREADTH,
-            run=tasks.asset_discovery,
-            produces=("subdomains", "httpx_metadata", "services"),
-        ),
+        Stage(name="expand", mode=Mode.BREADTH, run=tasks.expand, produces=("scope_dns", "tlsx_raw")),
+        Stage(name="resolve", mode=Mode.BREADTH, run=tasks.resolve,
+              produces=("subdomains", "unique_ips", "domain_ip_map")),
+        Stage(name="portscan", mode=Mode.BREADTH, run=tasks.portscan,
+              produces=("naabu_1k", "honeypots", "naabu_full")),
+        Stage(name="fingerprint", mode=Mode.BREADTH, run=tasks.fingerprint,
+              produces=("httpx_metadata", "nerva_metadata", "unique_webapps")),
     )
 
     def cluster(self, activity: Activity) -> list[str]:

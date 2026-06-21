@@ -17,7 +17,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pipt.core import tools, workspace
+from pipt.core import scope, tools, workspace
 from pipt.core.log import get_logger
 
 if TYPE_CHECKING:
@@ -103,60 +103,73 @@ def _run(tool: str, cmd: list[str], *, stdin: str, dest: Path, label: str) -> st
     return out
 
 
-# --- the breadth stage ---
-def asset_discovery(activity: Activity, targets: list[Target]) -> None:
-    """Expand the scope into the full attack surface (scope2surface.sh port)."""
+# --- breadth sub-phases (each reads/writes via disk → independently rerunnable) ---
+def _raw(activity: Activity, tool: str, label: str) -> Path:
+    return activity.asset_discovery_raw(tool) / f"{label}.txt"
+
+
+def expand(activity: Activity) -> None:
+    """Phase 1 — expand the scope: split by kind, TLS/PTR harvest, wildcard enum.
+
+    Reads scope/scope_init.txt; writes scope/scope_urls.txt, scope/scope_ip.txt
+    (mapcidr-expanded), tlsx_raw.txt, and scope/scope_dns.txt (the full candidate
+    name set that `resolve` consumes).
+    """
+    targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8"))
     urls, dns, wildcards, ips_cidr = split_scope(targets)
     tools.write_lines(activity.scope_urls, urls)
-    tools.write_lines(activity.scope_dns, [*dns, *wildcards])
-    tools.write_lines(activity.scope_ip, ips_cidr)
 
-    def raw(tool: str, label: str) -> Path:
-        return activity.asset_discovery_raw(tool) / f"{label}.txt"
-
-    canon = activity.asset_discovery_canonical
-    dns_names = list(dns)
-
-    log.info(" · scope expansion (DNS/TLS/PTR/wildcards)")
     scope_ips = _lines(
         _run("mapcidr", ["mapcidr", "-silent"],
-             stdin="\n".join(ips_cidr), dest=raw("mapcidr", "expand"), label="expand")
+             stdin="\n".join(ips_cidr), dest=_raw(activity, "mapcidr", "expand"), label="expand")
     ) or ips_cidr
+    tools.write_lines(activity.scope_ip, scope_ips)
 
+    dns_names = list(dns)
     naabu_tls = _lines(
         _run("naabu",
              ["naabu", "-silent", "-top-ports", NAABU_TLS_TOP_PORTS, "-exclude-cdn",
               "-c", NAABU_TLS_CONC, "-rate", NAABU_TLS_RATE],
-             stdin="\n".join(scope_ips), dest=raw("naabu", "tls_ports"), label="tls_ports")
+             stdin="\n".join(scope_ips), dest=_raw(activity, "naabu", "tls_ports"), label="tls_ports")
     )
     tls_names = _lines(
         _run("tlsx", ["tlsx", "-san", "-cn", "-silent", "-resp-only"],
-             stdin="\n".join(naabu_tls), dest=canon("tlsx_raw.txt"), label="from_ports")
+             stdin="\n".join(naabu_tls),
+             dest=activity.asset_discovery_canonical("tlsx_raw.txt"), label="from_ports")
     )
     dns_names += _lines(
         _run("dnsx", ["dnsx", "-silent"],
-             stdin="\n".join(tls_names), dest=raw("dnsx", "tls_resolve"), label="tls_resolve")
+             stdin="\n".join(tls_names), dest=_raw(activity, "dnsx", "tls_resolve"), label="tls_resolve")
     )
     dns_names += _lines(
         _run("dnsx", ["dnsx", "-ptr", "-resp-only", "-silent"],
-             stdin="\n".join(scope_ips), dest=raw("dnsx", "ptr"), label="ptr")
+             stdin="\n".join(scope_ips), dest=_raw(activity, "dnsx", "ptr"), label="ptr")
     )
     for wc in wildcards:
         dns_names += _lines(
             _run("assetfinder", ["assetfinder", "-subs-only"],
-                 stdin=wc, dest=raw("assetfinder", wc), label=wc)
+                 stdin=wc, dest=_raw(activity, "assetfinder", wc), label=wc)
         )
     if wildcards:
         dns_names += _lines(
             _run("subfinder", ["subfinder", "-silent"],
-                 stdin="\n".join(wildcards), dest=raw("subfinder", "wildcards"), label="wildcards")
+                 stdin="\n".join(wildcards), dest=_raw(activity, "subfinder", "wildcards"),
+                 label="wildcards")
         )
 
-    log.info(" · resolve subdomains + consolidate IPs")
-    all_dns = "\n".join(tools.dedupe(dns_names))
+    tools.write_lines(activity.scope_dns, [*dns_names, *wildcards])
+
+
+def resolve(activity: Activity) -> None:
+    """Phase 2 — resolve candidate names to live subdomains; consolidate IPs.
+
+    Reads scope/scope_dns.txt, scope/scope_ip.txt, tlsx_raw.txt; writes
+    subdomains.txt, unique_ips.txt, domain_ip_map.txt.
+    """
+    canon = activity.asset_discovery_canonical
+    all_dns = "\n".join(tools.read_lines(activity.scope_dns))
     subdomains = _lines(
-        _run("shuffledns",
-             ["shuffledns", "-mode", "resolve", "-r", RESOLVERS, "-silent"],
+        _run("shuffledns", ["shuffledns", "-mode", "resolve", "-r", RESOLVERS, "-silent"],
              stdin=all_dns, dest=canon("subdomains.txt"), label="resolve")
     )
     if not subdomains:
@@ -165,29 +178,46 @@ def asset_discovery(activity: Activity, targets: list[Target]) -> None:
                  stdin=all_dns, dest=canon("subdomains.txt"), label="resolve_fallback")
         )
 
+    tls_names = tools.read_lines(canon("tlsx_raw.txt"))
     a_input = "\n".join([*subdomains, *tls_names])
     resolved_ips = _lines(
         _run("dnsx", ["dnsx", "-a", "-resp-only", "-silent"],
-             stdin=a_input, dest=raw("dnsx", "a_responly"), label="a_responly")
+             stdin=a_input, dest=_raw(activity, "dnsx", "a_responly"), label="a_responly")
     )
-    unique_ips = tools.dedupe([*resolved_ips, *scope_ips])
-    tools.write_lines(canon("unique_ips.txt"), unique_ips)
+    tools.write_lines(canon("unique_ips.txt"), [*resolved_ips, *tools.read_lines(activity.scope_ip)])
     _run("dnsx", ["dnsx", "-a", "-resp", "-nc", "-silent"],
          stdin=a_input, dest=canon("domain_ip_map.txt"), label="a_resp")
 
-    log.info(" · port scan (tiered) + honeypot filter")
+
+def portscan(activity: Activity) -> None:
+    """Phase 3 — tiered port scan (1k → honeypot filter → full) on unique IPs.
+
+    Reads unique_ips.txt; writes naabu_1k.txt, honeypots.txt, naabu_full.txt.
+    """
+    canon = activity.asset_discovery_canonical
+    unique_ips = tools.read_lines(canon("unique_ips.txt"))
     naabu_1k = _lines(
         _run("naabu", ["naabu", "-silent", "-top-ports", "1000", "-exclude-cdn"],
              stdin="\n".join(unique_ips), dest=canon("naabu_1k.txt"), label="top1k")
     )
     valid_ips, honeypots = honeypot_split(naabu_1k)
     tools.write_lines(canon("honeypots.txt"), honeypots)
-    naabu_full = _lines(
-        _run("naabu", ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn"],
-             stdin="\n".join(valid_ips), dest=canon("naabu_full.txt"), label="full")
-    )
+    _run("naabu", ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn"],
+         stdin="\n".join(valid_ips), dest=canon("naabu_full.txt"), label="full")
 
-    log.info(" · fingerprinting (httpx / nerva)")
+
+def fingerprint(activity: Activity) -> None:
+    """Phase 4 — httpx + nerva fingerprinting; emit unique webapps.
+
+    Reads tlsx_raw.txt, subdomains.txt, naabu_full.txt, honeypots.txt; writes
+    httpx_full_metadata.jsonl, nerva_full_metadata.jsonl, unique_webapps.txt.
+    """
+    canon = activity.asset_discovery_canonical
+    tls_names = tools.read_lines(canon("tlsx_raw.txt"))
+    subdomains = tools.read_lines(canon("subdomains.txt"))
+    naabu_full = tools.read_lines(canon("naabu_full.txt"))
+    honeypots = tools.read_lines(canon("honeypots.txt"))
+
     httpx_input = "\n".join(tools.dedupe([*tls_names, *subdomains, *naabu_full, *honeypots]))
     httpx_out = _run(
         "httpx",
