@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 
+from pipt.core.log import setup_logging
 from pipt.core.orchestrator import orchestrate
 from pipt.pipelines import load_pipeline
 
@@ -17,10 +18,15 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("activity")
     run.add_argument("scope")
     run.add_argument("--root", default=None, help="parent dir for the activity (default: cwd)")
+    run.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="show the exact command and full output of every tool invoked",
+    )
 
     args = parser.parse_args(argv)
 
     if args.cmd == "run":
+        setup_logging(verbose=args.verbose)
         base = orchestrate(load_pipeline(args.pipeline), args.activity, args.scope, root=args.root)
         print(base)  # noqa: T201
         return 0

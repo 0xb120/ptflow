@@ -57,3 +57,7 @@ def test_write_then_read_jsonl_roundtrip(tmp_path):
 
 def test_read_jsonl_missing_returns_empty(tmp_path):
     assert tools.read_jsonl(tmp_path / "nope.jsonl") == []
+
+
+def test_run_stream_stderr_returns_stdout():
+    assert tools.run(["printf", "hi"], stream_stderr=True) == "hi"

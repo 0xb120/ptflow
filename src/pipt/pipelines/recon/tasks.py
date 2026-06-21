@@ -9,15 +9,20 @@ webapp selection) are module-level functions so they can be unit-tested.
 from __future__ import annotations
 
 import json
+import logging
+import shlex
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pipt.core import tools
+from pipt.core.log import get_logger
 
 if TYPE_CHECKING:
     from pipt.core.paths import Activity
     from pipt.core.scope import Target
+
+log = get_logger()
 
 # --- tunables (mirror scope2surface.sh 1:1; conservative — live infra) ---
 NAABU_TLS_TOP_PORTS = "1000"
@@ -72,13 +77,27 @@ def _lines(text: str) -> list[str]:
 
 
 def _tool(activity: Activity, tool: str, cmd: list[str], *, stdin: str, label: str) -> str:
-    """Run a tool over `stdin`, persist its raw output, return stdout. No-op on empty input."""
+    """Run a tool over `stdin`, persist its raw output, return stdout. No-op on empty input.
+
+    Logs one INFO line per invocation (step visibility); in verbose (DEBUG) mode
+    logs the exact command, streams the tool's stderr live, and dumps its stdout.
+    """
     if not stdin.strip():
+        log.debug("  · skip %s/%s (no input)", tool, label)
         return ""
-    out = tools.run(cmd, stdin=stdin)
+    n_in = len([ln for ln in stdin.splitlines() if ln.strip()])
+    log.info("  → %s (%s) — %d input(s)", tool, label, n_in)
+    verbose = log.isEnabledFor(logging.DEBUG)
+    if verbose:
+        log.debug("    $ %s", shlex.join(cmd))
+    out = tools.run(cmd, stdin=stdin, stream_stderr=verbose)
     raw_dir = activity.asset_discovery_raw(tool)
     raw_dir.mkdir(parents=True, exist_ok=True)
     (raw_dir / f"{label}.txt").write_text(out, encoding="utf-8")
+    n_out = len([ln for ln in out.splitlines() if ln.strip()])
+    log.info("    %s (%s) → %d line(s)", tool, label, n_out)
+    if verbose and out.strip():
+        log.debug("    stdout:\n%s", out.rstrip())
     return out
 
 
@@ -93,6 +112,7 @@ def asset_discovery(activity: Activity, targets: list[Target]) -> None:
     dns_names: list[str] = list(dns)
     tlsx_names: list[str] = []
 
+    log.info(" · scope expansion (DNS/TLS/PTR/wildcards)")
     # expand IPs / CIDRs
     scope_ips = _lines(
         _tool(activity, "mapcidr", ["mapcidr", "-silent"], stdin="\n".join(ips_cidr), label="expand")
@@ -135,6 +155,7 @@ def asset_discovery(activity: Activity, targets: list[Target]) -> None:
 
     tools.write_lines(activity.asset_discovery_canonical("tlsx_raw.txt"), tlsx_names)
 
+    log.info(" · resolve subdomains + consolidate IPs")
     # resolve every candidate name to live subdomains (shuffledns; dnsx fallback)
     all_dns = "\n".join(tools.dedupe(dns_names))
     resolved = _lines(
@@ -159,6 +180,7 @@ def asset_discovery(activity: Activity, targets: list[Target]) -> None:
     dmap = _tool(activity, "dnsx", ["dnsx", "-a", "-resp", "-nc", "-silent"], stdin=a_input, label="a_resp")
     activity.asset_discovery_canonical("domain_ip_map.txt").write_text(dmap, encoding="utf-8")
 
+    log.info(" · port scan (tiered) + honeypot filter")
     # tiered port scan + honeypot filter
     naabu_1k = _lines(
         _tool(activity, "naabu", ["naabu", "-silent", "-top-ports", "1000", "-exclude-cdn"],
@@ -173,6 +195,7 @@ def asset_discovery(activity: Activity, targets: list[Target]) -> None:
     )
     tools.write_lines(activity.asset_discovery_canonical("naabu_full.txt"), naabu_full)
 
+    log.info(" · fingerprinting (httpx / fingerprintx / nerva)")
     # HTTP fingerprinting (httpx) — the rich per-vhost metadata clustering will consume
     httpx_input = "\n".join(tools.dedupe([*tlsx_names, *subdomains, *naabu_full, *honeypots]))
     httpx_out = _tool(

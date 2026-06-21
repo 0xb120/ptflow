@@ -47,3 +47,9 @@ def test_cli_run(tmp_path):
     root = str(tmp_path / "runs")
     assert main(["run", "example", "acme", str(scope_file), "--root", root]) == 0
     assert (tmp_path / "runs" / "acme" / "findings" / "hypotheses.jsonl").exists()
+
+
+def test_cli_run_verbose(tmp_path):
+    scope_file = _scope(tmp_path)
+    root = str(tmp_path / "runs")
+    assert main(["run", "example", "acme", str(scope_file), "--root", root, "--verbose"]) == 0

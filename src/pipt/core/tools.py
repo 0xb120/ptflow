@@ -22,18 +22,23 @@ def require(*tools: str) -> None:
         raise ToolNotFoundError(msg)
 
 
-def run(
+def run(  # noqa: PLR0913
     cmd: Command,
     *,
     stdin: str | None = None,
     check: bool = False,
     timeout: int | None = None,
     cwd: Path | None = None,
+    stream_stderr: bool = False,
 ) -> str:
+    """Run a command, return stdout. When `stream_stderr` is set, the tool's
+    stderr is inherited (printed live to the terminal) instead of suppressed —
+    used by verbose mode to surface tool progress/logs."""
     proc = subprocess.run(
         list(cmd),
         input=stdin,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=None if stream_stderr else subprocess.DEVNULL,
         text=True,
         check=check,
         timeout=timeout,

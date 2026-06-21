@@ -15,9 +15,12 @@ from prefect.task_runners import ThreadPoolTaskRunner
 from pipt.core import scope
 from pipt.core.agent import propose_hypotheses
 from pipt.core.config import CONFIG
+from pipt.core.log import get_logger
 from pipt.core.paths import Activity
 from pipt.core.stage import Mode, Pipeline, Stage
 from pipt.pipelines import load_pipeline
+
+log = get_logger()
 
 
 def split_stages(stages: list[Stage]) -> tuple[list[Stage], list[Stage]]:
@@ -56,20 +59,30 @@ def orchestrate(
     activity.scope.write_text(scope_text, encoding="utf-8")
     activity.scope_init.write_text(scope_text, encoding="utf-8")
     targets = scope.parse_scope(scope_text)
+    log.info("▶ pipeline '%s' on '%s' — %d target(s) → %s",
+             pipeline.name, activity_name, len(targets), activity.base)
 
-    breadth, _ = split_stages(list(pipeline.stages))
+    breadth, depth = split_stages(list(pipeline.stages))
 
     # 1. asset_discovery (breadth): one invocation over the whole scope
     for stage in breadth:
+        log.info("▶ breadth stage: %s", stage.name)
         stage.run(activity, targets)
 
     # 2. cluster discovery output into application groups
+    log.info("▶ cluster")
     app_ids = pipeline.cluster(activity)
+    log.info("  → %d application group(s)", len(app_ids))
 
     # 3. depth fan-out per app group (Prefect)
-    _depth_flow(pipeline.name, activity_name, root, app_ids)
+    if app_ids and depth:
+        log.info("▶ depth (%s) over %d group(s)", ", ".join(s.name for s in depth), len(app_ids))
+        _depth_flow(pipeline.name, activity_name, root, app_ids)
 
     # 4. agent stage (terminal): file-based hypotheses -> findings/
-    propose_hypotheses(activity, pipeline.provider())
+    log.info("▶ agent")
+    n = propose_hypotheses(activity, pipeline.provider())
+    log.info("  → %d hypothesis(es)", n)
 
+    log.info("✓ done → %s", activity.base)
     return activity.base
