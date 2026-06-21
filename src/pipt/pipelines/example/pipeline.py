@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from pipt.core.agent import HypothesisProvider, StubProvider
-from pipt.core.stage import Mode, Stage
+from pipt.core.stage import Stage
 from pipt.pipelines.example import tasks
 
 if TYPE_CHECKING:
@@ -16,8 +16,8 @@ if TYPE_CHECKING:
 class ExamplePipeline:
     name = "example"
     stages: Sequence[Stage] = (
-        Stage(name="discover", mode=Mode.BREADTH, run=tasks.discover, produces=("hosts",)),
-        Stage(name="enum", mode=Mode.DEPTH, run=tasks.enum, produces=("services",)),
+        Stage("discover", tasks.discover),          # activity scope
+        Stage("enum", tasks.enum, per_app=True),    # per app group
     )
 
     def cluster(self, activity: Activity) -> list[str]:

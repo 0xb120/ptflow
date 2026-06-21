@@ -38,18 +38,20 @@ def test_select_unique_webapps_dedups_by_signature():
 
 
 def test_pipeline_object_shape():
-    from pipt.core.stage import Mode
     from pipt.pipelines.recon.pipeline import PIPELINE
 
     assert PIPELINE.name == "recon"
-    assert [s.name for s in PIPELINE.stages] == [
-        "expand", "resolve", "portscan", "fingerprint",  # breadth
-        "passive_probe", "crawl", "subenum", "takeover",  # depth (per app)
-    ]
-    breadth = [s.name for s in PIPELINE.stages if s.mode is Mode.BREADTH]
-    depth = [s.name for s in PIPELINE.stages if s.mode is Mode.DEPTH]
-    assert breadth == ["expand", "resolve", "portscan", "fingerprint"]
-    assert depth == ["passive_probe", "crawl", "subenum", "takeover"]
+    activity = [s.name for s in PIPELINE.stages if not s.per_app]
+    app = [s.name for s in PIPELINE.stages if s.per_app]
+    assert activity == ["expand", "resolve", "portscan", "httpx", "nerva"]
+    assert app == ["passive_probe", "crawl", "subenum", "takeover"]
+    by_name = {s.name: s for s in PIPELINE.stages}
+    # httpx ∥ nerva (both depend only on portscan, not on each other)
+    assert by_name["httpx"].needs == ("portscan",)
+    assert by_name["nerva"].needs == ("portscan",)
+    # subenum ∥ passive_probe/crawl; takeover waits for both crawl and subenum
+    assert by_name["subenum"].needs == ()
+    assert set(by_name["takeover"].needs) == {"crawl", "subenum"}
 
 
 def test_depth_pure_helpers():

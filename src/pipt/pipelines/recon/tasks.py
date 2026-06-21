@@ -246,30 +246,34 @@ def portscan(activity: Activity) -> None:
          stdin="\n".join(valid_ips), dest=canon("naabu_full.txt"), label="full")
 
 
-def fingerprint(activity: Activity) -> None:
-    """Phase 4 — httpx + nerva fingerprinting; emit unique webapps.
+def httpx_fingerprint(activity: Activity) -> None:
+    """Phase 4a — HTTP fingerprinting (httpx) → httpx_full_metadata.jsonl + unique_webapps.txt.
 
-    Reads tlsx_raw.txt, subdomains.txt, naabu_full.txt, honeypots.txt; writes
-    httpx_full_metadata.jsonl, nerva_full_metadata.jsonl, unique_webapps.txt.
+    Independent of nerva, so the two fingerprint stages run in parallel.
     """
     canon = activity.asset_discovery_canonical
-    tls_names = tools.read_lines(canon("tlsx_raw.txt"))
-    subdomains = tools.read_lines(canon("subdomains.txt"))
-    naabu_full = tools.read_lines(canon("naabu_full.txt"))
-    honeypots = tools.read_lines(canon("honeypots.txt"))
-
-    httpx_input = "\n".join(tools.dedupe([*tls_names, *subdomains, *naabu_full, *honeypots]))
-    httpx_out = _run(
+    httpx_input = "\n".join(tools.dedupe([
+        *tools.read_lines(canon("tlsx_raw.txt")),
+        *tools.read_lines(canon("subdomains.txt")),
+        *tools.read_lines(canon("naabu_full.txt")),
+        *tools.read_lines(canon("honeypots.txt")),
+    ]))
+    out = _run(
         "httpx",
         [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
          "-location", "-fr", "-j"],
         stdin=httpx_input, dest=canon("httpx_full_metadata.jsonl"), label="fingerprint",
     )
-    _run("nerva", ["nerva", "--json"],
-         stdin="\n".join(naabu_full), dest=canon("nerva_full_metadata.jsonl"), label="json")
+    records = [json.loads(ln) for ln in out.splitlines() if ln.strip()]
+    tools.write_lines(canon("unique_webapps.txt"), select_unique_webapps(records))
 
-    httpx_records = [json.loads(ln) for ln in httpx_out.splitlines() if ln.strip()]
-    tools.write_lines(canon("unique_webapps.txt"), select_unique_webapps(httpx_records))
+
+def nerva_fingerprint(activity: Activity) -> None:
+    """Phase 4b — non-HTTP service fingerprinting (nerva) → nerva_full_metadata.jsonl."""
+    canon = activity.asset_discovery_canonical
+    _run("nerva", ["nerva", "--json"],
+         stdin="\n".join(tools.read_lines(canon("naabu_full.txt"))),
+         dest=canon("nerva_full_metadata.jsonl"), label="json")
 
 
 # --- clustering (surfagr.sh port) ---
