@@ -9,6 +9,7 @@ memory. Pure transforms are module-level so they can be unit-tested.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shlex
@@ -16,7 +17,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pipt.core import tools
+from pipt.core import tools, workspace
 from pipt.core.log import get_logger
 
 if TYPE_CHECKING:
@@ -72,6 +73,11 @@ def select_unique_webapps(httpx_records: list[dict]) -> list[str]:
 # --- helpers ---
 def _lines(text: str) -> list[str]:
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+
+def _app_id(signature: str) -> str:
+    """Stable app id from the cluster identity (NOT a mutable host/title string)."""
+    return hashlib.sha1(signature.encode()).hexdigest()[:12]  # noqa: S324
 
 
 def _run(tool: str, cmd: list[str], *, stdin: str, dest: Path, label: str) -> str:
@@ -194,3 +200,43 @@ def asset_discovery(activity: Activity, targets: list[Target]) -> None:
 
     httpx_records = [json.loads(ln) for ln in httpx_out.splitlines() if ln.strip()]
     tools.write_lines(canon("unique_webapps.txt"), select_unique_webapps(httpx_records))
+
+
+# --- clustering (surfagr.sh port) ---
+def cluster(activity: Activity) -> list[str]:
+    """Group httpx vhosts by (Title, Content-Length, Webserver) into scans/<app_id>/.
+
+    Port of surfagr.sh. Each distinct signature becomes one application-group
+    workspace with meta.json (identity) + hosts.txt (the group's URLs — the input
+    the per-app enum phase consumes). Returns the sorted app_ids.
+    """
+    records = tools.read_jsonl(activity.asset_discovery_canonical("httpx_full_metadata.jsonl"))
+    groups: dict[str, dict] = {}
+    for r in records:
+        url = r.get("url")
+        if not url:
+            continue
+        signature = f"{r.get('title') or ''}|{r.get('content_length')}|{r.get('webserver') or ''}"
+        group = groups.setdefault(_app_id(signature), {"signature": signature, "rep": r, "urls": []})
+        group["urls"].append(url)
+
+    for app_id, group in groups.items():
+        ws = activity.app(app_id).ensure()
+        rep = group["rep"]
+        members = tools.dedupe(group["urls"])
+        workspace.write_meta(
+            ws.meta,
+            {
+                "app_id": app_id,
+                "signature": group["signature"],
+                "title": rep.get("title"),
+                "webserver": rep.get("webserver"),
+                "content_length": rep.get("content_length"),
+                "status_code": rep.get("status_code"),
+                "tech": rep.get("tech") or [],
+                "hosts": members,
+            },
+        )
+        tools.write_lines(ws.hosts, members)
+        log.info("  → app %s [%s] — %d host(s)", app_id, group["signature"], len(members))
+    return sorted(groups)

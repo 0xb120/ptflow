@@ -24,10 +24,8 @@ class ReconPipeline:
         ),
     )
 
-    def cluster(self, activity: Activity) -> list[str]:  # noqa: ARG002
-        # Clustering (surfagr.sh port: group httpx vhosts by Title + Content-Length
-        # + Webserver into scans/<app_id>/) lands in a later round — no app groups yet.
-        return []
+    def cluster(self, activity: Activity) -> list[str]:
+        return tasks.cluster(activity)
 
     def provider(self) -> HypothesisProvider:
         return StubProvider()

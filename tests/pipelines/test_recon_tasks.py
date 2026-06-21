@@ -42,4 +42,28 @@ def test_pipeline_object_shape():
 
     assert PIPELINE.name == "recon"
     assert [s.name for s in PIPELINE.stages] == ["asset_discovery"]
-    assert PIPELINE.cluster(None) == []  # clustering is next round
+
+
+def test_cluster_groups_by_signature(tmp_path):
+    from pipt.core import tools, workspace
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    tools.write_jsonl(
+        act.asset_discovery_canonical("httpx_full_metadata.jsonl"),
+        [
+            {"url": "https://a.example", "title": "Home", "content_length": 100, "webserver": "nginx"},
+            {"url": "https://b.example", "title": "Home", "content_length": 100, "webserver": "nginx"},
+            {"url": "https://c.example", "title": "Login", "content_length": 50, "webserver": "nginx"},
+            {"title": "NoUrl", "content_length": 1, "webserver": "x"},  # no url -> ignored
+        ],
+    )
+    app_ids = tasks.cluster(act)
+    assert len(app_ids) == 2  # two distinct signatures
+
+    by_sig = {
+        workspace.read_meta(act.app(a).meta)["signature"]: sorted(tools.read_lines(act.app(a).hosts))
+        for a in app_ids
+    }
+    assert by_sig["Home|100|nginx"] == ["https://a.example", "https://b.example"]
+    assert by_sig["Login|50|nginx"] == ["https://c.example"]
