@@ -13,5 +13,9 @@ def load_pipeline(name: str) -> Pipeline:
         from pipt.pipelines.example.pipeline import PIPELINE  # noqa: PLC0415
 
         return PIPELINE
+    if name == "recon":
+        from pipt.pipelines.recon.pipeline import PIPELINE  # noqa: PLC0415
+
+        return PIPELINE
     msg = f"unknown pipeline: {name!r}"
     raise ValueError(msg)
