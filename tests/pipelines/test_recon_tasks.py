@@ -38,10 +38,31 @@ def test_select_unique_webapps_dedups_by_signature():
 
 
 def test_pipeline_object_shape():
+    from pipt.core.stage import Mode
     from pipt.pipelines.recon.pipeline import PIPELINE
 
     assert PIPELINE.name == "recon"
-    assert [s.name for s in PIPELINE.stages] == ["expand", "resolve", "portscan", "fingerprint"]
+    assert [s.name for s in PIPELINE.stages] == [
+        "expand", "resolve", "portscan", "fingerprint",  # breadth
+        "passive_probe", "crawl", "subenum", "takeover",  # depth (per app)
+    ]
+    breadth = [s.name for s in PIPELINE.stages if s.mode is Mode.BREADTH]
+    depth = [s.name for s in PIPELINE.stages if s.mode is Mode.DEPTH]
+    assert breadth == ["expand", "resolve", "portscan", "fingerprint"]
+    assert depth == ["passive_probe", "crawl", "subenum", "takeover"]
+
+
+def test_depth_pure_helpers():
+    assert tasks.url_host("https://www.example.com:443/login?x=1") == "www.example.com"
+    assert tasks.url_host("http://45.33.32.156:80/") == "45.33.32.156"
+    assert tasks.is_ip("45.33.32.156") is True
+    assert tasks.is_ip("scanme.nmap.org") is False
+    assert tasks.apex("scanme.nmap.org") == "nmap.org"
+    assert tasks.apex("example.com") == "example.com"
+    assert tasks.denoise(["https://x/app.js", "https://x/logo.png", "https://x/api"]) == [
+        "https://x/app.js",
+        "https://x/api",
+    ]
 
 
 def test_expand_splits_scope_offline(tmp_path):

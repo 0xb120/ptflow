@@ -23,6 +23,12 @@ class ReconPipeline:
               produces=("naabu_1k", "honeypots", "naabu_full")),
         Stage(name="fingerprint", mode=Mode.BREADTH, run=tasks.fingerprint,
               produces=("httpx_metadata", "nerva_metadata", "unique_webapps")),
+        # depth: per app group (passive_probe -> crawl -> subenum -> takeover)
+        Stage(name="passive_probe", mode=Mode.DEPTH, run=tasks.passive_probe,
+              produces=("endpoints_passive",)),
+        Stage(name="crawl", mode=Mode.DEPTH, run=tasks.crawl, produces=("endpoints",)),
+        Stage(name="subenum", mode=Mode.DEPTH, run=tasks.subenum, produces=("subs",)),
+        Stage(name="takeover", mode=Mode.DEPTH, run=tasks.takeover, produces=("takeover",)),
     )
 
     def cluster(self, activity: Activity) -> list[str]:
