@@ -1,31 +1,47 @@
-# tests/pipelines/test_example_tasks.py
-import json
-
-from pipt.core.paths import Engagement
+from pipt.core import tools, workspace
+from pipt.core.paths import Activity
 from pipt.core.scope import Target
 from pipt.pipelines.example import tasks
 
 
-def test_discover_writes_hosts_jsonl(tmp_path):
-    eng = Engagement.for_scan("demo", root=tmp_path).ensure()
-    t = Target(raw="example.com", kind="domain", normalized="example.com", tid="t_aaa111")
-    tasks.discover(eng, [t])
-    records = [json.loads(ln) for ln in eng.surface_canonical("hosts.jsonl").read_text().splitlines()]
-    names = {r["name"] for r in records}
-    assert names == {"example.com", "www.example.com"}
-    assert all(r["targets"] == ["t_aaa111"] for r in records)
-    assert (eng.surface_raw("discover") / "out.jsonl").exists()
+def _targets():
+    return [
+        Target(raw="https://example.com/", kind="url", normalized="example.com", tid="t_a"),
+        Target(raw="nmap.org", kind="domain", normalized="nmap.org", tid="t_b"),
+    ]
 
 
-def test_enum_reads_hosts_txt_writes_services(tmp_path):
-    eng = Engagement.for_scan("demo", root=tmp_path).ensure()
-    t = Target(raw="example.com", kind="domain", normalized="example.com", tid="t_aaa111")
-    ws = eng.target(t.tid).ensure()
-    ws.canonical("hosts.txt").write_text("example.com\nwww.example.com\n")
-    tasks.enum(eng, t)
-    records = [json.loads(ln) for ln in ws.canonical("services.jsonl").read_text().splitlines()]
-    assert len(records) == 2
-    assert all(r["port"] == 443 for r in records)
+def test_discover_writes_scope_split_and_hosts(tmp_path):
+    act = Activity.named("demo", root=tmp_path).ensure()
+    tasks.discover(act, _targets())
+    assert tools.read_lines(act.scope_urls) == ["https://example.com/"]
+    assert tools.read_lines(act.scope_dns) == ["nmap.org"]
+    assert tools.read_lines(act.scope_ip) == []
+    hosts = tools.read_jsonl(act.asset_discovery_canonical("hosts.jsonl"))
+    assert {h["name"] for h in hosts} == {"example.com", "www.example.com", "nmap.org", "www.nmap.org"}
+    assert (act.asset_discovery_raw("discover") / "out.jsonl").exists()
+
+
+def test_cluster_groups_apex_and_www(tmp_path):
+    act = Activity.named("demo", root=tmp_path).ensure()
+    tasks.discover(act, _targets())
+    app_ids = tasks.cluster(act)
+    assert len(app_ids) == 2
+    for app_id in app_ids:
+        ws = act.app(app_id)
+        meta = workspace.read_meta(ws.meta)
+        assert meta["signature"].startswith("app:")
+        assert len(tools.read_lines(ws.hosts)) == 2  # apex + www
+
+
+def test_enum_reads_hosts_writes_services(tmp_path):
+    act = Activity.named("demo", root=tmp_path).ensure()
+    ws = act.app("app_x").ensure()
+    tools.write_lines(ws.hosts, ["example.com", "www.example.com"])
+    tasks.enum(act, "app_x")
+    services = tools.read_jsonl(ws.canonical("services.jsonl"))
+    assert len(services) == 2
+    assert all(s["port"] == 443 for s in services)
     assert (ws.raw("enum") / "out.jsonl").exists()
 
 
@@ -34,4 +50,3 @@ def test_pipeline_object_shape():
 
     assert PIPELINE.name == "example"
     assert [s.name for s in PIPELINE.stages] == ["discover", "enum"]
-    assert "example_note" in PIPELINE.extension_schema()

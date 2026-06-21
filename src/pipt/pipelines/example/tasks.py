@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from typing import TYPE_CHECKING
 
 from pipt.core import tools, workspace
 
 if TYPE_CHECKING:
-    from pipt.core.paths import Engagement
+    from pipt.core.paths import Activity
     from pipt.core.scope import Target
 
 
@@ -18,31 +17,59 @@ def fake_ip(seed: str) -> str:
     return f"10.{h[0]}.{h[1]}.{h[2]}"
 
 
-def _dump_jsonl(records: list[dict]) -> str:
-    return "\n".join(json.dumps(r) for r in records) + ("\n" if records else "")
+def _app_id(signature: str) -> str:
+    return hashlib.sha1(signature.encode()).hexdigest()[:12]  # noqa: S324
 
 
-def discover(eng: Engagement, targets: list[Target]) -> None:
-    """BREADTH stub: derive apex + www host per target, with target provenance."""
+def discover(activity: Activity, targets: list[Target]) -> None:
+    """BREADTH stub: expand the scope into scope/ and discover hosts.
+
+    Writes scope/scope_{urls,dns,ip}.txt (split by kind) and the canonical
+    asset_discovery/hosts.jsonl (apex + www host per target).
+    """
+    tools.write_lines(activity.scope_urls, [t.raw for t in targets if t.kind == "url"])
+    tools.write_lines(
+        activity.scope_dns, [t.normalized for t in targets if t.kind in ("domain", "wildcard")]
+    )
+    tools.write_lines(
+        activity.scope_ip, [t.normalized for t in targets if t.kind in ("ip", "cidr")]
+    )
+
     records: list[dict] = []
     for t in targets:
         ip = fake_ip(t.normalized)
-        records.append({"name": t.normalized, "ip": ip, "source": "stub", "targets": [t.tid]})
-        records.append(
-            {"name": f"www.{t.normalized}", "ip": ip, "source": "stub", "targets": [t.tid]}
-        )
-    raw = eng.surface_raw("discover")
-    raw.mkdir(parents=True, exist_ok=True)
-    (raw / "out.jsonl").write_text(_dump_jsonl(records), encoding="utf-8")
-    out = eng.surface_canonical("hosts.jsonl")
-    out.write_text(_dump_jsonl(records), encoding="utf-8")
-    workspace.record(eng.surface_manifest, role="hosts", path=out, tool="discover", inputs="scope")
+        records.append({"name": t.normalized, "ip": ip, "source": "stub"})
+        records.append({"name": f"www.{t.normalized}", "ip": ip, "source": "stub"})
+    tools.write_jsonl(activity.asset_discovery_raw("discover") / "out.jsonl", records)
+    tools.write_jsonl(activity.asset_discovery_canonical("hosts.jsonl"), records)
 
 
-def enum(eng: Engagement, target: Target) -> None:
-    """DEPTH stub: 'fingerprint' each assigned host into a service row."""
-    ws = eng.target(target.tid).ensure()
-    hosts = tools.read_lines(ws.canonical("hosts.txt"))
+def cluster(activity: Activity) -> list[str]:
+    """Group discovered hosts into 'equal application' groups.
+
+    Stub signature: an apex and its www host are the same app. The real
+    pipeline would key on httpx (Title, Content-Length, Webserver).
+    """
+    hosts = tools.read_jsonl(activity.asset_discovery_canonical("hosts.jsonl"))
+    groups: dict[str, dict] = {}
+    for h in hosts:
+        apex = h["name"].removeprefix("www.")
+        signature = f"app:{apex}"            # fabricated app signature
+        app_id = _app_id(signature)
+        g = groups.setdefault(app_id, {"signature": signature, "hosts": []})
+        g["hosts"].append(h["name"])
+
+    for app_id, g in groups.items():
+        ws = activity.app(app_id).ensure()
+        members = sorted(set(g["hosts"]))
+        workspace.write_meta(ws.meta, {"app_id": app_id, "signature": g["signature"], "hosts": members})
+        tools.write_lines(ws.hosts, members)
+    return sorted(groups)
+
+
+def enum(activity: Activity, app_id: str) -> None:
+    """DEPTH stub: 'fingerprint' each host of the app group into a service row."""
+    ws = activity.app(app_id).ensure()
     records = [
         {
             "ip": fake_ip(h.removeprefix("www.")),
@@ -52,11 +79,7 @@ def enum(eng: Engagement, target: Target) -> None:
             "version": "stub/1.0",
             "source": "stub",
         }
-        for h in hosts
+        for h in tools.read_lines(ws.hosts)
     ]
-    raw = ws.raw("enum")
-    raw.mkdir(parents=True, exist_ok=True)
-    (raw / "out.jsonl").write_text(_dump_jsonl(records), encoding="utf-8")
-    out = ws.canonical("services.jsonl")
-    out.write_text(_dump_jsonl(records), encoding="utf-8")
-    workspace.record(ws.manifest, role="services", path=out, tool="enum", inputs="hosts.txt")
+    tools.write_jsonl(ws.raw("enum") / "out.jsonl", records)
+    tools.write_jsonl(ws.canonical("services.jsonl"), records)

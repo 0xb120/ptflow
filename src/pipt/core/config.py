@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class FanOut:
-    max_workers: int = 3       # concurrent per-target depth chains (xargs -P 3 equivalent)
+    max_workers: int = 3       # concurrent per-app depth chains (xargs -P 3 equivalent)
     net_limit: int = 10        # optional global Prefect concurrency limit on tag "net"
 
 
@@ -18,15 +18,9 @@ class Retries:
 
 
 @dataclass(frozen=True)
-class DB:
-    busy_timeout_ms: int = 5000
-
-
-@dataclass(frozen=True)
 class Config:
     fanout: FanOut = field(default_factory=FanOut)
     retries: Retries = field(default_factory=Retries)
-    db: DB = field(default_factory=DB)
 
 
 CONFIG = Config()

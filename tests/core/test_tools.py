@@ -46,3 +46,14 @@ def test_read_lines_strips(tmp_path):
     p = tmp_path / "f.txt"
     p.write_text("  a  \n\n b\n")
     assert tools.read_lines(p) == ["a", "b"]
+
+
+def test_write_then_read_jsonl_roundtrip(tmp_path):
+    p = tmp_path / "out.jsonl"
+    n = tools.write_jsonl(p, [{"a": 1}, {"b": 2}])
+    assert n == 2
+    assert tools.read_jsonl(p) == [{"a": 1}, {"b": 2}]
+
+
+def test_read_jsonl_missing_returns_empty(tmp_path):
+    assert tools.read_jsonl(tmp_path / "nope.jsonl") == []

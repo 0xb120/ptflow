@@ -1,29 +1,42 @@
-from pipt.core.paths import Engagement, TargetWorkspace
+from pipt.core.paths import Activity, AppWorkspace
 
 
-def test_engagement_layout(tmp_path):
-    eng = Engagement.for_scan("demo", root=tmp_path)
-    assert eng.base == tmp_path / "demo"
-    assert eng.scope == tmp_path / "demo" / "scope.txt"
-    assert eng.db == tmp_path / "demo" / "db" / "engagement.db"
-    assert eng.surface_canonical("hosts.jsonl") == tmp_path / "demo" / "surface" / "hosts.jsonl"
-    assert eng.surface_raw("discover") == tmp_path / "demo" / "surface" / "raw" / "discover"
+def test_activity_layout(tmp_path):
+    act = Activity.named("acme", root=tmp_path)
+    assert act.base == tmp_path / "acme"
+    assert act.scope == tmp_path / "acme" / "scope.txt"
+    assert act.scope_dns == tmp_path / "acme" / "scope" / "scope_dns.txt"
+    assert act.scope_urls == tmp_path / "acme" / "scope" / "scope_urls.txt"
+    assert (
+        act.asset_discovery_canonical("hosts.jsonl")
+        == tmp_path / "acme" / "scans" / "asset_discovery" / "hosts.jsonl"
+    )
+    assert (
+        act.asset_discovery_raw("discover")
+        == tmp_path / "acme" / "scans" / "asset_discovery" / "raw" / "discover"
+    )
+    assert act.findings == tmp_path / "acme" / "findings"
 
 
-def test_target_workspace_paths(tmp_path):
-    eng = Engagement.for_scan("demo", root=tmp_path)
-    ws = eng.target("t_abc123")
-    assert isinstance(ws, TargetWorkspace)
-    assert ws.canonical("services.jsonl") == eng.targets / "t_abc123" / "services.jsonl"
-    assert ws.raw("enum") == eng.targets / "t_abc123" / "raw" / "enum"
-    assert ws.manifest == eng.targets / "t_abc123" / "manifest.jsonl"
+def test_app_workspace_paths(tmp_path):
+    act = Activity.named("acme", root=tmp_path)
+    ws = act.app("abc123def456")
+    assert isinstance(ws, AppWorkspace)
+    assert ws.hosts == act.scans / "abc123def456" / "hosts.txt"
+    assert ws.canonical("services.jsonl") == act.scans / "abc123def456" / "services.jsonl"
+    assert ws.raw("enum") == act.scans / "abc123def456" / "raw" / "enum"
+    assert ws.meta == act.scans / "abc123def456" / "meta.json"
 
 
-def test_ensure_and_list_targets(tmp_path):
-    eng = Engagement.for_scan("demo", root=tmp_path).ensure()
-    assert eng.surface.is_dir()
-    assert eng.db.parent.is_dir()
-    eng.target("t_aaa111").ensure()
-    eng.target("t_bbb222").ensure()
-    tids = sorted(ws.root.name for ws in eng.list_targets())
-    assert tids == ["t_aaa111", "t_bbb222"]
+def test_ensure_creates_standard_dirs(tmp_path):
+    act = Activity.named("acme", root=tmp_path).ensure()
+    for d in (act.scope_dir, act.asset_discovery, act.findings, act.poc, act.tmp, act.wl, act.logs):
+        assert d.is_dir()
+
+
+def test_list_apps_excludes_asset_discovery(tmp_path):
+    act = Activity.named("acme", root=tmp_path).ensure()  # ensure() creates scans/asset_discovery/
+    act.app("app_aaa").ensure()
+    act.app("app_bbb").ensure()
+    names = sorted(ws.root.name for ws in act.list_apps())
+    assert names == ["app_aaa", "app_bbb"]

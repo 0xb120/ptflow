@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from collections.abc import Iterable, Sequence
@@ -98,3 +99,18 @@ def write_lines(path: Path, lines: Iterable[str]) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(deduped) + ("\n" if deduped else ""), encoding="utf-8")
     return len(deduped)
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    """Read a JSONL file (one JSON object per line). Returns [] if missing."""
+    if not path.exists():
+        return []
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def write_jsonl(path: Path, records: Iterable[dict]) -> int:
+    """Write records as JSONL (one object per line); returns the count."""
+    recs = list(records)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in recs), encoding="utf-8")
+    return len(recs)

@@ -10,7 +10,6 @@ def test_defaults():
     assert CONFIG.fanout.net_limit == 10
     assert CONFIG.retries.tool_retries == 2
     assert CONFIG.retries.tool_retry_delay_s == 10
-    assert CONFIG.db.busy_timeout_ms == 5000
 
 
 def test_frozen():
