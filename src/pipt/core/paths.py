@@ -11,10 +11,13 @@ Activity workspace layout (parent dir = activity name):
           raw/<tool>/                 #   raw tool dumps
           hosts.jsonl                 #   canonical discovery output
         <app_id>/                     # one per clustered "application group" (DEPTH)
-          meta.json  hosts.txt  services.jsonl
+          meta.json  hosts.txt  services.jsonl  endpoints.txt
+          wl/                         #   per-app custom wordlists (seed.txt, …)
+          responses/                  #   downloaded HTML/JS corpus (katana -srd) — mined offline
           raw/<tool>/
       findings/                       # agent output (hypotheses.jsonl)
-      poc/   tmp/   wl/   logs/
+      poc/   tmp/   logs/
+      wl/                             # shared/global wordlists (or links to SecLists & co.)
 """
 
 from __future__ import annotations
@@ -36,6 +39,19 @@ class AppWorkspace:
     def hosts(self) -> Path:
         """Canonical enum input — the group's host list (written by clustering)."""
         return self.root / "hosts.txt"
+
+    @property
+    def wl(self) -> Path:
+        """Per-app custom wordlists (seed + derived). The activity-level wl/ holds
+        shared/global lists (or links to system ones like SecLists)."""
+        return self.root / "wl"
+
+    @property
+    def responses(self) -> Path:
+        """Per-app response store (katana -srd): the downloaded HTML/JS corpus that
+        offline steps mine without re-fetching — the crawler IS the downloader for
+        the linked surface. A canonical corpus, not raw/ provenance."""
+        return self.root / "responses"
 
     def raw(self, tool: str) -> Path:
         return self.root / "raw" / tool
@@ -126,6 +142,8 @@ class Activity:
 
     @property
     def wl(self) -> Path:
+        """Shared/global wordlists (or links to system lists like SecLists). Per-app
+        custom wordlists live under each AppWorkspace.wl instead."""
         return self.base / "wl"
 
     @property

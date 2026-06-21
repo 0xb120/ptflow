@@ -23,15 +23,22 @@ class Stage:
       - activity stage (per_app=False): ``run(activity)`` — runs once over the scope.
       - per-app stage  (per_app=True):  ``run(activity, app_id)`` — once per app group.
 
-    `needs` references stage names in the SAME scope (activity deps among activity
-    stages; per-app deps among per-app stages). The cluster step is the fan-out
-    boundary between the two scopes.
+    `needs` references stage names in the SAME scope AND the SAME `phase` (the
+    cluster step is the fan-out boundary between activity and per-app scopes).
+
+    `phase` groups per-app stages into successive **loops**. All per-app stages
+    sharing a phase run as one DAG; loops run in ascending phase order with a
+    global barrier between them (every app finishes loop N before any app starts
+    loop N+1). A later loop therefore reads an earlier loop's on-disk artifacts
+    directly — cross-loop ordering is the barrier, NOT `needs`. `phase` is ignored
+    for activity stages, which all run as the single pre-cluster DAG.
     """
 
     name: str
     run: Callable[..., None]
     needs: tuple[str, ...] = field(default_factory=tuple)
     per_app: bool = False
+    phase: int = 1
 
 
 class Pipeline(Protocol):

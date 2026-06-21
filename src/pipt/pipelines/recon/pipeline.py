@@ -22,11 +22,14 @@ class ReconPipeline:
         Stage("portscan", tasks.portscan, needs=("resolve",)),
         Stage("httpx", tasks.httpx_fingerprint, needs=("portscan",)),
         Stage("nerva", tasks.nerva_fingerprint, needs=("portscan",)),  # ∥ httpx
-        # per-app scope (after cluster fan-out)
-        Stage("passive_probe", tasks.passive_probe, per_app=True),
-        Stage("crawl", tasks.crawl, needs=("passive_probe",), per_app=True),
-        Stage("subenum", tasks.subenum, per_app=True),  # ∥ passive_probe/crawl
-        Stage("takeover", tasks.takeover, needs=("crawl", "subenum"), per_app=True),
+        # per-app LOOP 1 — enumeration (after cluster fan-out)
+        Stage("passive_probe", tasks.passive_probe, per_app=True, phase=1),
+        Stage("crawl", tasks.crawl, needs=("passive_probe",), per_app=True, phase=1),
+        Stage("subenum", tasks.subenum, per_app=True, phase=1),  # ∥ passive_probe/crawl
+        Stage("takeover", tasks.takeover, needs=("crawl", "subenum"), per_app=True, phase=1),
+        # per-app LOOP 2 — content discovery (reads loop-1 artifacts across the barrier)
+        Stage("wordlist", tasks.build_wordlist, per_app=True, phase=2),
+        Stage("fetch_delta", tasks.fetch_delta, per_app=True, phase=2),  # ∥ wordlist
     )
 
     def cluster(self, activity: Activity) -> list[str]:

@@ -14,6 +14,7 @@ def test_stage_defaults():
     s = Stage("expand", lambda *_: None)
     assert s.needs == ()
     assert s.per_app is False
+    assert s.phase == 1  # first per-app loop by default
 
 
 def test_load_pipeline_unknown_raises():

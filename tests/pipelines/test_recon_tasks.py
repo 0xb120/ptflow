@@ -44,7 +44,7 @@ def test_pipeline_object_shape():
     activity = [s.name for s in PIPELINE.stages if not s.per_app]
     app = [s.name for s in PIPELINE.stages if s.per_app]
     assert activity == ["expand", "resolve", "portscan", "httpx", "nerva"]
-    assert app == ["passive_probe", "crawl", "subenum", "takeover"]
+    assert app == ["passive_probe", "crawl", "subenum", "takeover", "wordlist", "fetch_delta"]
     by_name = {s.name: s for s in PIPELINE.stages}
     # httpx ∥ nerva (both depend only on portscan, not on each other)
     assert by_name["httpx"].needs == ("portscan",)
@@ -52,6 +52,12 @@ def test_pipeline_object_shape():
     # subenum ∥ passive_probe/crawl; takeover waits for both crawl and subenum
     assert by_name["subenum"].needs == ()
     assert set(by_name["takeover"].needs) == {"crawl", "subenum"}
+    # loop 1 = enumeration; loop 2 = content discovery (separate per-app loop)
+    assert {by_name[n].phase for n in ("passive_probe", "crawl", "subenum", "takeover")} == {1}
+    # loop 2 stages cross the loop-1 barrier (no `needs`) and run in parallel
+    assert {by_name[n].phase for n in ("wordlist", "fetch_delta")} == {2}
+    assert by_name["wordlist"].needs == ()
+    assert by_name["fetch_delta"].needs == ()
 
 
 def test_depth_pure_helpers():
@@ -65,6 +71,64 @@ def test_depth_pure_helpers():
         "https://x/app.js",
         "https://x/api",
     ]
+
+
+def test_tokenize_urls_mines_segments_keys_and_basenames():
+    corpus = [
+        "https://app.example.com/admin/login.php?user=1&redirect=/home",
+        "/api/v1/users",                       # bare path (jsluice-style)
+        "app.example.com/wp-content/themes",   # scheme-less host/path
+        "https://app.example.com/",            # no path → no tokens
+        "https://app.example.com/files/12345", # pure-numeric id dropped
+        "",                                    # skipped
+    ]
+    words = tasks.tokenize_urls(corpus)
+    assert {"admin", "api", "v1", "users", "wp-content", "themes"} <= set(words)
+    assert {"login.php", "login"} <= set(words)   # filename + basename
+    assert {"user", "redirect"} <= set(words)     # query-param keys
+    assert "12345" not in words                    # numeric id dropped
+    assert "home" not in words                     # param value, not a key
+    assert words == sorted(set(words))             # sorted + deduped
+
+
+def test_select_tech_wordlists_matches_existing_files(tmp_path):
+    (tmp_path / "cms").mkdir()
+    (tmp_path / "cms" / "wordpress.txt").write_text("wp-admin\nwp-login.php\n")
+    mapping = {"wordpress": "cms/wordpress.txt", "drupal": "cms/drupal.txt"}
+    # case-insensitive substring match on httpx-style tags; mapped-but-missing file skipped
+    assert tasks.select_tech_wordlists(["WordPress 6.4", "Nginx"], mapping, tmp_path) == [
+        tmp_path / "cms" / "wordpress.txt"
+    ]
+    # no matching tech, or an absent base dir → no-op (step runs without external data)
+    assert tasks.select_tech_wordlists(["Apache"], mapping, tmp_path) == []
+    assert tasks.select_tech_wordlists(["WordPress"], mapping, tmp_path / "nope") == []
+
+
+def test_passive_delta_excludes_crawled_and_static():
+    passive = [
+        "https://x/api/users",   # keep — not crawled, not static
+        "https://x/old/page",    # keep
+        "https://x/logo.png",    # drop — static asset
+        "https://x/already",     # drop — already fetched by the crawl
+        "https://x/api/users",   # dup → collapsed
+    ]
+    crawled = ["https://x/already", "https://x/home"]
+    assert tasks.passive_delta(passive, crawled) == ["https://x/api/users", "https://x/old/page"]
+
+
+def test_build_wordlist_offline(tmp_path):
+    """wordlist is pure offline: it tokenizes loop-1's endpoints.txt, never fetches."""
+    from pipt.core import tools, workspace
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    ws = act.app("app1").ensure()
+    workspace.write_meta(ws.meta, {"app_id": "app1", "tech": []})
+    tools.write_lines(ws.canonical("endpoints.txt"), ["https://app1/admin/index.php?id=2"])
+
+    tasks.build_wordlist(act, "app1")
+    words = tools.read_lines(ws.wl / "seed.txt")
+    assert {"admin", "index.php", "index", "id"} <= set(words)
 
 
 def test_expand_splits_scope_offline(tmp_path):

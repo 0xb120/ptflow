@@ -14,6 +14,7 @@ import json
 import logging
 import shlex
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,6 +45,23 @@ NOISE_EXTENSIONS = frozenset({
     "woff", "woff2", "ttf", "eot", "otf", "css",
     "mp3", "mp4", "wav", "avi", "mov", "webm",
 })
+
+# wordlist synthesis (LOOP 2 — active collection → custom per-app wordlist)
+_TOKEN_MAX_LEN = 40                       # drop longer "segments" (hashes/junk)
+WORDLIST_DIR = Path("/opt/wordlists")     # shared static lists (seclists-style); optional
+TECH_WORDLISTS = {                        # detected-tech keyword → list relative to WORDLIST_DIR
+    "wordpress": "cms/wordpress.txt",
+    "drupal": "cms/drupal.txt",
+    "joomla": "cms/joomla.txt",
+    "tomcat": "servers/tomcat.txt",
+    "jboss": "servers/jboss.txt",
+    "jenkins": "apps/jenkins.txt",
+    "gitlab": "apps/gitlab.txt",
+    "php": "languages/php.txt",
+    "asp.net": "languages/aspnet.txt",
+    "java": "languages/java.txt",
+}
+OSINT_FETCH_RL = "50"  # httpx req/s when downloading the OSINT delta into responses/osint/
 
 # `httpx` on PATH is the pyenv shim; the ProjectDiscovery binary lives in ~/go/bin.
 _HTTPX_BIN = Path.home() / "go" / "bin" / "httpx"
@@ -108,6 +126,74 @@ def denoise(urls: list[str]) -> list[str]:
         if ext not in NOISE_EXTENSIONS:
             out.append(u)
     return out
+
+
+def _add_token(out: set[str], seg: str) -> None:
+    """Add a path/param token (and a filename's basename) if it's wordlist-worthy."""
+    seg = seg.strip()
+    if not seg or seg.isdigit() or len(seg) > _TOKEN_MAX_LEN:
+        return
+    out.add(seg)
+    if "." in seg:  # filename → also offer the basename (login.php → login)
+        base = seg.rsplit(".", 1)[0]
+        if base and not base.isdigit():
+            out.add(base)
+
+
+def tokenize_urls(urls: Iterable[str]) -> list[str]:
+    """Mine wordlist candidates from a URL/endpoint corpus.
+
+    Extracts path segments, filename basenames and query-parameter names. Drops
+    the scheme+host, pure-numeric segments (IDs), and junk longer than
+    _TOKEN_MAX_LEN. Accepts full URLs, scheme-less host/path, and bare ``/path``
+    forms (as emitted by jsluice). Case is preserved; the result is sorted+deduped.
+    """
+    out: set[str] = set()
+    for raw in urls:
+        u = raw.strip()
+        if not u:
+            continue
+        if "://" in u:
+            u = u.split("://", 1)[1]
+            u = u.split("/", 1)[1] if "/" in u else ""           # drop scheme + host
+        elif u.startswith("/"):
+            u = u[1:]                                            # bare /path
+        elif "/" in u and "." in u.split("/", 1)[0]:
+            u = u.split("/", 1)[1]                               # host/path (first label has a dot)
+        path, _, query = u.partition("?")
+        for seg in path.split("/"):
+            _add_token(out, seg)
+        for pair in query.split("&"):
+            _add_token(out, pair.split("=", 1)[0])
+    return sorted(out)
+
+
+def select_tech_wordlists(tech: list[str], mapping: dict[str, str], base: Path) -> list[Path]:
+    """Map detected-tech tags to existing static wordlist files under ``base``.
+
+    Matching is case-insensitive substring (httpx tags like 'WordPress 6.4' still
+    hit the 'wordpress' key). Returns only files that exist — absent files or an
+    absent ``base`` make this a no-op, so the step needs no external data to run.
+    """
+    tags = [t.lower() for t in tech]
+    out: list[Path] = []
+    for key, rel in mapping.items():
+        if any(key in tag for tag in tags):
+            path = base / rel
+            if path.is_file():
+                out.append(path)
+    return out
+
+
+def passive_delta(passive: list[str], crawled: list[str]) -> list[str]:
+    """OSINT URLs (gau/urlfinder) whose bodies the crawl never fetched.
+
+    `denoise(passive)` minus what the crawler already requested — the only URLs a
+    separate downloader needs (the crawler is the downloader for everything it
+    reached). Static assets are dropped; order is preserved.
+    """
+    already = set(crawled)
+    return [u for u in denoise(tools.dedupe(passive)) if u not in already]
 
 
 # --- helpers ---
@@ -329,11 +415,25 @@ def passive_probe(activity: Activity, app_id: str) -> None:
 
 
 def crawl(activity: Activity, app_id: str) -> None:
-    """DEPTH 2 — active crawl (katana); merge with passive + denoise → endpoints.txt."""
+    """DEPTH 2 — active crawl that fetches the linked surface ONCE and keeps it.
+
+    katana with -jc/-jsl (parse JS endpoints), -kf all (robots.txt/sitemap.xml) and
+    -srd (store every response). Its URL output already contains JS-discovered and
+    known-file paths, so endpoints.txt is the JS-enriched corpus; the stored bodies
+    under responses/ are the per-app corpus that offline steps mine WITHOUT
+    re-fetching (the crawler is the downloader for the linked surface). Merges with
+    passive + denoise → endpoints.txt.
+    """
     ws = activity.app(app_id)
-    crawled = _lines(_run("katana", ["katana", "-silent", "-d", KATANA_DEPTH, "-c", KATANA_CONC],
-                          stdin="\n".join(tools.read_lines(ws.hosts)),
-                          dest=ws.raw("katana") / "out.txt", label=app_id))
+    hosts = tools.read_lines(ws.hosts)
+    if hosts:
+        ws.responses.mkdir(parents=True, exist_ok=True)
+    crawled = _lines(_run(
+        "katana",
+        ["katana", "-silent", "-jc", "-jsl", "-kf", "all", "-d", KATANA_DEPTH, "-c", KATANA_CONC,
+         "-srd", str(ws.responses)],
+        stdin="\n".join(hosts), dest=ws.raw("katana") / "out.txt", label=app_id,
+    ))
     passive = tools.read_lines(ws.canonical("endpoints_passive.txt"))
     tools.write_lines(ws.canonical("endpoints.txt"), denoise(tools.dedupe([*passive, *crawled])))
 
@@ -375,3 +475,51 @@ def takeover(activity: Activity, app_id: str) -> None:
     raw_out.write_text(out, encoding="utf-8")
     findings = [ln for ln in _lines(out) if "Not Vulnerable" not in ln]
     tools.write_lines(ws.canonical("takeover.txt"), findings)
+
+
+# --- LOOP 2 (content discovery) — runs after the loop-1 barrier ---
+def build_wordlist(activity: Activity, app_id: str) -> None:
+    """LOOP 2.1 — synthesize a custom per-app wordlist (wl/seed.txt) OFFLINE.
+
+    No fetching: the crawl (loop 1) already downloaded and JS-parsed the linked
+    surface — its JS-discovered endpoints and robots/sitemap paths are already in
+    endpoints.txt, and the bodies are under responses/. This step tokenizes
+    endpoints.txt into path segments, filename basenames and parameter names
+    (tokenize_urls) and merges any tech-specific static lists keyed on the cluster's
+    detected tech. Output: scans/<app_id>/wl/seed.txt (the activity wl/ holds
+    shared/global lists instead). Reads loop-1 artifacts directly — the cross-loop
+    barrier guarantees they exist.
+    """
+    ws = activity.app(app_id)
+    words = tokenize_urls(tools.read_lines(ws.canonical("endpoints.txt")))
+
+    tech = workspace.read_meta(ws.meta).get("tech") or []
+    static: list[str] = []
+    for wl in select_tech_wordlists(tech, TECH_WORDLISTS, WORDLIST_DIR):
+        static += tools.read_lines(wl)
+
+    n = tools.write_lines(ws.wl / "seed.txt", [*words, *static])
+    log.info("  → wordlist (%s) — %d term(s) (+%d tech), offline → wl/seed.txt", app_id, n, len(static))
+
+
+def fetch_delta(activity: Activity, app_id: str) -> None:
+    """LOOP 2.2 — download the OSINT delta into the response store (∥ wordlist).
+
+    passive_probe's URLs (endpoints_passive.txt) that the crawl never fetched are
+    the only ones a separate downloader needs — the crawler already downloaded the
+    linked surface. httpx fetches the live ones (it drops dead hosts) and stores
+    their bodies under responses/osint/, so offline body-mining covers archived/OSINT
+    URLs too. Reads loop-1 artifacts directly — the barrier guarantees they exist.
+    """
+    ws = activity.app(app_id)
+    delta = passive_delta(
+        tools.read_lines(ws.canonical("endpoints_passive.txt")),
+        tools.read_lines(ws.raw("katana") / "out.txt"),
+    )
+    if not delta:
+        log.debug("  · skip osint fetch (empty delta) for %s", app_id)
+        return
+    store = ws.responses / "osint"
+    store.mkdir(parents=True, exist_ok=True)
+    _run("httpx", [HTTPX, "-silent", "-srd", str(store), "-rl", OSINT_FETCH_RL],
+         stdin="\n".join(delta), dest=ws.raw("httpx_osint") / "out.txt", label=app_id)

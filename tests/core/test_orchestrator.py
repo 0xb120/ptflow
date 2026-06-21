@@ -18,3 +18,15 @@ def test_topo_order_ignores_foreign_needs():
     # a need that isn't in the given set (e.g. a cross-scope dep) is skipped
     s = Stage("only", lambda *_: None, needs=("not_here",))
     assert [x.name for x in orchestrator.topo_order([s])] == ["only"]
+
+
+def test_per_app_loops_groups_by_phase_in_order():
+    stages = [
+        Stage("expand", lambda *_: None),                          # activity → excluded
+        Stage("a", lambda *_: None, per_app=True, phase=1),
+        Stage("b", lambda *_: None, needs=("a",), per_app=True, phase=1),
+        Stage("c", lambda *_: None, per_app=True, phase=2),
+    ]
+    loops = orchestrator.per_app_loops(stages)
+    assert [phase for phase, _ in loops] == [1, 2]
+    assert [[s.name for s in ss] for _, ss in loops] == [["a", "b"], ["c"]]

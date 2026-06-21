@@ -47,6 +47,19 @@ def topo_order(stages: list[Stage]) -> list[Stage]:
     return ordered
 
 
+def per_app_loops(stages: list[Stage]) -> list[tuple[int, list[Stage]]]:
+    """Group per-app stages into successive loops by `phase`, ascending.
+
+    Each (phase, stages) loop runs as its own per-app DAG; the orchestrator puts a
+    global barrier between loops. Activity stages are not loops and are excluded.
+    """
+    app_stages = [s for s in stages if s.per_app]
+    return [
+        (phase, [s for s in app_stages if s.phase == phase])
+        for phase in sorted({s.phase for s in app_stages})
+    ]
+
+
 def _submit_dag(
     stages: list[Stage],
     pipeline_name: str,
@@ -88,7 +101,6 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None) -> None:
     pipeline = load_pipeline(pipeline_name)
     activity = Activity.named(activity_name, Path(root) if root else None)
     activity_stages = [s for s in pipeline.stages if not s.per_app]
-    app_stages = [s for s in pipeline.stages if s.per_app]
 
     # 1. activity-scope DAG (independent stages run in parallel)
     log.info("▶ activity stages")
@@ -100,14 +112,16 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None) -> None:
     app_ids = pipeline.cluster(activity)
     log.info("  → %d application group(s)", len(app_ids))
 
-    # 3. per-app DAG — fan-out across groups + intra-app parallelism (all capped by max_workers)
-    if app_ids and app_stages:
-        log.info("▶ per-app stages: %s", ", ".join(s.name for s in app_stages))
-        pending: list[PrefectFuture] = []
-        for app_id in app_ids:
-            pending += _submit_dag(app_stages, pipeline_name, activity_name, root, app_id)
-        for fut in pending:
-            fut.result(raise_on_failure=False)
+    # 3. per-app loops — each phase is a loop: fan-out across groups + intra-app
+    #    parallelism (capped by max_workers), with a global barrier between loops.
+    if app_ids:
+        for phase, loop_stages in per_app_loops(list(pipeline.stages)):
+            log.info("▶ per-app loop %d: %s", phase, ", ".join(s.name for s in loop_stages))
+            pending: list[PrefectFuture] = []
+            for app_id in app_ids:
+                pending += _submit_dag(loop_stages, pipeline_name, activity_name, root, app_id)
+            for fut in pending:
+                fut.result(raise_on_failure=False)
 
     # 4. agent — fan-in, once
     log.info("▶ agent")
