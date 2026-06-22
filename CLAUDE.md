@@ -38,6 +38,8 @@ uv run pytest tests/core/test_scope.py::test_classify  # one test
   - The "pipt" logger level is always DEBUG; the *console* handler is raised to INFO without `-v`,
     so the file (DEBUG) captures the full record while the console stays quiet. `is_verbose()` (not
     the logger level) gates console-only behaviour like streaming a tool's stderr.
+  - `tools.run` logs a WARNING on any non-zero exit, so a broken tool (bad flag, crash) can't
+    masquerade as a clean empty result — the failure shows on the console even without `-v`.
 - Ruff runs with `select = ["ALL"]`; respect the `ignore`/`per-file-ignores` in `pyproject.toml`
   rather than adding blanket `# noqa`. `ty` is the type checker (not mypy).
 
@@ -92,6 +94,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
     asset_discovery/  raw/<tool>/  <canonical files>      # BREADTH phase
     <app_id>/                            # one clustered app group (per-app loops)
       meta.json  hosts.txt  services.jsonl  endpoints.txt  subs.txt  …
+      screenshot.png                     #   root-page screenshot (or screenshot.failed)
       wl/seed.txt                        #   per-app CUSTOM wordlist (loop 2, offline)
       responses/                         #   downloaded HTML/JS corpus (katana -srd) — mined offline
       raw/<tool>/
@@ -127,7 +130,8 @@ recon hashes `Title|Content-Length|Webserver`; the example stub hashes a fabrica
   this is what the test suite and CI exercise.
 - **`recon`** — the REAL ProjectDiscovery toolchain (`pipelines/recon/tasks.py`), a faithful port of
   bash recon scripts (`scope2surface.sh` breadth, `surfagr.sh` clustering). Its per-app loops:
-  - **Loop 1 — enumeration** (`phase=1`): `passive_probe` → `crawl`, `subenum`, `takeover`.
+  - **Loop 1 — enumeration** (`phase=1`): `screenshot` (root-page shot of the cluster's best host, ∥) ;
+    `passive_probe` → `crawl` ; `subenum` ; `takeover` (← crawl + subenum).
   - **Loop 2 — content discovery** (`phase=2`): `wordlist` (offline) → `tech_enum` (surface-generating
     per-stack scanners) → `content_discovery` (feroxbuster forced browsing), ∥ `fetch_delta` (OSINT
     delta). See below.
@@ -158,6 +162,9 @@ a combined wordlist (`wl/seed.txt` first, then a global SecLists list — `CONTE
 `/opt/wordlist/SecLists/Discovery/Web-Content/raft-medium-directories.txt`) and tech-derived extensions
 (`tech_extensions`). `--smart` means the wordlist-feedback loop is built in — don't hand-roll it.
 Output: `scans/<app_id>/content_discovery.jsonl` (`parse_ferox` keeps the `response` records).
+Politeness on live infra is `--smart` (auto-tune adapts the rate **down** when the target
+errors/times out) + low `-t`/`-L`/`--timeout` (`FEROX_THREADS`/`FEROX_SCAN_LIMIT`/`FEROX_TIMEOUT`) —
+**not** `--rate-limit`, which is mutually exclusive with `--smart` (and per-directory).
 
 **Specialized per-stack scanners are split by output role** (so they land in the right loop):
 - `tech_enum` (loop 2, before content_discovery) runs scanners whose output is **surface that feeds

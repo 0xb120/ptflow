@@ -23,6 +23,7 @@ class ReconPipeline:
         Stage("httpx", tasks.httpx_fingerprint, needs=("portscan",)),
         Stage("nerva", tasks.nerva_fingerprint, needs=("portscan",)),  # ∥ httpx
         # per-app LOOP 1 — enumeration (after cluster fan-out)
+        Stage("screenshot", tasks.screenshot, per_app=True, phase=1),  # root-page shot (∥ entry)
         Stage("passive_probe", tasks.passive_probe, per_app=True, phase=1),
         Stage("crawl", tasks.crawl, needs=("passive_probe",), per_app=True, phase=1),
         Stage("subenum", tasks.subenum, per_app=True, phase=1),  # ∥ passive_probe/crawl

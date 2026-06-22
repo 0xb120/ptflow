@@ -45,7 +45,7 @@ def test_pipeline_object_shape():
     app = [s.name for s in PIPELINE.stages if s.per_app]
     assert activity == ["expand", "resolve", "portscan", "httpx", "nerva"]
     assert app == [
-        "passive_probe", "crawl", "subenum", "takeover",
+        "screenshot", "passive_probe", "crawl", "subenum", "takeover",
         "wordlist", "fetch_delta", "tech_enum", "content_discovery",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
@@ -56,7 +56,8 @@ def test_pipeline_object_shape():
     assert by_name["subenum"].needs == ()
     assert set(by_name["takeover"].needs) == {"crawl", "subenum"}
     # loop 1 = enumeration; loop 2 = content discovery (separate per-app loop)
-    assert {by_name[n].phase for n in ("passive_probe", "crawl", "subenum", "takeover")} == {1}
+    assert {by_name[n].phase for n in ("screenshot", "passive_probe", "crawl", "subenum", "takeover")} == {1}
+    assert by_name["screenshot"].needs == ()  # first loop-1 step, runs right after cluster
     # loop 2 stages cross the loop-1 barrier (no cross-loop `needs`)
     assert {by_name[n].phase for n in ("wordlist", "fetch_delta", "tech_enum", "content_discovery")} == {2}
     assert by_name["wordlist"].needs == ()
@@ -171,6 +172,16 @@ def test_build_wordlist_offline(tmp_path):
     tasks.build_wordlist(act, "app1")
     words = tools.read_lines(ws.wl / "seed.txt")
     assert {"admin", "index.php", "index", "id"} <= set(words)
+
+
+def test_best_host_prefers_non_ip_then_https():
+    # a non-IP host beats an IP, even when the IP is https
+    assert tasks.best_host(["https://1.2.3.4", "http://app.example.com"]) == "http://app.example.com"
+    # within non-IP hosts, https beats http
+    assert tasks.best_host(["http://app.example.com", "https://app.example.com"]) == "https://app.example.com"
+    # all IPs → https preferred, else first
+    assert tasks.best_host(["http://1.2.3.4:80", "https://1.2.3.4:443"]) == "https://1.2.3.4:443"
+    assert tasks.best_host([]) is None
 
 
 def test_expand_splits_scope_offline(tmp_path):

@@ -39,6 +39,7 @@ KATANA_DEPTH = "3"
 KATANA_CONC = "2"
 SUBJACK_THREADS = "100"
 SUBJACK_TIMEOUT = "30"
+SCREENSHOT_TIMEOUT = "20"   # httpx -screenshot per-page timeout (seconds)
 NOISE_EXTENSIONS = frozenset({
     "jpg", "jpeg", "png", "gif", "svg", "bmp", "webp", "ico",
     "woff", "woff2", "ttf", "eot", "otf", "css",
@@ -65,8 +66,13 @@ OSINT_FETCH_RL = "50"  # httpx req/s when downloading the OSINT delta into respo
 # content discovery (LOOP 2) — feroxbuster forced browsing
 SECLISTS_DIR = Path("/opt/wordlist/SecLists")
 CONTENT_WORDLIST = SECLISTS_DIR / "Discovery" / "Web-Content" / "raft-medium-directories.txt"  # global; optional
-FEROX_DEPTH = "2"   # recursion depth (conservative; feroxbuster default is 4)
-FEROX_RL = "100"    # feroxbuster --rate-limit req/s (conservative for live infra)
+# Gentle on live infra: --smart (auto-tune) adapts the rate down when the target errors/times
+# out; low -t/-L keep concurrency bounded from the start. (--rate-limit is mutually exclusive
+# with --smart, and is per-directory anyway, so it's the wrong tool here.)
+FEROX_DEPTH = "2"        # -d recursion depth (feroxbuster default is 4)
+FEROX_THREADS = "5"      # -t threads per scan (default 50 is aggressive for fragile apps)
+FEROX_SCAN_LIMIT = "2"   # -L concurrent directory scans (caps recursion fan-out)
+FEROX_TIMEOUT = "15"     # --timeout per-request seconds (tolerate slow apps)
 TECH_EXTENSIONS = {  # detected-tech keyword → file extensions to fuzz
     "php": ["php"],
     "asp.net": ["asp", "aspx", "ashx"],
@@ -139,6 +145,18 @@ def apex(host: str) -> str:
     """Naive apex domain (last two labels). Good enough pre-PSL for common TLDs."""
     parts = host.split(".")
     return ".".join(parts[-2:]) if len(parts) >= 2 else host  # noqa: PLR2004
+
+
+def best_host(urls: list[str]) -> str | None:
+    """Pick the single URL to screenshot for a cluster: prefer a non-IP host, then
+    https, then the first. Returns None for an empty list."""
+    pool = [u for u in (u.strip() for u in urls) if u]
+    if not pool:
+        return None
+    non_ip = [u for u in pool if not is_ip(url_host(u))]
+    pool = non_ip or pool
+    https = [u for u in pool if u.startswith("https://")]
+    return (https or pool)[0]
 
 
 def denoise(urls: list[str]) -> list[str]:
@@ -487,6 +505,37 @@ def cluster(activity: Activity) -> list[str]:
 
 
 # --- depth sub-phases (per app group; chain via the app workspace on disk) ---
+def screenshot(activity: Activity, app_id: str) -> None:
+    """LOOP 1 (first step) — root-page screenshot of the cluster's best host.
+
+    Picks one URL per app (non-IP preferred; see best_host) and captures its root page
+    with system Chrome via httpx -screenshot. httpx names the PNG under raw/; it's
+    promoted to the canonical scans/<app_id>/screenshot.png, or a screenshot.failed
+    marker on miss. No needs — runs right after cluster fan-out, ∥ the other loop-1 steps.
+    """
+    ws = activity.app(app_id)
+    target = best_host(tools.read_lines(ws.hosts))
+    if not target:
+        log.debug("  · skip screenshot (no host) for %s", app_id)
+        return
+    store = ws.raw("httpx_screenshot")
+    store.mkdir(parents=True, exist_ok=True)
+    log.info("  → screenshot (%s) — %s", app_id, target)
+    out = tools.run(
+        [HTTPX, "-screenshot", "-system-chrome", "-no-screenshot-full-page", "-esb",
+         "-st", SCREENSHOT_TIMEOUT, "-silent", "-j", "-srd", str(store)],
+        stdin=target, stream_stderr=is_verbose(),
+    )
+    (store / "out.json").write_text(out, encoding="utf-8")
+    pngs = sorted(store.rglob("*.png"))
+    if pngs:
+        shutil.copy(pngs[0], ws.canonical("screenshot.png"))
+        log.info("    screenshot (%s) → screenshot.png", app_id)
+    else:
+        ws.canonical("screenshot.failed").write_text("", encoding="utf-8")
+        log.info("    screenshot (%s) → screenshot.failed", app_id)
+
+
 def passive_probe(activity: Activity, app_id: str) -> None:
     """DEPTH 1 — passive URL discovery (gau + urlfinder) → endpoints_passive.txt."""
     ws = activity.app(app_id)
@@ -705,7 +754,8 @@ def content_discovery(activity: Activity, app_id: str) -> None:
     log.info("  → feroxbuster (%s) — %d host(s), %d term(s)%s", app_id, len(hosts), n_wl,
              f", -x {','.join(exts)}" if exts else "")
     cmd = [FEROX, "--stdin", "--silent", "--json", "-o", str(out_file), "--no-state", "-k",
-           "--smart", "-d", FEROX_DEPTH, "--rate-limit", FEROX_RL, "-w", str(wordlist), *ext_args]
+           "--smart", "-t", FEROX_THREADS, "-L", FEROX_SCAN_LIMIT, "--timeout", FEROX_TIMEOUT,
+           "-d", FEROX_DEPTH, "-w", str(wordlist), *ext_args]
     tools.run(cmd, stdin="\n".join(hosts), stream_stderr=is_verbose())
     records = parse_ferox(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
     n = tools.write_jsonl(ws.canonical("content_discovery.jsonl"), records)
