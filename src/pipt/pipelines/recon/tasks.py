@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
-import shlex
 import shutil
 from collections import Counter
 from collections.abc import Iterable
@@ -20,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pipt.core import scope, tools, workspace
-from pipt.core.log import get_logger
+from pipt.core.log import get_logger, is_verbose
 
 if TYPE_CHECKING:
     from pipt.core.paths import Activity, AppWorkspace
@@ -305,9 +303,7 @@ def _run(tool: str, cmd: list[str], *, stdin: str, dest: Path, label: str) -> st
         log.debug("  · skip %s/%s (no input)", tool, label)
         return ""
     log.info("  → %s (%s) — %d input(s)", tool, label, len(_lines(stdin)))
-    verbose = log.isEnabledFor(logging.DEBUG)
-    if verbose:
-        log.debug("    $ %s", shlex.join(cmd))
+    verbose = is_verbose()
     out = tools.run(cmd, stdin=stdin, stream_stderr=verbose)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(out, encoding="utf-8")
@@ -527,7 +523,15 @@ def crawl(activity: Activity, app_id: str) -> None:
 
 
 def subenum(activity: Activity, app_id: str) -> None:
-    """DEPTH 3 — passive subdomain enum (subfinder + dnsx live filter) → subs.txt."""
+    """DEPTH 3 — passive subdomain enum (subfinder + dnsx live filter) → subs.txt.
+
+    NOTE — overlaps with breadth on purpose, by different trigger: breadth `expand`
+    enumerates subs of the input SCOPE WILDCARDS (feeds httpx); this enumerates subs
+    of the clustered app's discovered APEXES (feeds `takeover`). Non-redundant when an
+    apex was discovered (TLS SAN / PTR) or the scope had no wildcard — breadth never
+    covered it. Redundant only when a scope wildcard == the app apex; no dedup against
+    breadth's subdomains.txt today (a cheap future win; ties into a `recluster` step).
+    """
     ws = activity.app(app_id)
     hosts = [url_host(u) for u in tools.read_lines(ws.hosts)]
     apexes = sorted({apex(h) for h in hosts if not is_ip(h)})
@@ -556,7 +560,7 @@ def takeover(activity: Activity, app_id: str) -> None:
     log.info("  → subjack (%s) — %d candidate(s)", app_id, len(candidates))
     out = tools.run(
         ["subjack", "-w", str(cand_file), "-t", SUBJACK_THREADS, "-timeout", SUBJACK_TIMEOUT, "-ssl"],
-        stream_stderr=log.isEnabledFor(logging.DEBUG),
+        stream_stderr=is_verbose(),
     )
     raw_out = ws.raw("subjack") / "out.txt"
     raw_out.parent.mkdir(parents=True, exist_ok=True)
@@ -640,7 +644,7 @@ def _shortscan_surface(ws: AppWorkspace, app_id: str) -> list[str]:
     out = tools.run(
         [SHORTSCAN, "-o", "json", "-a", "auto", "-w", str(rainbow), "-c", SHORTSCAN_CONC,
          f"@{hosts_file}"],
-        stream_stderr=log.isEnabledFor(logging.DEBUG),
+        stream_stderr=is_verbose(),
     )
     (ws.raw("shortscan") / "out.json").write_text(out, encoding="utf-8")
     return parse_shortscan(out)
@@ -698,14 +702,11 @@ def content_discovery(activity: Activity, app_id: str) -> None:
     ext_args = ["-x", *exts] if exts else []
     out_file = ws.raw("feroxbuster") / "out.json"
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    verbose = log.isEnabledFor(logging.DEBUG)
     log.info("  → feroxbuster (%s) — %d host(s), %d term(s)%s", app_id, len(hosts), n_wl,
              f", -x {','.join(exts)}" if exts else "")
     cmd = [FEROX, "--stdin", "--silent", "--json", "-o", str(out_file), "--no-state", "-k",
            "--smart", "-d", FEROX_DEPTH, "--rate-limit", FEROX_RL, "-w", str(wordlist), *ext_args]
-    if verbose:
-        log.debug("    $ %s", shlex.join(cmd))
-    tools.run(cmd, stdin="\n".join(hosts), stream_stderr=verbose)
+    tools.run(cmd, stdin="\n".join(hosts), stream_stderr=is_verbose())
     records = parse_ferox(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
     n = tools.write_jsonl(ws.canonical("content_discovery.jsonl"), records)
     log.info("    feroxbuster (%s) → %d result(s) → content_discovery.jsonl", app_id, n)

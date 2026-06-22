@@ -16,7 +16,7 @@ from prefect.task_runners import ThreadPoolTaskRunner
 
 from pipt.core.agent import propose_hypotheses
 from pipt.core.config import CONFIG
-from pipt.core.log import get_logger
+from pipt.core.log import add_file_handler, get_logger
 from pipt.core.paths import Activity
 from pipt.core.stage import Pipeline, Stage
 from pipt.pipelines import load_pipeline
@@ -139,6 +139,7 @@ def orchestrate(
 ) -> Path:
     """Run the full pipeline for one activity. Returns the activity base dir."""
     activity = Activity.named(activity_name, Path(root) if root else None).ensure()
+    add_file_handler(activity.logs / "run.log")  # persist the full run log (every command + output)
     scope_text = Path(scope_file).read_text(encoding="utf-8")
     activity.scope.write_text(scope_text, encoding="utf-8")
     activity.scope_init.write_text(scope_text, encoding="utf-8")

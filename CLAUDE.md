@@ -31,8 +31,13 @@ uv run pytest tests/core/test_orchestrator.py          # one file
 uv run pytest tests/core/test_scope.py::test_classify  # one test
 ```
 
-- `<pipeline>` is `example` or `recon` (see below). `-v`/`--verbose` logs the exact command,
-  streams each tool's stderr live, and dumps its stdout.
+- `<pipeline>` is `example` or `recon` (see below). Every external command (routed through
+  `tools.run`/`tools.pipe`) is logged, and the full run log — every command + output — is persisted
+  to `<activity>/logs/run.log` regardless of console verbosity. `-v`/`--verbose` additionally surfaces
+  commands and live tool stdout/stderr on the console.
+  - The "pipt" logger level is always DEBUG; the *console* handler is raised to INFO without `-v`,
+    so the file (DEBUG) captures the full record while the console stays quiet. `is_verbose()` (not
+    the logger level) gates console-only behaviour like streaming a tool's stderr.
 - Ruff runs with `select = ["ALL"]`; respect the `ignore`/`per-file-ignores` in `pyproject.toml`
   rather than adding blanket `# noqa`. `ty` is the type checker (not mypy).
 

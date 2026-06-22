@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
+from pipt.core.log import get_logger
+
 Command = Sequence[str]
+log = get_logger()
 
 
 class ToolNotFoundError(RuntimeError):
@@ -34,6 +38,7 @@ def run(  # noqa: PLR0913
     """Run a command, return stdout. When `stream_stderr` is set, the tool's
     stderr is inherited (printed live to the terminal) instead of suppressed —
     used by verbose mode to surface tool progress/logs."""
+    log.debug("$ %s", shlex.join(list(cmd)))
     proc = subprocess.run(
         list(cmd),
         input=stdin,
@@ -50,6 +55,7 @@ def run(  # noqa: PLR0913
 def pipe(stages: Sequence[Command], *, stdin: str | None = None) -> str:
     if not stages:
         return ""
+    log.debug("$ %s", " | ".join(shlex.join(list(s)) for s in stages))
     procs: list[subprocess.Popen[bytes]] = []
     first = subprocess.Popen(
         list(stages[0]),
