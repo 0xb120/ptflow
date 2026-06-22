@@ -30,6 +30,9 @@ class ReconPipeline:
         # per-app LOOP 2 — content discovery (reads loop-1 artifacts across the barrier)
         Stage("wordlist", tasks.build_wordlist, per_app=True, phase=2),
         Stage("fetch_delta", tasks.fetch_delta, per_app=True, phase=2),  # ∥ wordlist
+        Stage("tech_enum", tasks.tech_enum, needs=("wordlist",), per_app=True, phase=2),
+        Stage("content_discovery", tasks.content_discovery,
+              needs=("wordlist", "tech_enum"), per_app=True, phase=2),  # ∥ fetch_delta
     )
 
     def cluster(self, activity: Activity) -> list[str]:

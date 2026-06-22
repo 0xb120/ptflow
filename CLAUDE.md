@@ -123,8 +123,12 @@ recon hashes `Title|Content-Length|Webserver`; the example stub hashes a fabrica
 - **`recon`** — the REAL ProjectDiscovery toolchain (`pipelines/recon/tasks.py`), a faithful port of
   bash recon scripts (`scope2surface.sh` breadth, `surfagr.sh` clustering). Its per-app loops:
   - **Loop 1 — enumeration** (`phase=1`): `passive_probe` → `crawl`, `subenum`, `takeover`.
-  - **Loop 2 — content discovery** (`phase=2`): `wordlist` (offline) ∥ `fetch_delta` (downloads the
-    OSINT delta; see below). `content_discovery` (fuzzing) and `tech_enum` are planned next.
+  - **Loop 2 — content discovery** (`phase=2`): `wordlist` (offline) → `tech_enum` (surface-generating
+    per-stack scanners) → `content_discovery` (feroxbuster forced browsing), ∥ `fetch_delta` (OSINT
+    delta). See below.
+  - **Loop 3 — vuln scan** (gated, planned): `tech_vulnscan` — finding-only per-stack scanners
+    (`wpprobe`, nuclei tech-tags, `nikto`, …). Specialized scanners are split between loops by output
+    role: **surface → `tech_enum`** (loop 2, feeds enum); **findings → `tech_vulnscan`** (loop 3).
 
 ### Fetch once, mine offline
 
@@ -141,6 +145,23 @@ gau/urlfinder URLs minus what the crawl already requested, static assets dropped
 path segments, filename basenames and parameter names (`tokenize_urls`) and merges any tech-specific
 static lists keyed on the cluster's detected tech (`select_tech_wordlists`, best-effort — no-op if
 `WORDLIST_DIR` is absent). Output: the per-app `scans/<app_id>/wl/seed.txt`.
+
+`content_discovery` is the one Loop 2 step that *must* make new requests — forced browsing finds
+UNLINKED paths, which by definition aren't in any downloaded body. `feroxbuster --smart` (auto-tune
+soft-404 calibration + collect-words/backups + link extraction/recursion) over the app's hosts, with
+a combined wordlist (`wl/seed.txt` first, then a global SecLists list — `CONTENT_WORDLIST`, default
+`/opt/wordlist/SecLists/Discovery/Web-Content/raft-medium-directories.txt`) and tech-derived extensions
+(`tech_extensions`). `--smart` means the wordlist-feedback loop is built in — don't hand-roll it.
+Output: `scans/<app_id>/content_discovery.jsonl` (`parse_ferox` keeps the `response` records).
+
+**Specialized per-stack scanners are split by output role** (so they land in the right loop):
+- `tech_enum` (loop 2, before content_discovery) runs scanners whose output is **surface that feeds
+  enum**. Today: `shortscan` (IIS/ASP.NET 8.3 short-name enumeration). It builds a `shortutil` rainbow
+  table from the seed + global list so shortscan resolves leaked 8.3 names to real filenames, then
+  `parse_shortscan` harvests those as fuzz words → `wl/shortnames.txt`, merged into the combined
+  wordlist. Best-effort dispatch keyed on detected tech (no-op if tech unmatched / binary absent).
+- `tech_vulnscan` (loop 3, gated, planned) runs scanners whose output is **findings-only** (`wpprobe`,
+  nuclei tech-tags, `nikto`, …).
 
 ## Adding a pipeline (checklist)
 

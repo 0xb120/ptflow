@@ -44,7 +44,10 @@ def test_pipeline_object_shape():
     activity = [s.name for s in PIPELINE.stages if not s.per_app]
     app = [s.name for s in PIPELINE.stages if s.per_app]
     assert activity == ["expand", "resolve", "portscan", "httpx", "nerva"]
-    assert app == ["passive_probe", "crawl", "subenum", "takeover", "wordlist", "fetch_delta"]
+    assert app == [
+        "passive_probe", "crawl", "subenum", "takeover",
+        "wordlist", "fetch_delta", "tech_enum", "content_discovery",
+    ]
     by_name = {s.name: s for s in PIPELINE.stages}
     # httpx ∥ nerva (both depend only on portscan, not on each other)
     assert by_name["httpx"].needs == ("portscan",)
@@ -54,10 +57,13 @@ def test_pipeline_object_shape():
     assert set(by_name["takeover"].needs) == {"crawl", "subenum"}
     # loop 1 = enumeration; loop 2 = content discovery (separate per-app loop)
     assert {by_name[n].phase for n in ("passive_probe", "crawl", "subenum", "takeover")} == {1}
-    # loop 2 stages cross the loop-1 barrier (no `needs`) and run in parallel
-    assert {by_name[n].phase for n in ("wordlist", "fetch_delta")} == {2}
+    # loop 2 stages cross the loop-1 barrier (no cross-loop `needs`)
+    assert {by_name[n].phase for n in ("wordlist", "fetch_delta", "tech_enum", "content_discovery")} == {2}
     assert by_name["wordlist"].needs == ()
     assert by_name["fetch_delta"].needs == ()
+    # within loop 2: tech_enum→seed; content_discovery waits for seed + tech_enum surface; fetch_delta ∥
+    assert by_name["tech_enum"].needs == ("wordlist",)
+    assert set(by_name["content_discovery"].needs) == {"wordlist", "tech_enum"}
 
 
 def test_depth_pure_helpers():
@@ -114,6 +120,42 @@ def test_passive_delta_excludes_crawled_and_static():
     ]
     crawled = ["https://x/already", "https://x/home"]
     assert tasks.passive_delta(passive, crawled) == ["https://x/api/users", "https://x/old/page"]
+
+
+def test_tech_extensions_from_detected_tech():
+    mapping = {"php": ["php"], "asp.net": ["asp", "aspx"], "java": ["jsp"]}
+    assert tasks.tech_extensions(["PHP", "Nginx"], mapping) == ["php"]   # case-insensitive
+    assert tasks.tech_extensions(["ASP.NET 4.8"], mapping) == ["asp", "aspx"]  # substring match
+    assert tasks.tech_extensions(["Go"], mapping) == []                  # no match
+
+
+def test_parse_ferox_keeps_response_records():
+    out = (
+        '{"type":"response","url":"https://x/admin","status":200,"content_length":12,"word_count":3,"line_count":1}\n'
+        '{"type":"response","url":"https://x/old","status":301,"content_length":0,"word_count":0,"line_count":0}\n'
+        '{"type":"statistics","total":2}\n'   # dropped — not a response
+        "not json\n"                          # dropped — unparseable
+        "\n"
+    )
+    assert tasks.parse_ferox(out) == [
+        {"url": "https://x/admin", "status": 200, "length": 12, "words": 3, "lines": 1},
+        {"url": "https://x/old", "status": 301, "length": 0, "words": 0, "lines": 0},
+    ]
+
+
+def test_parse_shortscan_harvests_surface_words():
+    out = (
+        '{"type":"status","url":"https://x/","server":"Microsoft-IIS/10.0","vulnerable":true}\n'
+        '{"type":"result","fullmatch":true,"baseurl":"https://x/","shortfile":"ADMINI",'
+        '"shortext":".ASP","shorttilde":"~1","partname":"ADMINI?.ASP?","fullname":"administrator.aspx"}\n'
+        '{"type":"result","fullmatch":false,"baseurl":"https://x/","shortfile":"BACKUP",'
+        '"shortext":".ZIP","shorttilde":"~1","partname":"BACKUP?.ZIP?","fullname":""}\n'
+        '{"type":"statistics","requests":100}\n'
+        "garbage\n"
+    )
+    words = tasks.parse_shortscan(out)
+    assert {"administrator.aspx", "administrator", "admini", "backup"} <= set(words)  # resolved + 8.3
+    assert len(words) == len(set(words))  # deduped, lowercased
 
 
 def test_build_wordlist_offline(tmp_path):

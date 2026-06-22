@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import shlex
+import shutil
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
@@ -22,7 +23,7 @@ from pipt.core import scope, tools, workspace
 from pipt.core.log import get_logger
 
 if TYPE_CHECKING:
-    from pipt.core.paths import Activity
+    from pipt.core.paths import Activity, AppWorkspace
     from pipt.core.scope import Target
 
 log = get_logger()
@@ -63,9 +64,34 @@ TECH_WORDLISTS = {                        # detected-tech keyword → list relat
 }
 OSINT_FETCH_RL = "50"  # httpx req/s when downloading the OSINT delta into responses/osint/
 
+# content discovery (LOOP 2) — feroxbuster forced browsing
+SECLISTS_DIR = Path("/opt/wordlist/SecLists")
+CONTENT_WORDLIST = SECLISTS_DIR / "Discovery" / "Web-Content" / "raft-medium-directories.txt"  # global; optional
+FEROX_DEPTH = "2"   # recursion depth (conservative; feroxbuster default is 4)
+FEROX_RL = "100"    # feroxbuster --rate-limit req/s (conservative for live infra)
+TECH_EXTENSIONS = {  # detected-tech keyword → file extensions to fuzz
+    "php": ["php"],
+    "asp.net": ["asp", "aspx", "ashx"],
+    "java": ["jsp", "do", "action"],
+    "python": ["py"],
+    "ruby": ["rb"],
+    "coldfusion": ["cfm", "cfc"],
+}
+
 # `httpx` on PATH is the pyenv shim; the ProjectDiscovery binary lives in ~/go/bin.
 _HTTPX_BIN = Path.home() / "go" / "bin" / "httpx"
 HTTPX = str(_HTTPX_BIN) if _HTTPX_BIN.exists() else "httpx"
+
+# feroxbuster lives in ~/.local/bin (may not be on the subprocess PATH).
+_FEROX_BIN = Path.home() / ".local" / "bin" / "feroxbuster"
+FEROX = str(_FEROX_BIN) if _FEROX_BIN.exists() else "feroxbuster"
+
+# shortscan + shortutil (IIS 8.3 short-name enum, tech_enum) live in ~/go/bin.
+_SHORTSCAN_BIN = Path.home() / "go" / "bin" / "shortscan"
+SHORTSCAN = str(_SHORTSCAN_BIN) if _SHORTSCAN_BIN.exists() else "shortscan"
+_SHORTUTIL_BIN = Path.home() / "go" / "bin" / "shortutil"
+SHORTUTIL = str(_SHORTUTIL_BIN) if _SHORTUTIL_BIN.exists() else "shortutil"
+SHORTSCAN_CONC = "20"  # shortscan -c concurrency (its default)
 
 
 # --- pure transforms (unit-tested) ---
@@ -194,6 +220,68 @@ def passive_delta(passive: list[str], crawled: list[str]) -> list[str]:
     """
     already = set(crawled)
     return [u for u in denoise(tools.dedupe(passive)) if u not in already]
+
+
+def tech_extensions(tech: list[str], mapping: dict[str, list[str]]) -> list[str]:
+    """File extensions to fuzz, derived from detected tech (case-insensitive substring)."""
+    tags = [t.lower() for t in tech]
+    out: list[str] = []
+    for key, exts in mapping.items():
+        if any(key in tag for tag in tags):
+            out += exts
+    return tools.dedupe(out)
+
+
+def parse_ferox(out: str) -> list[dict]:
+    """Keep feroxbuster --json 'response' records (drop stats/garbage); normalize."""
+    records: list[dict] = []
+    for ln in out.splitlines():
+        text = ln.strip()
+        if not text:
+            continue
+        try:
+            r = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if r.get("type") != "response":
+            continue
+        records.append({
+            "url": r.get("url"),
+            "status": r.get("status"),
+            "length": r.get("content_length"),
+            "words": r.get("word_count"),
+            "lines": r.get("line_count"),
+        })
+    return records
+
+
+def parse_shortscan(out: str) -> list[str]:
+    """Fuzz words from shortscan --output json 'result' records (schema: v0.9.2).
+
+    Per confirmed hit: the resolved full name + its basename when `fullmatch`
+    (autocomplete/rainbow recovered the real filename), else the 8.3 `shortfile`
+    prefix. All lowercased and deduped — surface words for content_discovery, not
+    URLs. 'status'/'statistics' records and unparseable lines are dropped.
+    """
+    words: list[str] = []
+    for ln in out.splitlines():
+        text = ln.strip()
+        if not text:
+            continue
+        try:
+            r = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if r.get("type") != "result":
+            continue
+        full = (r.get("fullname") or "").strip()
+        if full:
+            words.append(full)
+            words.append(full.rsplit(".", 1)[0])
+        short = (r.get("shortfile") or "").strip()
+        if short:
+            words.append(short)
+    return tools.dedupe(w.lower() for w in words if w.strip())
 
 
 # --- helpers ---
@@ -523,3 +611,101 @@ def fetch_delta(activity: Activity, app_id: str) -> None:
     store.mkdir(parents=True, exist_ok=True)
     _run("httpx", [HTTPX, "-silent", "-srd", str(store), "-rl", OSINT_FETCH_RL],
          stdin="\n".join(delta), dest=ws.raw("httpx_osint") / "out.txt", label=app_id)
+
+
+def _shortscan_surface(ws: AppWorkspace, app_id: str) -> list[str]:
+    """IIS 8.3 short-name enumeration → fuzz words (shortscan + shortutil rainbow).
+
+    Builds a shortutil rainbow table from the per-app seed + global list so shortscan
+    resolves the leaked 8.3 names to real filenames (on top of its HTTP autocomplete
+    oracles), then harvests those names as surface. Best-effort: no-op if the binaries
+    are missing or the app has no hosts.
+    """
+    if shutil.which(SHORTSCAN) is None or shutil.which(SHORTUTIL) is None:
+        log.debug("  · skip shortscan (not installed) for %s", app_id)
+        return []
+    hosts = tools.read_lines(ws.hosts)
+    if not hosts:
+        return []
+    rainbow_src = ws.wl / "rainbow_src.txt"
+    tools.write_lines(rainbow_src, [
+        *tools.read_lines(ws.wl / "seed.txt"),
+        *(tools.read_lines(CONTENT_WORDLIST) if CONTENT_WORDLIST.is_file() else []),
+    ])
+    rainbow = ws.wl / "rainbow.txt"
+    rainbow.write_text(tools.run([SHORTUTIL, "wordlist", str(rainbow_src)]), encoding="utf-8")
+    hosts_file = ws.raw("shortscan") / "hosts.txt"
+    tools.write_lines(hosts_file, hosts)
+    log.info("  → shortscan (%s) — %d host(s)", app_id, len(hosts))
+    out = tools.run(
+        [SHORTSCAN, "-o", "json", "-a", "auto", "-w", str(rainbow), "-c", SHORTSCAN_CONC,
+         f"@{hosts_file}"],
+        stream_stderr=log.isEnabledFor(logging.DEBUG),
+    )
+    (ws.raw("shortscan") / "out.json").write_text(out, encoding="utf-8")
+    return parse_shortscan(out)
+
+
+def tech_enum(activity: Activity, app_id: str) -> None:
+    """LOOP 2 (surface) — specialized per-stack scanners whose output FEEDS enum.
+
+    Best-effort dispatch keyed on the cluster's detected tech: a scanner runs only if
+    its tech matched AND its binary is installed. Output is SURFACE (fuzz words) →
+    wl/shortnames.txt, which content_discovery merges into its wordlist. Scanners whose
+    output is findings-only (wpprobe, nuclei, …) belong to tech_vulnscan / loop 3.
+
+    Today: shortscan (IIS/ASP.NET 8.3 short-name enumeration). Reads loop-1 hosts
+    across the barrier; needs the wordlist seed for the shortutil rainbow table.
+    """
+    ws = activity.app(app_id)
+    tech = " ".join(workspace.read_meta(ws.meta).get("tech") or []).lower()
+    surface: list[str] = []
+    if any(k in tech for k in ("iis", "asp.net", "microsoft-iis")):
+        surface += _shortscan_surface(ws, app_id)
+    n = tools.write_lines(ws.wl / "shortnames.txt", surface)
+    log.info("  → tech_enum (%s) — %d surface term(s) → wl/shortnames.txt", app_id, n)
+
+
+def content_discovery(activity: Activity, app_id: str) -> None:
+    """LOOP 2.3 — forced browsing (feroxbuster) seeded by the custom wordlist.
+
+    Discovers UNLINKED paths/files — the one thing reusing downloaded bodies can't
+    do, so it must make new requests. feroxbuster --smart brings auto-tune (soft-404
+    calibration), collect-words/backups and link extraction/recursion for free, so
+    the wordlist-feedback loop is built in. Targets the app's hosts with a combined
+    wordlist (per-app wl/seed.txt first, then a global SecLists list) and tech-derived
+    extensions. Output: scans/<app_id>/content_discovery.jsonl.
+
+    feroxbuster writes JSON to -o (not stdout), so it bypasses _run.
+    """
+    ws = activity.app(app_id)
+    hosts = tools.read_lines(ws.hosts)
+    if not hosts:
+        log.debug("  · skip content_discovery (no hosts) for %s", app_id)
+        return
+
+    # combined wordlist = per-app seed + tech_enum surface (app-specific, first) + global SecLists
+    seed = tools.read_lines(ws.wl / "seed.txt")
+    shortnames = tools.read_lines(ws.wl / "shortnames.txt")  # tech_enum surface (8.3 names)
+    global_wl = tools.read_lines(CONTENT_WORDLIST) if CONTENT_WORDLIST.is_file() else []
+    wordlist = ws.wl / "combined.txt"
+    n_wl = tools.write_lines(wordlist, [*seed, *shortnames, *global_wl])
+    if not n_wl:
+        log.debug("  · skip content_discovery (empty wordlist) for %s", app_id)
+        return
+
+    exts = tech_extensions(workspace.read_meta(ws.meta).get("tech") or [], TECH_EXTENSIONS)
+    ext_args = ["-x", *exts] if exts else []
+    out_file = ws.raw("feroxbuster") / "out.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    verbose = log.isEnabledFor(logging.DEBUG)
+    log.info("  → feroxbuster (%s) — %d host(s), %d term(s)%s", app_id, len(hosts), n_wl,
+             f", -x {','.join(exts)}" if exts else "")
+    cmd = [FEROX, "--stdin", "--silent", "--json", "-o", str(out_file), "--no-state", "-k",
+           "--smart", "-d", FEROX_DEPTH, "--rate-limit", FEROX_RL, "-w", str(wordlist), *ext_args]
+    if verbose:
+        log.debug("    $ %s", shlex.join(cmd))
+    tools.run(cmd, stdin="\n".join(hosts), stream_stderr=verbose)
+    records = parse_ferox(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
+    n = tools.write_jsonl(ws.canonical("content_discovery.jsonl"), records)
+    log.info("    feroxbuster (%s) → %d result(s) → content_discovery.jsonl", app_id, n)
