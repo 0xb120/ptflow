@@ -38,7 +38,8 @@ def run(  # noqa: PLR0913
     """Run a command, return stdout. When `stream_stderr` is set, the tool's
     stderr is inherited (printed live to the terminal) instead of suppressed —
     used by verbose mode to surface tool progress/logs."""
-    log.debug("$ %s", shlex.join(list(cmd)))
+    cmd_str = shlex.join(list(cmd))
+    log.debug("$ %s", cmd_str)
     proc = subprocess.run(
         list(cmd),
         input=stdin,
@@ -49,6 +50,10 @@ def run(  # noqa: PLR0913
         timeout=timeout,
         cwd=cwd,
     )
+    if not check and proc.returncode != 0:
+        # surface non-zero exits so a broken tool (bad flag, crash) can't masquerade
+        # as a clean empty result — WARNING reaches the console even without --verbose
+        log.warning("⚠ command exited %d: %s", proc.returncode, cmd_str)
     return proc.stdout
 
 

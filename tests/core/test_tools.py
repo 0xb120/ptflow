@@ -20,6 +20,24 @@ def test_run_echoes_stdout():
     assert tools.run(["printf", "hello"]) == "hello"
 
 
+def test_run_warns_on_nonzero_exit():
+    import logging
+
+    from pipt.core.log import get_logger
+
+    lg = get_logger()
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append          # capture records directly (bypasses propagate)
+    handler.setLevel(logging.WARNING)
+    lg.addHandler(handler)
+    try:
+        tools.run(["false"])               # exits 1 → should warn, not stay silent
+    finally:
+        lg.removeHandler(handler)
+    assert any(r.levelno == logging.WARNING and "exited 1" in r.getMessage() for r in records)
+
+
 def test_pipe_chains_processes():
     out = tools.pipe([["printf", "a\nb\na\n"], ["sort", "-u"]])
     assert out.splitlines() == ["a", "b"]
