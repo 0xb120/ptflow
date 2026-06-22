@@ -43,15 +43,17 @@ def test_pipeline_object_shape():
     assert PIPELINE.name == "recon"
     activity = [s.name for s in PIPELINE.stages if not s.per_app]
     app = [s.name for s in PIPELINE.stages if s.per_app]
-    assert activity == ["expand", "resolve", "portscan", "httpx", "nerva"]
+    assert activity == ["expand", "resolve", "portscan", "httpx", "nerva", "takeover_scope"]
     assert app == [
         "screenshot", "passive_probe", "crawl", "subenum", "takeover",
-        "wordlist", "fetch_delta", "tech_enum", "content_discovery",
+        "wordlist", "fetch_delta", "mine_responses", "tech_enum", "content_discovery",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
     # httpx ∥ nerva (both depend only on portscan, not on each other)
     assert by_name["httpx"].needs == ("portscan",)
     assert by_name["nerva"].needs == ("portscan",)
+    # scope-wide nuclei takeover runs ∥ the rest of asset discovery (needs only resolve)
+    assert by_name["takeover_scope"].needs == ("resolve",)
     # subenum ∥ passive_probe/crawl; takeover waits for both crawl and subenum
     assert by_name["subenum"].needs == ()
     assert set(by_name["takeover"].needs) == {"crawl", "subenum"}
@@ -59,12 +61,14 @@ def test_pipeline_object_shape():
     assert {by_name[n].phase for n in ("screenshot", "passive_probe", "crawl", "subenum", "takeover")} == {1}
     assert by_name["screenshot"].needs == ()  # first loop-1 step, runs right after cluster
     # loop 2 stages cross the loop-1 barrier (no cross-loop `needs`)
-    assert {by_name[n].phase for n in ("wordlist", "fetch_delta", "tech_enum", "content_discovery")} == {2}
+    loop2 = ("wordlist", "fetch_delta", "mine_responses", "tech_enum", "content_discovery")
+    assert {by_name[n].phase for n in loop2} == {2}
     assert by_name["wordlist"].needs == ()
     assert by_name["fetch_delta"].needs == ()
-    # within loop 2: tech_enum→seed; content_discovery waits for seed + tech_enum surface; fetch_delta ∥
+    # within loop 2: tech_enum→seed; mine_responses→osint bodies; content_discovery folds both in
     assert by_name["tech_enum"].needs == ("wordlist",)
-    assert set(by_name["content_discovery"].needs) == {"wordlist", "tech_enum"}
+    assert by_name["mine_responses"].needs == ("fetch_delta",)
+    assert set(by_name["content_discovery"].needs) == {"wordlist", "tech_enum", "mine_responses"}
 
 
 def test_depth_pure_helpers():
@@ -172,6 +176,35 @@ def test_build_wordlist_offline(tmp_path):
     tasks.build_wordlist(act, "app1")
     words = tools.read_lines(ws.wl / "seed.txt")
     assert {"admin", "index.php", "index", "id"} <= set(words)
+
+
+def test_is_spa_detects_js_frameworks():
+    assert tasks.is_spa(["React", "Webpack"])
+    assert tasks.is_spa(["Nginx", "Vue.js"])
+    assert not tasks.is_spa(["Apache HTTP Server:2.4.7", "Ubuntu"])
+    assert not tasks.is_spa([])
+
+
+def test_is_js_url():
+    assert tasks.is_js_url("https://x/a/app.min.js")
+    assert tasks.is_js_url("https://x/app.js?v=2")
+    assert not tasks.is_js_url("https://x/app.css")
+    assert not tasks.is_js_url("https://x/")
+
+
+def test_http_body_extracts_response_body():
+    stored = (
+        "https://x/app.js\n\n"
+        "GET /app.js HTTP/1.1\nHost: x\n\n\n"
+        "HTTP/1.1 200 OK\nContent-Type: application/javascript\n\n\n"
+        "var a = 1;\nfetch('/api/v1');\n"
+    )
+    body = tasks.http_body(stored)
+    assert "var a = 1;" in body
+    assert "fetch('/api/v1');" in body
+    assert "HTTP/1.1 200 OK" not in body  # response headers stripped
+    assert "GET /app.js" not in body      # request block stripped
+    assert tasks.http_body("no http response here") == ""
 
 
 def test_best_host_prefers_non_ip_then_https():

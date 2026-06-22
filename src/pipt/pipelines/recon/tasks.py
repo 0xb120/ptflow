@@ -40,6 +40,7 @@ KATANA_CONC = "2"
 SUBJACK_THREADS = "100"
 SUBJACK_TIMEOUT = "30"
 SCREENSHOT_TIMEOUT = "20"   # httpx -screenshot per-page timeout (seconds)
+SPA_FRAMEWORKS = frozenset({"react", "vue", "angular", "svelte", "next", "nuxt", "gatsby", "ember"})
 NOISE_EXTENSIONS = frozenset({
     "jpg", "jpeg", "png", "gif", "svg", "bmp", "webp", "ico",
     "woff", "woff2", "ttf", "eot", "otf", "css",
@@ -96,6 +97,10 @@ SHORTSCAN = str(_SHORTSCAN_BIN) if _SHORTSCAN_BIN.exists() else "shortscan"
 _SHORTUTIL_BIN = Path.home() / "go" / "bin" / "shortutil"
 SHORTUTIL = str(_SHORTUTIL_BIN) if _SHORTUTIL_BIN.exists() else "shortutil"
 SHORTSCAN_CONC = "20"  # shortscan -c concurrency (its default)
+
+# jsluice (offline JS endpoint/secret mining of the response store) lives in ~/go/bin.
+_JSLUICE_BIN = Path.home() / "go" / "bin" / "jsluice"
+JSLUICE = str(_JSLUICE_BIN) if _JSLUICE_BIN.exists() else "jsluice"
 
 
 # --- pure transforms (unit-tested) ---
@@ -300,6 +305,32 @@ def parse_shortscan(out: str) -> list[str]:
     return tools.dedupe(w.lower() for w in words if w.strip())
 
 
+def is_js_url(url: str) -> bool:
+    """True if the URL points at a JavaScript file (path ends .js, ignoring the query)."""
+    last = url.split("?", 1)[0].rsplit("/", 1)[-1]
+    return last.lower().endswith(".js")
+
+
+def http_body(text: str) -> str:
+    """Body of a katana/httpx -srd stored response (URL + request + response headers +
+    body). Returns the text after the response headers — the lines after the first blank
+    line that follows the 'HTTP/...' status line. '' if no response line is found."""
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("HTTP/")), None)
+    if start is None:
+        return ""
+    for j in range(start + 1, len(lines)):
+        if not lines[j].strip():
+            return "\n".join(lines[j + 1:]).strip("\n")
+    return ""
+
+
+def is_spa(tech: list[str]) -> bool:
+    """Whether the cluster's detected tech (meta.json) suggests a JS SPA → headless crawl."""
+    blob = " ".join(tech).lower()
+    return any(fw in blob for fw in SPA_FRAMEWORKS)
+
+
 # --- helpers ---
 def _lines(text: str) -> list[str]:
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -464,6 +495,17 @@ def nerva_fingerprint(activity: Activity) -> None:
          dest=canon("nerva_full_metadata.jsonl"), label="json")
 
 
+def takeover_scope(activity: Activity) -> None:
+    """BREADTH — scope-wide subdomain-takeover scan (nuclei -tags takeover) over the
+    resolved subdomains, running ∥ the rest of asset discovery. Complements the per-app
+    subjack (loop 1) with nuclei's signatures. Best-effort: needs nuclei templates
+    installed (`nuclei -ut`); -duc keeps it from phoning home mid-run.
+    """
+    _run("nuclei", ["nuclei", "-tags", "takeover", "-j", "-silent", "-duc"],
+         stdin="\n".join(tools.read_lines(activity.asset_discovery_canonical("subdomains.txt"))),
+         dest=activity.asset_discovery_canonical("takeovers_scope.jsonl"), label="takeover_scope")
+
+
 # --- clustering (surfagr.sh port) ---
 def cluster(activity: Activity) -> list[str]:
     """Group httpx vhosts by (Title, Content-Length, Webserver) into scans/<app_id>/.
@@ -554,19 +596,20 @@ def crawl(activity: Activity, app_id: str) -> None:
     -srd (store every response). Its URL output already contains JS-discovered and
     known-file paths, so endpoints.txt is the JS-enriched corpus; the stored bodies
     under responses/ are the per-app corpus that offline steps mine WITHOUT
-    re-fetching (the crawler is the downloader for the linked surface). Merges with
+    re-fetching (the crawler is the downloader for the linked surface). Clusters whose
+    detected tech is a JS SPA (is_spa) also get -headless to render the app. Merges with
     passive + denoise → endpoints.txt.
     """
     ws = activity.app(app_id)
     hosts = tools.read_lines(ws.hosts)
     if hosts:
         ws.responses.mkdir(parents=True, exist_ok=True)
-    crawled = _lines(_run(
-        "katana",
-        ["katana", "-silent", "-jc", "-jsl", "-kf", "all", "-d", KATANA_DEPTH, "-c", KATANA_CONC,
-         "-srd", str(ws.responses)],
-        stdin="\n".join(hosts), dest=ws.raw("katana") / "out.txt", label=app_id,
-    ))
+    katana = ["katana", "-silent", "-jc", "-jsl", "-kf", "all", "-d", KATANA_DEPTH, "-c", KATANA_CONC,
+              "-srd", str(ws.responses)]
+    if is_spa(workspace.read_meta(ws.meta).get("tech") or []):
+        katana += ["-headless", "-system-chrome"]  # render JS SPAs (detected framework)
+    crawled = _lines(_run("katana", katana, stdin="\n".join(hosts),
+                          dest=ws.raw("katana") / "out.txt", label=app_id))
     passive = tools.read_lines(ws.canonical("endpoints_passive.txt"))
     tools.write_lines(ws.canonical("endpoints.txt"), denoise(tools.dedupe([*passive, *crawled])))
 
@@ -666,6 +709,64 @@ def fetch_delta(activity: Activity, app_id: str) -> None:
          stdin="\n".join(delta), dest=ws.raw("httpx_osint") / "out.txt", label=app_id)
 
 
+def _store_index(index: Path) -> list[tuple[str, str]]:
+    """Parse a katana/httpx -srd index.txt → [(stored_file, url)]; lines are
+    '<filepath> <url> (<status>)'."""
+    out: list[tuple[str, str]] = []
+    for ln in tools.read_lines(index):
+        parts = ln.split()
+        if len(parts) >= 2:  # noqa: PLR2004
+            out.append((parts[0], parts[1]))
+    return out
+
+
+def _jsonl_str(out: str) -> list[dict]:
+    """Parse NDJSON from a command's stdout (jsluice), skipping unparseable lines."""
+    recs: list[dict] = []
+    for ln in out.splitlines():
+        text = ln.strip()
+        if text:
+            try:
+                recs.append(json.loads(text))
+            except json.JSONDecodeError:
+                continue
+    return recs
+
+
+def mine_responses(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — mine the per-app response store OFFLINE (cashes in 'fetch once').
+
+    Reads the stored HTTP responses (crawl + fetch_delta -srd) WITHOUT re-fetching:
+    extracts each JS body (http_body) and runs jsluice for endpoints (→ endpoints_js.txt,
+    folded into the content_discovery wordlist) and secrets (→ secrets.jsonl). Needs
+    fetch_delta so the OSINT bodies are present; the crawl bodies are guaranteed by the
+    loop barrier. Port of run-web-sast.sh, but AST-based via jsluice.
+    """
+    ws = activity.app(app_id)
+    js_dir = ws.raw("js")
+    js_files: list[str] = []
+    for index in (ws.responses / "index.txt", ws.responses / "osint" / "response" / "index.txt"):
+        for stored, url in _store_index(index):
+            if not is_js_url(url):
+                continue
+            body = http_body(Path(stored).read_text(encoding="utf-8", errors="replace"))
+            if not body.strip():
+                continue
+            js_dir.mkdir(parents=True, exist_ok=True)
+            dst = js_dir / f"{Path(stored).stem}.js"
+            dst.write_text(body, encoding="utf-8")
+            js_files.append(str(dst))
+    if not js_files:
+        log.debug("  · skip mine_responses (no JS in store) for %s", app_id)
+        return
+    endpoints = [r["url"] for r in _jsonl_str(tools.run([JSLUICE, "urls", *js_files])) if r.get("url")]
+    secrets = _jsonl_str(tools.run([JSLUICE, "secrets", *js_files]))
+    n_ep = tools.write_lines(ws.canonical("endpoints_js.txt"), endpoints)
+    n_sec = tools.write_jsonl(ws.canonical("secrets.jsonl"), secrets)
+    log.info("  → mine_responses (%s) — %d JS · %d endpoint(s) · %d secret(s)",
+             app_id, len(js_files), n_ep, n_sec)
+
+
 def _shortscan_surface(ws: AppWorkspace, app_id: str) -> list[str]:
     """IIS 8.3 short-name enumeration → fuzz words (shortscan + shortutil rainbow).
 
@@ -737,12 +838,13 @@ def content_discovery(activity: Activity, app_id: str) -> None:
         log.debug("  · skip content_discovery (no hosts) for %s", app_id)
         return
 
-    # combined wordlist = per-app seed + tech_enum surface (app-specific, first) + global SecLists
+    # combined wordlist = per-app seed + tech_enum surface + JS-mined paths, then global SecLists
     seed = tools.read_lines(ws.wl / "seed.txt")
     shortnames = tools.read_lines(ws.wl / "shortnames.txt")  # tech_enum surface (8.3 names)
+    js_tokens = tokenize_urls(tools.read_lines(ws.canonical("endpoints_js.txt")))  # mine_responses
     global_wl = tools.read_lines(CONTENT_WORDLIST) if CONTENT_WORDLIST.is_file() else []
     wordlist = ws.wl / "combined.txt"
-    n_wl = tools.write_lines(wordlist, [*seed, *shortnames, *global_wl])
+    n_wl = tools.write_lines(wordlist, [*seed, *shortnames, *js_tokens, *global_wl])
     if not n_wl:
         log.debug("  · skip content_discovery (empty wordlist) for %s", app_id)
         return

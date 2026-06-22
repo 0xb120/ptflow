@@ -91,13 +91,15 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
   scope.txt                              # raw input
   scope/  scope_init|urls|dns|ip.txt     # parsed/expanded scope
   scans/
-    asset_discovery/  raw/<tool>/  <canonical files>      # BREADTH phase
+    asset_discovery/  raw/<tool>/  <canonical files>      # BREADTH (+ takeovers_scope.jsonl)
     <app_id>/                            # one clustered app group (per-app loops)
-      meta.json  hosts.txt  services.jsonl  endpoints.txt  subs.txt  …
+      meta.json  hosts.txt  endpoints.txt  subs.txt  takeover.txt  …
       screenshot.png                     #   root-page screenshot (or screenshot.failed)
+      endpoints_js.txt  secrets.jsonl    #   mine_responses (jsluice over the stored JS)
+      content_discovery.jsonl            #   feroxbuster forced-browse results
       wl/seed.txt                        #   per-app CUSTOM wordlist (loop 2, offline)
-      responses/                         #   downloaded HTML/JS corpus (katana -srd) — mined offline
-      raw/<tool>/
+      responses/                         #   downloaded HTML/JS corpus (katana/httpx -srd) — mined offline
+      raw/<tool>/  (incl. raw/js/ extracted JS bodies)
   findings/hypotheses.jsonl              # dormant agent fan-in output
   poc/  tmp/  logs/
   wl/                                    # GLOBAL/shared wordlists (or links to SecLists & co.)
@@ -129,12 +131,15 @@ recon hashes `Title|Content-Length|Webserver`; the example stub hashes a fabrica
 - **`example`** — stub tasks (deterministic fake IPs/services, no external binaries). Dependency-free;
   this is what the test suite and CI exercise.
 - **`recon`** — the REAL ProjectDiscovery toolchain (`pipelines/recon/tasks.py`), a faithful port of
-  bash recon scripts (`scope2surface.sh` breadth, `surfagr.sh` clustering). Its per-app loops:
+  bash recon scripts (`scope2surface.sh` breadth, `surfagr.sh` clustering). Stages:
+  - **Breadth** (activity scope): `expand` → `resolve` → `portscan` → `httpx` ∥ `nerva`; plus
+    `takeover_scope` (nuclei `-tags takeover` over resolved subdomains, ∥) → `cluster` fan-out.
   - **Loop 1 — enumeration** (`phase=1`): `screenshot` (root-page shot of the cluster's best host, ∥) ;
-    `passive_probe` → `crawl` ; `subenum` ; `takeover` (← crawl + subenum).
+    `passive_probe` → `crawl` (SPA clusters get `-headless`, see `is_spa`) ; `subenum` ; `takeover`
+    (← crawl + subenum).
   - **Loop 2 — content discovery** (`phase=2`): `wordlist` (offline) → `tech_enum` (surface-generating
-    per-stack scanners) → `content_discovery` (feroxbuster forced browsing), ∥ `fetch_delta` (OSINT
-    delta). See below.
+    per-stack scanners) ; `fetch_delta` (OSINT delta) → `mine_responses` (offline JS/secret mining) ;
+    both feed `content_discovery` (feroxbuster forced browsing). See below.
   - **Loop 3 — vuln scan** (gated, planned): `tech_vulnscan` — finding-only per-stack scanners
     (`wpprobe`, nuclei tech-tags, `nikto`, …). Specialized scanners are split between loops by output
     role: **surface → `tech_enum`** (loop 2, feeds enum); **findings → `tech_vulnscan`** (loop 3).
@@ -148,7 +153,9 @@ under `scans/<app_id>/responses/`. Downstream steps mine that corpus offline rat
 A separate downloader is justified only for URLs the crawl never reached — and only over that delta:
 the `fetch_delta` step (`passive_delta` + httpx `-srd`) downloads the live OSINT delta (passive
 gau/urlfinder URLs minus what the crawl already requested, static assets dropped) into
-`responses/osint/`. Brute-forced hits (from future `content_discovery`) are the other such delta.
+`responses/osint/`. `mine_responses` then mines the store **offline** (jsluice over the stored JS
+bodies) → JS endpoints (`endpoints_js.txt`, folded into the content_discovery wordlist) + secrets
+(`secrets.jsonl`). This is where the "fetch once" design pays off — no re-fetching.
 
 `build_wordlist` (`wordlist` step) is therefore **pure offline**: it tokenizes `endpoints.txt` into
 path segments, filename basenames and parameter names (`tokenize_urls`) and merges any tech-specific
