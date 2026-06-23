@@ -44,7 +44,7 @@ def test_pipeline_object_shape():
     activity = [s.name for s in PIPELINE.stages if not s.per_app and not s.spanning]
     spanning = [s.name for s in PIPELINE.stages if s.spanning]
     app = [s.name for s in PIPELINE.stages if s.per_app]
-    assert activity == ["expand", "resolve", "portscan", "httpx", "nerva"]
+    assert activity == ["provision_wl", "expand", "resolve", "portscan", "httpx", "nerva"]
     assert spanning == ["nuclei_scope"]
     assert app == [
         "screenshot", "passive_probe", "crawl", "subenum", "takeover",
@@ -105,17 +105,6 @@ def test_tokenize_urls_mines_segments_keys_and_basenames():
     assert words == sorted(set(words))             # sorted + deduped
 
 
-def test_select_tech_wordlists_matches_existing_files(tmp_path):
-    (tmp_path / "cms").mkdir()
-    (tmp_path / "cms" / "wordpress.txt").write_text("wp-admin\nwp-login.php\n")
-    mapping = {"wordpress": "cms/wordpress.txt", "drupal": "cms/drupal.txt"}
-    # case-insensitive substring match on httpx-style tags; mapped-but-missing file skipped
-    assert tasks.select_tech_wordlists(["WordPress 6.4", "Nginx"], mapping, tmp_path) == [
-        tmp_path / "cms" / "wordpress.txt"
-    ]
-    # no matching tech, or an absent base dir → no-op (step runs without external data)
-    assert tasks.select_tech_wordlists(["Apache"], mapping, tmp_path) == []
-    assert tasks.select_tech_wordlists(["WordPress"], mapping, tmp_path / "nope") == []
 
 
 def test_passive_delta_excludes_crawled_and_static():
@@ -177,7 +166,7 @@ def test_build_wordlist_offline(tmp_path):
     tools.write_lines(ws.canonical("endpoints.txt"), ["https://app1/admin/index.php?id=2"])
 
     tasks.build_wordlist(act, "app1")
-    words = tools.read_lines(ws.wl / "seed.txt")
+    words = tools.read_lines(ws.wl_custom / "seed.txt")
     assert {"admin", "index.php", "index", "id"} <= set(words)
 
 

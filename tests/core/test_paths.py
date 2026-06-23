@@ -30,7 +30,7 @@ def test_app_workspace_paths(tmp_path):
 
 def test_ensure_creates_standard_dirs(tmp_path):
     act = Activity.named("acme", root=tmp_path).ensure()
-    for d in (act.scope_dir, act.asset_discovery, act.findings, act.poc, act.tmp, act.wl, act.logs):
+    for d in (act.scope_dir, act.asset_discovery, act.findings, act.poc, act.tmp, act.wl_global, act.logs):
         assert d.is_dir()
 
 

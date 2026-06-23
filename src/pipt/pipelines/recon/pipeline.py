@@ -17,6 +17,7 @@ class ReconPipeline:
     name = "recon"
     stages: Sequence[Stage] = (
         # activity scope (whole-scope asset discovery)
+        Stage("provision_wl", tasks.provision_wl),  # resolve global wordlist roles → wl_global/ (∥)
         Stage("expand", tasks.expand),
         Stage("resolve", tasks.resolve, needs=("expand",)),
         Stage("portscan", tasks.portscan, needs=("resolve",)),

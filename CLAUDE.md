@@ -102,16 +102,26 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       screenshot.png                     #   root-page screenshot (or screenshot.failed)
       endpoints_js.txt  secrets.jsonl    #   mine_responses (jsluice over the stored JS)
       content_discovery.jsonl            #   feroxbuster forced-browse results
-      wl/seed.txt                        #   per-app CUSTOM wordlist (loop 2, offline)
+      wl_custom/seed.txt                 #   per-app GENERATED wordlist (loop 2, offline)
       responses/                         #   downloaded HTML/JS corpus (katana/httpx -srd) — mined offline
       raw/<tool>/  (incl. raw/js/ extracted JS bodies)
   findings/hypotheses.jsonl              # dormant agent fan-in output
   poc/  tmp/  logs/
-  wl/                                    # GLOBAL/shared wordlists (or links to SecLists & co.)
+  wl_global/                             # shared/global INPUT wordlists (SecLists & co.)
 ```
 
-Two `wl/` scopes: the activity-level `wl/` holds shared/global lists; each app's
-`scans/<app_id>/wl/` holds the wordlists generated for that app.
+Two wordlist scopes (deliberately distinct names): `<activity>/wl_global/` is the
+shared/global INPUT lists; `scans/<app_id>/wl_custom/` is the wordlists GENERATED for
+that app from its own corpus (`Activity.wl_global` / `AppWorkspace.wl_custom`).
+
+**Global wordlists are resolved by ROLE, not hardcoded** (`pipelines/recon/wordlists.py`). The
+`provision_wl` breadth stage resolves each role (`content`, `wordpress`, `drupal`, `joomla`) to a
+concrete file and symlinks it into `wl_global/<role>.txt`; steps then read by role
+(`wordlists.role_path(activity, "content")`). Resolution order: BYO (`wl_global/<role>.txt` already
+present) › explicit env `PIPT_WL_<ROLE>` › discovery (first candidate filename under a search dir;
+search dirs = env `PIPT_WORDLISTS` ++ common locations like `/usr/share/seclists`) › unresolved →
+the step degrades to the generated `wl_custom` (the pipeline never fails for missing wordlists).
+This keeps it independent of WHICH collection, WHERE it's installed, and whether it's installed.
 
 ### Write each tool output exactly once
 
@@ -137,7 +147,8 @@ recon hashes `Title|Content-Length|Webserver`; the example stub hashes a fabrica
   this is what the test suite and CI exercise.
 - **`recon`** — the REAL ProjectDiscovery toolchain (`pipelines/recon/tasks.py`), a faithful port of
   bash recon scripts (`scope2surface.sh` breadth, `surfagr.sh` clustering). Stages:
-  - **Breadth** (activity scope): `expand` → `resolve` → `portscan` → `httpx` ∥ `nerva` → `cluster`
+  - **Breadth** (activity scope): `provision_wl` (resolve global wordlist roles → `wl_global/`) ∥
+    `expand` → `resolve` → `portscan` → `httpx` ∥ `nerva` → `cluster`
     fan-out. Plus `nuclei_scope` — a **spanning** whole-scope full-template nuclei scan (one process,
     one global `-rl` over deduped subdomains + webapps) launched after `httpx`, running ∥ everything,
     joined at the fan-in (`findings/nuclei_scope.jsonl`). It runs `nuclei -ut` (update templates)
@@ -168,14 +179,14 @@ bodies) → JS endpoints (`endpoints_js.txt`, folded into the content_discovery 
 
 `build_wordlist` (`wordlist` step) is therefore **pure offline**: it tokenizes `endpoints.txt` into
 path segments, filename basenames and parameter names (`tokenize_urls`) and merges any tech-specific
-static lists keyed on the cluster's detected tech (`select_tech_wordlists`, best-effort — no-op if
-`WORDLIST_DIR` is absent). Output: the per-app `scans/<app_id>/wl/seed.txt`.
+static lists for the cluster's detected tech (`wordlists.tech_role_paths` → `wl_global/<role>.txt`,
+best-effort). Output: the per-app `scans/<app_id>/wl_custom/seed.txt`.
 
 `content_discovery` is the one Loop 2 step that *must* make new requests — forced browsing finds
 UNLINKED paths, which by definition aren't in any downloaded body. `feroxbuster --smart` (auto-tune
 soft-404 calibration + collect-words/backups + link extraction/recursion) over the app's hosts, with
-a combined wordlist (`wl/seed.txt` first, then a global SecLists list — `CONTENT_WORDLIST`, default
-`/opt/wordlist/SecLists/Discovery/Web-Content/raft-medium-directories.txt`) and tech-derived extensions
+a combined wordlist (`wl_custom/seed.txt` first, then the resolved global list
+`wordlists.role_path(activity, "content")` — see role resolution above) and tech-derived extensions
 (`tech_extensions`). `--smart` means the wordlist-feedback loop is built in — don't hand-roll it.
 Output: `scans/<app_id>/content_discovery.jsonl` (`parse_ferox` keeps the `response` records).
 Politeness on live infra is `--smart` (auto-tune adapts the rate **down** when the target
@@ -186,7 +197,7 @@ errors/times out) + low `-t`/`-L`/`--timeout` (`FEROX_THREADS`/`FEROX_SCAN_LIMIT
 - `tech_enum` (loop 2, before content_discovery) runs scanners whose output is **surface that feeds
   enum**. Today: `shortscan` (IIS/ASP.NET 8.3 short-name enumeration). It builds a `shortutil` rainbow
   table from the seed + global list so shortscan resolves leaked 8.3 names to real filenames, then
-  `parse_shortscan` harvests those as fuzz words → `wl/shortnames.txt`, merged into the combined
+  `parse_shortscan` harvests those as fuzz words → `wl_custom/shortnames.txt`, merged into the combined
   wordlist. Best-effort dispatch keyed on detected tech (no-op if tech unmatched / binary absent).
 - `tech_vulnscan` (loop 3, gated, planned) runs scanners whose output is **findings-only** (`wpprobe`,
   nuclei tech-tags, `nikto`, …).

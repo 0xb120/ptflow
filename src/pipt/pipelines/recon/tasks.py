@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from pipt.core import scope, tools, workspace
 from pipt.core.log import get_logger, is_verbose
+from pipt.pipelines.recon import wordlists
 
 if TYPE_CHECKING:
     from pipt.core.paths import Activity, AppWorkspace
@@ -56,24 +57,10 @@ NOISE_EXTENSIONS = frozenset({
 
 # wordlist synthesis (LOOP 2 — active collection → custom per-app wordlist)
 _TOKEN_MAX_LEN = 40                       # drop longer "segments" (hashes/junk)
-WORDLIST_DIR = Path("/opt/wordlists")     # shared static lists (seclists-style); optional
-TECH_WORDLISTS = {                        # detected-tech keyword → list relative to WORDLIST_DIR
-    "wordpress": "cms/wordpress.txt",
-    "drupal": "cms/drupal.txt",
-    "joomla": "cms/joomla.txt",
-    "tomcat": "servers/tomcat.txt",
-    "jboss": "servers/jboss.txt",
-    "jenkins": "apps/jenkins.txt",
-    "gitlab": "apps/gitlab.txt",
-    "php": "languages/php.txt",
-    "asp.net": "languages/aspnet.txt",
-    "java": "languages/java.txt",
-}
 OSINT_FETCH_RL = "50"  # httpx req/s when downloading the OSINT delta into responses/osint/
 
-# content discovery (LOOP 2) — feroxbuster forced browsing
-SECLISTS_DIR = Path("/opt/wordlist/SecLists")
-CONTENT_WORDLIST = SECLISTS_DIR / "Discovery" / "Web-Content" / "raft-medium-directories.txt"  # global; optional
+# content discovery (LOOP 2) — feroxbuster forced browsing. Global wordlists are
+# resolved by ROLE (see wordlists.py / wl_global/), never hardcoded here.
 # Gentle on live infra: --smart (auto-tune) adapts the rate down when the target errors/times
 # out; low -t/-L keep concurrency bounded from the start. (--rate-limit is mutually exclusive
 # with --smart, and is per-directory anyway, so it's the wrong tool here.)
@@ -222,23 +209,6 @@ def tokenize_urls(urls: Iterable[str]) -> list[str]:
     return sorted(out)
 
 
-def select_tech_wordlists(tech: list[str], mapping: dict[str, str], base: Path) -> list[Path]:
-    """Map detected-tech tags to existing static wordlist files under ``base``.
-
-    Matching is case-insensitive substring (httpx tags like 'WordPress 6.4' still
-    hit the 'wordpress' key). Returns only files that exist — absent files or an
-    absent ``base`` make this a no-op, so the step needs no external data to run.
-    """
-    tags = [t.lower() for t in tech]
-    out: list[Path] = []
-    for key, rel in mapping.items():
-        if any(key in tag for tag in tags):
-            path = base / rel
-            if path.is_file():
-                out.append(path)
-    return out
-
-
 def passive_delta(passive: list[str], crawled: list[str]) -> list[str]:
     """OSINT URLs (gau/urlfinder) whose bodies the crawl never fetched.
 
@@ -370,6 +340,19 @@ def _run(tool: str, cmd: list[str], *, stdin: str, dest: Path, label: str) -> st
 
 
 # --- breadth sub-phases (each reads/writes via disk → independently rerunnable) ---
+def provision_wl(activity: Activity) -> None:
+    """BREADTH — resolve global wordlist ROLES into wl_global/<role>.txt (env/discovery/BYO).
+
+    Environment- and provider-agnostic: roles map to candidate filenames across collections,
+    found under PIPT_WORDLISTS / common locations, or supplied per-role (PIPT_WL_<ROLE>) / by
+    dropping a file in wl_global/. Best-effort — unresolved roles just leave the dependent
+    steps to run on the generated wl_custom (the pipeline never fails for missing wordlists).
+    """
+    resolved = wordlists.provision(activity)
+    log.info("  → wordlists: %d role(s) provisioned%s", len(resolved),
+             f" ({', '.join(sorted(resolved))})" if resolved else " — none found, degrading")
+
+
 def _raw(activity: Activity, tool: str, label: str) -> Path:
     return activity.asset_discovery_raw(tool) / f"{label}.txt"
 
@@ -682,14 +665,14 @@ def takeover(activity: Activity, app_id: str) -> None:
 
 # --- LOOP 2 (content discovery) — runs after the loop-1 barrier ---
 def build_wordlist(activity: Activity, app_id: str) -> None:
-    """LOOP 2.1 — synthesize a custom per-app wordlist (wl/seed.txt) OFFLINE.
+    """LOOP 2.1 — synthesize a custom per-app wordlist (wl_custom/seed.txt) OFFLINE.
 
     No fetching: the crawl (loop 1) already downloaded and JS-parsed the linked
     surface — its JS-discovered endpoints and robots/sitemap paths are already in
     endpoints.txt, and the bodies are under responses/. This step tokenizes
     endpoints.txt into path segments, filename basenames and parameter names
     (tokenize_urls) and merges any tech-specific static lists keyed on the cluster's
-    detected tech. Output: scans/<app_id>/wl/seed.txt (the activity wl/ holds
+    detected tech. Output: scans/<app_id>/wl_custom/seed.txt (the activity wl_global/ holds
     shared/global lists instead). Reads loop-1 artifacts directly — the cross-loop
     barrier guarantees they exist.
     """
@@ -698,11 +681,11 @@ def build_wordlist(activity: Activity, app_id: str) -> None:
 
     tech = workspace.read_meta(ws.meta).get("tech") or []
     static: list[str] = []
-    for wl in select_tech_wordlists(tech, TECH_WORDLISTS, WORDLIST_DIR):
-        static += tools.read_lines(wl)
+    for wl_file in wordlists.tech_role_paths(tech, activity.wl_global):
+        static += tools.read_lines(wl_file)
 
-    n = tools.write_lines(ws.wl / "seed.txt", [*words, *static])
-    log.info("  → wordlist (%s) — %d term(s) (+%d tech), offline → wl/seed.txt", app_id, n, len(static))
+    n = tools.write_lines(ws.wl_custom / "seed.txt", [*words, *static])
+    log.info("  → wordlist (%s) — %d term(s) (+%d tech), offline → wl_custom/seed.txt", app_id, n, len(static))
 
 
 def fetch_delta(activity: Activity, app_id: str) -> None:
@@ -786,7 +769,7 @@ def mine_responses(activity: Activity, app_id: str) -> None:
              app_id, len(js_files), n_ep, n_sec)
 
 
-def _shortscan_surface(ws: AppWorkspace, app_id: str) -> list[str]:
+def _shortscan_surface(activity: Activity, ws: AppWorkspace, app_id: str) -> list[str]:
     """IIS 8.3 short-name enumeration → fuzz words (shortscan + shortutil rainbow).
 
     Builds a shortutil rainbow table from the per-app seed + global list so shortscan
@@ -800,12 +783,13 @@ def _shortscan_surface(ws: AppWorkspace, app_id: str) -> list[str]:
     hosts = tools.read_lines(ws.hosts)
     if not hosts:
         return []
-    rainbow_src = ws.wl / "rainbow_src.txt"
+    content_wl = wordlists.role_path(activity, "content")
+    rainbow_src = ws.wl_custom / "rainbow_src.txt"
     tools.write_lines(rainbow_src, [
-        *tools.read_lines(ws.wl / "seed.txt"),
-        *(tools.read_lines(CONTENT_WORDLIST) if CONTENT_WORDLIST.is_file() else []),
+        *tools.read_lines(ws.wl_custom / "seed.txt"),
+        *(tools.read_lines(content_wl) if content_wl else []),
     ])
-    rainbow = ws.wl / "rainbow.txt"
+    rainbow = ws.wl_custom / "rainbow.txt"
     rainbow.write_text(tools.run([SHORTUTIL, "wordlist", str(rainbow_src)]), encoding="utf-8")
     hosts_file = ws.raw("shortscan") / "hosts.txt"
     tools.write_lines(hosts_file, hosts)
@@ -824,7 +808,7 @@ def tech_enum(activity: Activity, app_id: str) -> None:
 
     Best-effort dispatch keyed on the cluster's detected tech: a scanner runs only if
     its tech matched AND its binary is installed. Output is SURFACE (fuzz words) →
-    wl/shortnames.txt, which content_discovery merges into its wordlist. Scanners whose
+    wl_custom/shortnames.txt, which content_discovery merges into its wordlist. Scanners whose
     output is findings-only (wpprobe, nuclei, …) belong to tech_vulnscan / loop 3.
 
     Today: shortscan (IIS/ASP.NET 8.3 short-name enumeration). Reads loop-1 hosts
@@ -834,9 +818,9 @@ def tech_enum(activity: Activity, app_id: str) -> None:
     tech = " ".join(workspace.read_meta(ws.meta).get("tech") or []).lower()
     surface: list[str] = []
     if any(k in tech for k in ("iis", "asp.net", "microsoft-iis")):
-        surface += _shortscan_surface(ws, app_id)
-    n = tools.write_lines(ws.wl / "shortnames.txt", surface)
-    log.info("  → tech_enum (%s) — %d surface term(s) → wl/shortnames.txt", app_id, n)
+        surface += _shortscan_surface(activity, ws, app_id)
+    n = tools.write_lines(ws.wl_custom / "shortnames.txt", surface)
+    log.info("  → tech_enum (%s) — %d surface term(s) → wl_custom/shortnames.txt", app_id, n)
 
 
 def content_discovery(activity: Activity, app_id: str) -> None:
@@ -846,7 +830,7 @@ def content_discovery(activity: Activity, app_id: str) -> None:
     do, so it must make new requests. feroxbuster --smart brings auto-tune (soft-404
     calibration), collect-words/backups and link extraction/recursion for free, so
     the wordlist-feedback loop is built in. Targets the app's hosts with a combined
-    wordlist (per-app wl/seed.txt first, then a global SecLists list) and tech-derived
+    wordlist (per-app wl_custom/seed.txt first, then a global SecLists list) and tech-derived
     extensions. Output: scans/<app_id>/content_discovery.jsonl.
 
     feroxbuster writes JSON to -o (not stdout), so it bypasses _run.
@@ -858,11 +842,12 @@ def content_discovery(activity: Activity, app_id: str) -> None:
         return
 
     # combined wordlist = per-app seed + tech_enum surface + JS-mined paths, then global SecLists
-    seed = tools.read_lines(ws.wl / "seed.txt")
-    shortnames = tools.read_lines(ws.wl / "shortnames.txt")  # tech_enum surface (8.3 names)
+    seed = tools.read_lines(ws.wl_custom / "seed.txt")
+    shortnames = tools.read_lines(ws.wl_custom / "shortnames.txt")  # tech_enum surface (8.3 names)
     js_tokens = tokenize_urls(tools.read_lines(ws.canonical("endpoints_js.txt")))  # mine_responses
-    global_wl = tools.read_lines(CONTENT_WORDLIST) if CONTENT_WORDLIST.is_file() else []
-    wordlist = ws.wl / "combined.txt"
+    content_wl = wordlists.role_path(activity, "content")  # global list, resolved by role
+    global_wl = tools.read_lines(content_wl) if content_wl else []
+    wordlist = ws.wl_custom / "combined.txt"
     n_wl = tools.write_lines(wordlist, [*seed, *shortnames, *js_tokens, *global_wl])
     if not n_wl:
         log.debug("  · skip content_discovery (empty wordlist) for %s", app_id)

@@ -12,12 +12,12 @@ Activity workspace layout (parent dir = activity name):
           hosts.jsonl                 #   canonical discovery output
         <app_id>/                     # one per clustered "application group" (DEPTH)
           meta.json  hosts.txt  services.jsonl  endpoints.txt
-          wl/                         #   per-app custom wordlists (seed.txt, …)
+          wl_custom/                  #   per-app GENERATED wordlists (seed.txt, …)
           responses/                  #   downloaded HTML/JS corpus (katana -srd) — mined offline
           raw/<tool>/
       findings/                       # agent output (hypotheses.jsonl)
       poc/   tmp/   logs/
-      wl/                             # shared/global wordlists (or links to SecLists & co.)
+      wl_global/                      # shared/global INPUT wordlists (SecLists & co.)
 """
 
 from __future__ import annotations
@@ -41,10 +41,10 @@ class AppWorkspace:
         return self.root / "hosts.txt"
 
     @property
-    def wl(self) -> Path:
-        """Per-app custom wordlists (seed + derived). The activity-level wl/ holds
-        shared/global lists (or links to system ones like SecLists)."""
-        return self.root / "wl"
+    def wl_custom(self) -> Path:
+        """Per-app GENERATED wordlists (seed, shortnames, combined — derived from the
+        app's crawled/collected corpus). Distinct from the activity-level wl_global/."""
+        return self.root / "wl_custom"
 
     @property
     def responses(self) -> Path:
@@ -141,10 +141,10 @@ class Activity:
         return self.base / "tmp"
 
     @property
-    def wl(self) -> Path:
-        """Shared/global wordlists (or links to system lists like SecLists). Per-app
-        custom wordlists live under each AppWorkspace.wl instead."""
-        return self.base / "wl"
+    def wl_global(self) -> Path:
+        """Shared/global INPUT wordlists for the run (e.g. SecLists). Per-app GENERATED
+        wordlists live under each AppWorkspace.wl_custom instead."""
+        return self.base / "wl_global"
 
     @property
     def logs(self) -> Path:
@@ -157,7 +157,7 @@ class Activity:
             self.findings,
             self.poc,
             self.tmp,
-            self.wl,
+            self.wl_global,
             self.logs,
         ):
             d.mkdir(parents=True, exist_ok=True)

@@ -42,7 +42,7 @@ def test_orchestrate_end_to_end(tmp_path):
     assert all(h["source"] == "stub" for h in hyp)
 
     # standard activity dirs
-    for sub in ("poc", "tmp", "wl", "logs"):
+    for sub in ("poc", "tmp", "wl_global", "logs"):
         assert (base / sub).is_dir()
 
 
