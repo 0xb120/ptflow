@@ -22,7 +22,8 @@ class ReconPipeline:
         Stage("portscan", tasks.portscan, needs=("resolve",)),
         Stage("httpx", tasks.httpx_fingerprint, needs=("portscan",)),
         Stage("nerva", tasks.nerva_fingerprint, needs=("portscan",)),  # ∥ httpx
-        Stage("takeover_scope", tasks.takeover_scope, needs=("resolve",)),  # nuclei takeover, ∥ portscan/httpx
+        # whole-scope nuclei — spanning: runs ∥ clustering + all per-app loops, joined at the fan-in
+        Stage("nuclei_scope", tasks.nuclei_scope, needs=("httpx",), spanning=True),
         # per-app LOOP 1 — enumeration (after cluster fan-out)
         Stage("screenshot", tasks.screenshot, per_app=True, phase=1),  # root-page shot (∥ entry)
         Stage("passive_probe", tasks.passive_probe, per_app=True, phase=1),

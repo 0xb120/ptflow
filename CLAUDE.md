@@ -52,6 +52,11 @@ uv run pytest tests/core/test_scope.py::test_classify  # one test
 3. **per-app loops** run in order (see below);
 4. the **agent** stage runs once as a fan-in (currently the dormant stub).
 
+**Spanning stages** (`spanning=True`, activity-scope) don't block the breadth→cluster barrier:
+they're launched once their breadth `needs` are done and awaited only at the fan-in, so they run
+**∥ clustering + all the per-app loops** — for a long whole-scope scan (`nuclei_scope`) that hides
+its cost behind the per-app work instead of serializing in front of it.
+
 **Only strings cross the Prefect task boundary** (`_run_stage` reconstructs the
 `Activity`/`Pipeline` from names + `app_id`); never pass objects through `.submit()`.
 **Stages communicate only through on-disk artifacts** — never return values or shared
@@ -132,8 +137,12 @@ recon hashes `Title|Content-Length|Webserver`; the example stub hashes a fabrica
   this is what the test suite and CI exercise.
 - **`recon`** — the REAL ProjectDiscovery toolchain (`pipelines/recon/tasks.py`), a faithful port of
   bash recon scripts (`scope2surface.sh` breadth, `surfagr.sh` clustering). Stages:
-  - **Breadth** (activity scope): `expand` → `resolve` → `portscan` → `httpx` ∥ `nerva`; plus
-    `takeover_scope` (nuclei `-tags takeover` over resolved subdomains, ∥) → `cluster` fan-out.
+  - **Breadth** (activity scope): `expand` → `resolve` → `portscan` → `httpx` ∥ `nerva` → `cluster`
+    fan-out. Plus `nuclei_scope` — a **spanning** whole-scope full-template nuclei scan (one process,
+    one global `-rl` over deduped subdomains + webapps) launched after `httpx`, running ∥ everything,
+    joined at the fan-in (`findings/nuclei_scope.jsonl`). It runs `nuclei -ut` (update templates)
+    first, then scans with `-duc`. Per-app would multiply traffic on shared backends, so it's
+    whole-scope, not per-app.
   - **Loop 1 — enumeration** (`phase=1`): `screenshot` (root-page shot of the cluster's best host, ∥) ;
     `passive_probe` → `crawl` (SPA clusters get `-headless`, see `is_spa`) ; `subenum` ; `takeover`
     (← crawl + subenum).

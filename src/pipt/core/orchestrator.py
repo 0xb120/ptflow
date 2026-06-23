@@ -100,12 +100,20 @@ def _run_stage(
 def _run_dag(pipeline_name: str, activity_name: str, root: str | None) -> None:
     pipeline = load_pipeline(pipeline_name)
     activity = Activity.named(activity_name, Path(root) if root else None)
-    activity_stages = [s for s in pipeline.stages if not s.per_app]
+    activity_stages = [s for s in pipeline.stages if not s.per_app and not s.spanning]
+    spanning_stages = [s for s in pipeline.stages if s.spanning]
 
-    # 1. activity-scope DAG (independent stages run in parallel)
+    # 1. activity-scope (breadth) DAG — barrier before cluster
     log.info("▶ activity stages")
     for fut in _submit_dag(activity_stages, pipeline_name, activity_name, root, None):
         fut.result(raise_on_failure=False)
+
+    # 1b. spanning stages — breadth deps are done; launch now and await only at the
+    #     fan-in, so they overlap clustering + the per-app loops (e.g. whole-scope nuclei)
+    spanning: list[PrefectFuture] = []
+    if spanning_stages:
+        log.info("▶ spanning (∥): %s", ", ".join(s.name for s in spanning_stages))
+        spanning = _submit_dag(spanning_stages, pipeline_name, activity_name, root, None)
 
     # 2. cluster — fan-out pivot
     log.info("▶ cluster")
@@ -123,7 +131,9 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None) -> None:
             for fut in pending:
                 fut.result(raise_on_failure=False)
 
-    # 4. agent — fan-in, once
+    # 4. join the spanning stages (ran ∥ everything above), then agent fan-in
+    for fut in spanning:
+        fut.result(raise_on_failure=False)
     log.info("▶ agent")
     n = propose_hypotheses(activity, pipeline.provider())
     log.info("  → %d hypothesis(es)", n)

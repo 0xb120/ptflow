@@ -32,6 +32,11 @@ class Stage:
     loop N+1). A later loop therefore reads an earlier loop's on-disk artifacts
     directly — cross-loop ordering is the barrier, NOT `needs`. `phase` is ignored
     for activity stages, which all run as the single pre-cluster DAG.
+
+    `spanning` marks an activity-scope stage (per_app=False) that should NOT block the
+    breadth→cluster barrier: it's launched once its breadth `needs` are done and awaited
+    only at the terminal fan-in, so it overlaps clustering and all the per-app loops
+    (e.g. a whole-scope nuclei scan running ∥ the rest of the pipeline).
     """
 
     name: str
@@ -39,6 +44,7 @@ class Stage:
     needs: tuple[str, ...] = field(default_factory=tuple)
     per_app: bool = False
     phase: int = 1
+    spanning: bool = False
 
 
 class Pipeline(Protocol):

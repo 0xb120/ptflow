@@ -83,3 +83,11 @@ def enum(activity: Activity, app_id: str) -> None:
     ]
     tools.write_jsonl(ws.raw("enum") / "out.jsonl", records)
     tools.write_jsonl(ws.canonical("services.jsonl"), records)
+
+
+def scope_scan(activity: Activity) -> None:
+    """SPANNING stub: a whole-scope 'scan' that runs ∥ clustering + per-app enum and is
+    joined at the fan-in. Deterministic — one finding row per discovered host."""
+    hosts = tools.read_jsonl(activity.asset_discovery_canonical("hosts.jsonl"))
+    records = [{"target": h["name"], "finding": "stub-scope-scan"} for h in hosts]
+    tools.write_jsonl(activity.findings / "scope_scan.jsonl", records)

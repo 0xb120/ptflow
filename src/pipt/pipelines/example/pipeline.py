@@ -16,8 +16,9 @@ if TYPE_CHECKING:
 class ExamplePipeline:
     name = "example"
     stages: Sequence[Stage] = (
-        Stage("discover", tasks.discover),          # activity scope
-        Stage("enum", tasks.enum, per_app=True),    # per app group
+        Stage("discover", tasks.discover),                                   # activity scope
+        Stage("scope_scan", tasks.scope_scan, needs=("discover",), spanning=True),  # ∥ everything
+        Stage("enum", tasks.enum, per_app=True),                             # per app group
     )
 
     def cluster(self, activity: Activity) -> list[str]:

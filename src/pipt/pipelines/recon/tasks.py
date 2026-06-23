@@ -33,6 +33,13 @@ NAABU_TLS_CONC = "50"
 HONEYPOT_MIN_OPEN_PORTS = 15      # >= this many open ports => suspected honeypot
 RESOLVERS = "/opt/resolvers/resolvers-trusted.txt"
 
+# whole-scope nuclei scan (spanning stage — ONE process, ONE global rate cap)
+NUCLEI_CONC = "25"      # -c  templates in parallel
+NUCLEI_BULK = "25"      # -bs hosts per template
+NUCLEI_RL = "150"       # -rl global requests/second
+NUCLEI_TIMEOUT = "10"   # -timeout seconds
+NUCLEI_RETRIES = "2"    # -retries
+
 # per-app enum (depth) — mirror run-passive-probe / run-crawler / run-takeover-discovered
 GAU_THREADS = "5"
 KATANA_DEPTH = "3"
@@ -495,15 +502,27 @@ def nerva_fingerprint(activity: Activity) -> None:
          dest=canon("nerva_full_metadata.jsonl"), label="json")
 
 
-def takeover_scope(activity: Activity) -> None:
-    """BREADTH — scope-wide subdomain-takeover scan (nuclei -tags takeover) over the
-    resolved subdomains, running ∥ the rest of asset discovery. Complements the per-app
-    subjack (loop 1) with nuclei's signatures. Best-effort: needs nuclei templates
-    installed (`nuclei -ut`); -duc keeps it from phoning home mid-run.
+def nuclei_scope(activity: Activity) -> None:
+    """SPANNING (whole-scope) — full-template nuclei over the entire discovered surface.
+
+    ONE process over the deduped scope (subdomains + webapps) with a single global rate
+    cap (-rl) — gentler and more efficient than per-app, which would multiply traffic on
+    shared backends and reload templates per process. Runs ∥ clustering + the per-app
+    loops, joined at the fan-in. Subsumes the old per-tag takeover scan. Updates the
+    nuclei-templates first (`-ut`), then scans with -duc (no redundant check mid-run).
     """
-    _run("nuclei", ["nuclei", "-tags", "takeover", "-j", "-silent", "-duc"],
-         stdin="\n".join(tools.read_lines(activity.asset_discovery_canonical("subdomains.txt"))),
-         dest=activity.asset_discovery_canonical("takeovers_scope.jsonl"), label="takeover_scope")
+    canon = activity.asset_discovery_canonical
+    targets = tools.dedupe([*tools.read_lines(canon("subdomains.txt")),
+                            *tools.read_lines(canon("unique_webapps.txt"))])
+    if not targets:
+        log.debug("  · skip nuclei_scope (no targets)")
+        return
+    log.info("  → nuclei -ut (update templates)")
+    tools.run(["nuclei", "-ut"], stream_stderr=is_verbose())
+    _run("nuclei",
+         ["nuclei", "-stats", "-nmhe", "-c", NUCLEI_CONC, "-bs", NUCLEI_BULK, "-rl", NUCLEI_RL,
+          "-timeout", NUCLEI_TIMEOUT, "-retries", NUCLEI_RETRIES, "-j", "-silent", "-duc"],
+         stdin="\n".join(targets), dest=activity.findings / "nuclei_scope.jsonl", label="scope")
 
 
 # --- clustering (surfagr.sh port) ---

@@ -41,9 +41,11 @@ def test_pipeline_object_shape():
     from pipt.pipelines.recon.pipeline import PIPELINE
 
     assert PIPELINE.name == "recon"
-    activity = [s.name for s in PIPELINE.stages if not s.per_app]
+    activity = [s.name for s in PIPELINE.stages if not s.per_app and not s.spanning]
+    spanning = [s.name for s in PIPELINE.stages if s.spanning]
     app = [s.name for s in PIPELINE.stages if s.per_app]
-    assert activity == ["expand", "resolve", "portscan", "httpx", "nerva", "takeover_scope"]
+    assert activity == ["expand", "resolve", "portscan", "httpx", "nerva"]
+    assert spanning == ["nuclei_scope"]
     assert app == [
         "screenshot", "passive_probe", "crawl", "subenum", "takeover",
         "wordlist", "fetch_delta", "mine_responses", "tech_enum", "content_discovery",
@@ -52,8 +54,9 @@ def test_pipeline_object_shape():
     # httpx ∥ nerva (both depend only on portscan, not on each other)
     assert by_name["httpx"].needs == ("portscan",)
     assert by_name["nerva"].needs == ("portscan",)
-    # scope-wide nuclei takeover runs ∥ the rest of asset discovery (needs only resolve)
-    assert by_name["takeover_scope"].needs == ("resolve",)
+    # whole-scope nuclei is spanning: starts after httpx, runs ∥ cluster + per-app, joins at fan-in
+    assert by_name["nuclei_scope"].spanning is True
+    assert by_name["nuclei_scope"].needs == ("httpx",)
     # subenum ∥ passive_probe/crawl; takeover waits for both crawl and subenum
     assert by_name["subenum"].needs == ()
     assert set(by_name["takeover"].needs) == {"crawl", "subenum"}

@@ -47,4 +47,6 @@ def test_pipeline_object_shape():
     from pipt.pipelines.example.pipeline import PIPELINE
 
     assert PIPELINE.name == "example"
-    assert [s.name for s in PIPELINE.stages] == ["discover", "enum"]
+    assert [s.name for s in PIPELINE.stages] == ["discover", "scope_scan", "enum"]
+    by_name = {s.name: s for s in PIPELINE.stages}
+    assert by_name["scope_scan"].spanning is True  # runs ∥ cluster + per-app, joined at fan-in

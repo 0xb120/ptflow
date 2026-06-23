@@ -32,6 +32,10 @@ def test_orchestrate_end_to_end(tmp_path):
         assert (d / "services.jsonl").exists()
         assert (d / "raw" / "enum" / "out.jsonl").exists()
 
+    # spanning stage ran ∥ clustering + per-app and was joined at the fan-in
+    scope = tools.read_jsonl(base / "findings" / "scope_scan.jsonl")
+    assert len(scope) == 4  # one finding per discovered host (2 targets x apex+www)
+
     # agent output
     hyp = tools.read_jsonl(base / "findings" / "hypotheses.jsonl")
     assert len(hyp) >= 1
