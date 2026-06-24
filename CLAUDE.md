@@ -242,14 +242,20 @@ best-effort). Output: the per-app `scans/<app_id>/wl_custom/seed.txt`.
 
 `content_discovery` is the one Loop 2 step that *must* make new requests — forced browsing finds
 UNLINKED paths, which by definition aren't in any downloaded body. `feroxbuster --smart` (auto-tune
-soft-404 calibration + collect-words/backups + link extraction/recursion) over the app's hosts, with
-a combined wordlist (`wl_custom/seed.txt` first, then the resolved global list
+soft-404 calibration + collect-words/backups + link extraction/recursion) over the app's
+**representative host only** (`best_host`, like screenshot) — a group is one app by construction, so
+forced-browsing every host would re-fuzz the same backend (double traffic; the scanme.nmap.org hang)
+— with a combined wordlist (`wl_custom/seed.txt` first, then the resolved global list
 `wordlists.role_path(activity, "content")` — see role resolution above) and tech-derived extensions
 (`tech_extensions`). `--smart` means the wordlist-feedback loop is built in — don't hand-roll it.
 Output: `scans/<app_id>/content_discovery.jsonl` (`parse_ferox` keeps the `response` records).
 Politeness on live infra is `--smart` (auto-tune adapts the rate **down** when the target
 errors/times out) + low `-t`/`-L`/`--timeout` (`FEROX_THREADS`/`FEROX_SCAN_LIMIT`/`FEROX_TIMEOUT`) —
-**not** `--rate-limit`, which is mutually exclusive with `--smart` (and per-directory).
+**not** `--rate-limit`, which is mutually exclusive with `--smart` (and per-directory). A
+**`--time-limit`** (`FEROX_TIME_LIMIT`, total scan wall-clock) is mandatory: `--timeout` is only
+per-request, so a throttling target can drive `--smart`'s auto-tune into an unbounded backoff
+livelock that hangs the whole pipeline — `--time-limit` is the hard cap that breaks it (it exits
+gracefully, keeping partial results).
 
 **Specialized per-stack scanners are split by output role** (so they land in the right loop):
 - `tech_enum` (loop 2, before content_discovery) runs scanners whose output is **surface that feeds

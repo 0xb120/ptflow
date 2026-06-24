@@ -105,6 +105,11 @@ FEROX_DEPTH = "2"        # -d recursion depth (feroxbuster default is 4)
 FEROX_THREADS = "5"      # -t threads per scan (default 50 is aggressive for fragile apps)
 FEROX_SCAN_LIMIT = "2"   # -L concurrent directory scans (caps recursion fan-out)
 FEROX_TIMEOUT = "15"     # --timeout per-request seconds (tolerate slow apps)
+# --time-limit caps TOTAL scan wall-clock (--timeout is only per-request). Without it, a target that
+# throttles under --smart can send feroxbuster's auto-tune into an unbounded backoff livelock that
+# hangs the whole pipeline (no per-request timeout breaks it). --smart-compatible; exits gracefully,
+# keeping partial results. See the scanme.nmap.org incident.
+FEROX_TIME_LIMIT = "20m"  # --time-limit total scan duration (normal scans here finish in ~5m)
 TECH_EXTENSIONS = {  # detected-tech keyword → file extensions to fuzz
     "php": ["php"],
     "asp.net": ["asp", "aspx", "ashx"],
@@ -586,7 +591,7 @@ def httpx_fingerprint(activity: Activity) -> None:
     out = _run(
         "httpx",
         [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
-         "-favicon", "-location", "-fr", "-j"],
+         "-favicon", "-location", "-fr", "-irr", "-j"],
         stdin=httpx_input, dest=canon("httpx_full_metadata.jsonl"), label="fingerprint",
     )
     records = [json.loads(ln) for ln in out.splitlines() if ln.strip()]
@@ -1197,16 +1202,18 @@ def content_discovery(activity: Activity, app_id: str) -> None:
     Discovers UNLINKED paths/files — the one thing reusing downloaded bodies can't
     do, so it must make new requests. feroxbuster --smart brings auto-tune (soft-404
     calibration), collect-words/backups and link extraction/recursion for free, so
-    the wordlist-feedback loop is built in. Targets the app's hosts with a combined
-    wordlist (per-app wl_custom/seed.txt first, then a global SecLists list) and tech-derived
+    the wordlist-feedback loop is built in. Targets the app's REPRESENTATIVE host (best_host,
+    like screenshot) — the group is one app by construction, so forced-browsing every host would
+    just re-fuzz the same backend (double traffic/throttle; see the scanme.nmap.org incident).
+    Combined wordlist (per-app wl_custom/seed.txt first, then a global SecLists list) + tech-derived
     extensions. Output: scans/<app_id>/content_discovery.jsonl.
 
     feroxbuster writes JSON to -o (not stdout), so it bypasses _run.
     """
     ws = activity.app(app_id)
-    hosts = tools.read_lines(ws.hosts)
-    if not hosts:
-        log.debug("  · skip content_discovery (no hosts) for %s", app_id)
+    target = best_host(tools.read_lines(ws.hosts))
+    if not target:
+        log.debug("  · skip content_discovery (no host) for %s", app_id)
         return
 
     # combined wordlist = per-app seed + tech_enum surface + JS-mined paths, then global SecLists
@@ -1225,12 +1232,12 @@ def content_discovery(activity: Activity, app_id: str) -> None:
     ext_args = ["-x", *exts] if exts else []
     out_file = ws.raw("feroxbuster") / "out.json"
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    log.info("  → feroxbuster (%s) — %d host(s), %d term(s)%s", app_id, len(hosts), n_wl,
+    log.info("  → feroxbuster (%s) — %s, %d term(s)%s", app_id, target, n_wl,
              f", -x {','.join(exts)}" if exts else "")
     cmd = [FEROX, "--stdin", "--silent", "--json", "-o", str(out_file), "--no-state", "-k",
            "--smart", "-t", FEROX_THREADS, "-L", FEROX_SCAN_LIMIT, "--timeout", FEROX_TIMEOUT,
-           "-d", FEROX_DEPTH, "-w", str(wordlist), *ext_args]
-    tools.run(cmd, stdin="\n".join(hosts), stream_stderr=is_verbose())
+           "--time-limit", FEROX_TIME_LIMIT, "-d", FEROX_DEPTH, "-w", str(wordlist), *ext_args]
+    tools.run(cmd, stdin=target, stream_stderr=is_verbose())
     records = parse_ferox(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
     n = tools.write_jsonl(ws.canonical("content_discovery.jsonl"), records)
     log.info("    feroxbuster (%s) → %d result(s) → content_discovery.jsonl", app_id, n)
