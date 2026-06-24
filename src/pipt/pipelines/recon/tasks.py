@@ -218,6 +218,23 @@ def best_host(urls: list[str]) -> str | None:
     return (https or pool)[0]
 
 
+def dedup_by_body(hosts: list[str], body_by_host: dict[str, str | None]) -> list[str]:
+    """Collapse hosts that serve an IDENTICAL response body to one representative (best_host per
+    body) — same body = same backend/content, so scanning each is pure duplication (a domain and
+    its IP, http+https). Hosts with a DIFFERENT body are distinct environments (staging vs test)
+    and are all kept; hosts with an unknown body are kept individually (can't prove identity)."""
+    buckets: dict[str, list[str]] = {}
+    unknown: list[str] = []
+    for h in hosts:
+        body = body_by_host.get(h)
+        if body:
+            buckets.setdefault(body, []).append(h)
+        else:
+            unknown.append(h)
+    reps = [best_host(group) for group in buckets.values()]
+    return [*[r for r in reps if r], *unknown]
+
+
 def denoise(urls: list[str]) -> list[str]:
     """Drop URLs to static assets (extensions in NOISE_EXTENSIONS)."""
     out: list[str] = []
@@ -744,6 +761,9 @@ def cluster(activity: Activity) -> list[str]:
         app_id = _app_id(f"{key}:{value}")
         rep = min(members, key=lambda r: r["url"])
         urls = tools.dedupe(r["url"] for r in members)
+        # per-host response-body hash → lets per-app stages dedup same-backend hosts (domain+IP,
+        # http+https) while keeping distinct environments (staging vs test). See dedup_by_body.
+        body_by_host = {r["url"]: (r.get("hash") or {}).get("body_sha256") for r in members}
         if len(urls) > CLUSTER_MAX_HOSTS:
             log.warning("⚠ cluster %s has %d hosts — possible residual collision (id_anchor=%s)",
                         app_id, len(urls), key)
@@ -760,6 +780,7 @@ def cluster(activity: Activity) -> list[str]:
                 "status_code": rep.get("status_code"),
                 "tech": rep.get("tech") or [],
                 "hosts": urls,
+                "body_by_host": body_by_host,
             },
         )
         tools.write_lines(ws.hosts, urls)
@@ -861,6 +882,14 @@ def passive_probe(activity: Activity, app_id: str) -> None:
     tools.write_lines(ws.canonical("endpoints_passive.txt"), [*gau, *urls])
 
 
+def _scan_hosts(ws: AppWorkspace) -> list[str]:
+    """The group's hosts deduped to one representative per distinct response body (see
+    dedup_by_body) — one scan per backend/environment, not per hostname alias. Used by the
+    active scanners (crawl, crawl_headless, content_discovery)."""
+    body_by_host = workspace.read_meta(ws.meta).get("body_by_host") or {}
+    return dedup_by_body(tools.read_lines(ws.hosts), body_by_host)
+
+
 def _run_katana(ws: AppWorkspace, hosts: list[str], app_id: str) -> list[str]:
     """katana — the DOWNLOADER crawler: parses JS endpoints (-jc/-jsl), known files
     (-kf all), forms (-fx), climbs parent paths (-pc), scoped to each host's fqdn
@@ -913,8 +942,10 @@ def _stored_root_html(ws: AppWorkspace, hosts: list[str]) -> str:
 def crawl(activity: Activity, app_id: str) -> None:
     """DEPTH 2 — TWO crawlers in PARALLEL (TIER 0 cheap layer) + JS-render classification.
 
-    katana (downloader) and crawley (second discovery engine) run concurrently against
-    the app's hosts. katana stores every response under responses/ (-srd) as the per-app
+    katana (downloader) and crawley (second discovery engine) run concurrently against the
+    group's hosts deduped by response body (_scan_hosts: one per backend, but distinct
+    environments like staging vs test are still all crawled — their linked content differs).
+    katana stores every response under responses/ (-srd) as the per-app
     corpus offline steps mine WITHOUT re-fetching; its URL output is JS-/form-enriched.
     crawley adds the URLs katana didn't reach. Their union plus the passive sources,
     denoised, is endpoints.txt; crawley's discovery is also persisted (endpoints_crawley.txt)
@@ -926,7 +957,7 @@ def crawl(activity: Activity, app_id: str) -> None:
     reads it and only renders the apps that actually benefit.
     """
     ws = activity.app(app_id)
-    hosts = tools.read_lines(ws.hosts)
+    hosts = _scan_hosts(ws)
     if hosts:
         ws.responses.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -966,7 +997,7 @@ def crawl_headless(activity: Activity, app_id: str) -> None:
     if not (cls_path.exists() and workspace.read_meta(cls_path).get("js_render")):
         log.debug("  · skip headless (not JS-rendered) for %s", app_id)
         return
-    hosts = tools.read_lines(ws.hosts)
+    hosts = _scan_hosts(ws)  # one render per backend (headless is RAM-heavy); keeps distinct envs
     if not hosts:
         return
     store = ws.responses / "headless"
@@ -1009,6 +1040,7 @@ def takeover(activity: Activity, app_id: str) -> None:
     """
     ws = activity.app(app_id)
     candidates = tools.dedupe([
+        *[url_host(u) for u in tools.read_lines(ws.hosts)],  # every group hostname (crawl may dedup)
         *[url_host(u) for u in tools.read_lines(ws.canonical("endpoints.txt"))],
         *tools.read_lines(ws.canonical("subs.txt")),
     ])
@@ -1202,17 +1234,18 @@ def content_discovery(activity: Activity, app_id: str) -> None:
     Discovers UNLINKED paths/files — the one thing reusing downloaded bodies can't
     do, so it must make new requests. feroxbuster --smart brings auto-tune (soft-404
     calibration), collect-words/backups and link extraction/recursion for free, so
-    the wordlist-feedback loop is built in. Targets the app's REPRESENTATIVE host (best_host,
-    like screenshot) — the group is one app by construction, so forced-browsing every host would
-    just re-fuzz the same backend (double traffic/throttle; see the scanme.nmap.org incident).
-    Combined wordlist (per-app wl_custom/seed.txt first, then a global SecLists list) + tech-derived
-    extensions. Output: scans/<app_id>/content_discovery.jsonl.
+    the wordlist-feedback loop is built in. Targets the group's hosts deduped by response body
+    (_scan_hosts): one host per backend — same-backend aliases (domain+IP, http+https) are
+    collapsed (no re-fuzz; the scanme.nmap.org incident) but distinct environments (staging vs
+    test) are each fuzzed, since env-specific files differ. Combined wordlist (per-app
+    wl_custom/seed.txt first, then a global SecLists list) + tech-derived extensions. Output:
+    scans/<app_id>/content_discovery.jsonl.
 
     feroxbuster writes JSON to -o (not stdout), so it bypasses _run.
     """
     ws = activity.app(app_id)
-    target = best_host(tools.read_lines(ws.hosts))
-    if not target:
+    hosts = _scan_hosts(ws)
+    if not hosts:
         log.debug("  · skip content_discovery (no host) for %s", app_id)
         return
 
@@ -1232,12 +1265,12 @@ def content_discovery(activity: Activity, app_id: str) -> None:
     ext_args = ["-x", *exts] if exts else []
     out_file = ws.raw("feroxbuster") / "out.json"
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    log.info("  → feroxbuster (%s) — %s, %d term(s)%s", app_id, target, n_wl,
+    log.info("  → feroxbuster (%s) — %d host(s), %d term(s)%s", app_id, len(hosts), n_wl,
              f", -x {','.join(exts)}" if exts else "")
     cmd = [FEROX, "--stdin", "--silent", "--json", "-o", str(out_file), "--no-state", "-k",
            "--smart", "-t", FEROX_THREADS, "-L", FEROX_SCAN_LIMIT, "--timeout", FEROX_TIMEOUT,
            "--time-limit", FEROX_TIME_LIMIT, "-d", FEROX_DEPTH, "-w", str(wordlist), *ext_args]
-    tools.run(cmd, stdin=target, stream_stderr=is_verbose())
+    tools.run(cmd, stdin="\n".join(hosts), stream_stderr=is_verbose())
     records = parse_ferox(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
     n = tools.write_jsonl(ws.canonical("content_discovery.jsonl"), records)
     log.info("    feroxbuster (%s) → %d result(s) → content_discovery.jsonl", app_id, n)

@@ -305,6 +305,19 @@ def test_cluster_groups_by_signature(tmp_path):
     assert by_sig["Login|50|nginx"] == ["https://c.example.com"]
 
 
+def test_dedup_by_body():
+    # same backend served as domain + IP (identical body) → one rep (best_host: non-IP wins)
+    same = {"http://45.33.32.156": "B1", "http://scanme.nmap.org": "B1"}
+    assert tasks.dedup_by_body(["http://45.33.32.156", "http://scanme.nmap.org"], same) \
+        == ["http://scanme.nmap.org"]
+    # distinct environments (different body) → both kept
+    diff = {"https://staging.x.net": "B1", "https://test.x.net": "B2"}
+    assert sorted(tasks.dedup_by_body(["https://staging.x.net", "https://test.x.net"], diff)) \
+        == ["https://staging.x.net", "https://test.x.net"]
+    # unknown body → kept individually (can't prove identity)
+    assert tasks.dedup_by_body(["https://a", "https://b"], {}) == ["https://a", "https://b"]
+
+
 def test_cluster_partition_merges_same_apex_via_favicon():
     # same app on two sibling subdomains, content_length shifted by a token (→ different v1
     # signature) but identical favicon + same apex ⇒ merged (the over-split fix)

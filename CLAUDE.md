@@ -168,7 +168,11 @@ Dropped on purpose (were in an earlier draft): **leaf cert** and **ip+header+tec
 **Stable id:** `app_id` is anchored on the group's plurality `(favicon, apex)` → else plurality host
 (`_cluster_anchor`) — collision-free (two groups can't share an apex-scoped favicon, nor a host) and
 stable under minority membership changes. `meta.json` records `id_anchor` + `signature` for
-debuggability; oversized groups log a WARNING (`CLUSTER_MAX_HOSTS`). The residual (same-apex hosts
+debuggability, plus **`body_by_host`** (url → response-body sha256) — the active scanners
+(`crawl`/`crawl_headless`/`content_discovery`) read it via `_scan_hosts`/`dedup_by_body` to scan one
+host per distinct body (collapse same-backend aliases, keep distinct environments). `passive_probe`,
+`subenum` and `takeover` deliberately stay on ALL hosts (per-domain/apex/hostname data differs).
+Oversized groups log a WARNING (`CLUSTER_MAX_HOSTS`). The residual (same-apex hosts
 with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) is what a future
 `recluster` deep-path confirmation pass would resolve. The example stub still hashes a fabricated sig.
 
@@ -242,10 +246,12 @@ best-effort). Output: the per-app `scans/<app_id>/wl_custom/seed.txt`.
 
 `content_discovery` is the one Loop 2 step that *must* make new requests — forced browsing finds
 UNLINKED paths, which by definition aren't in any downloaded body. `feroxbuster --smart` (auto-tune
-soft-404 calibration + collect-words/backups + link extraction/recursion) over the app's
-**representative host only** (`best_host`, like screenshot) — a group is one app by construction, so
-forced-browsing every host would re-fuzz the same backend (double traffic; the scanme.nmap.org hang)
-— with a combined wordlist (`wl_custom/seed.txt` first, then the resolved global list
+soft-404 calibration + collect-words/backups + link extraction/recursion) over the group's hosts
+**deduped by response body** (`_scan_hosts` → `dedup_by_body`): same-backend aliases (domain+IP,
+http+https) collapse to one (no re-fuzz; the scanme.nmap.org hang), but distinct environments
+(staging vs test — different body) are each fuzzed, since env-specific files differ. `crawl` and
+`crawl_headless` use the same `_scan_hosts` selection — with a combined wordlist (`wl_custom/seed.txt`
+first, then the resolved global list
 `wordlists.role_path(activity, "content")` — see role resolution above) and tech-derived extensions
 (`tech_extensions`). `--smart` means the wordlist-feedback loop is built in — don't hand-roll it.
 Output: `scans/<app_id>/content_discovery.jsonl` (`parse_ferox` keeps the `response` records).
@@ -297,6 +303,63 @@ gracefully, keeping partial results).
   top of `pipelines/recon/tasks.py` — tuned conservatively for live infra; don't bump blindly.
 - **Authorized test scope only:** `https://ginandjuice.shop/` (PortSwigger demo), `scanme.nmap.org`
   (Nmap-sanctioned).
+
+## Recon design decisions (the *why*, and what was rejected)
+
+The architecture sections above say *what* the recon pipeline does; this records *why* — and the
+alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **Active scanners target one host per distinct response body — not all-hosts, not best_host.**
+  `crawl`/`crawl_headless`/`content_discovery` go through `_scan_hosts` → `dedup_by_body` (keyed on
+  the per-host `body_sha256` recorded in `meta.json`). *Why:* a group is one app, so same-backend
+  aliases (a domain **and** its IP, http+https) are pure re-scan — that caused a ~2h feroxbuster hang
+  re-fuzzing `scanme.nmap.org` twice (hostname + IP). But two hosts with *different* bodies are
+  distinct environments (e.g. `staging.` vs `test.` of one app) whose linked content and env-specific
+  files genuinely differ, so both must be scanned. *Rejected:* `best_host` (shipped briefly — too
+  aggressive, loses the staging/test deltas); all-hosts (re-fuzzes identical backends).
+  `passive_probe`/`subenum`/`takeover` deliberately stay on **all** hosts — they key on
+  domain/apex/hostname, where the data really does differ. (Supersedes a planned host-per-IP dedup.)
+
+- **feroxbuster gets a `--time-limit` (total wall-clock cap).** *Why:* `--timeout` is per-request
+  only; a target that throttles under `--smart` (scanme.nmap.org) drove feroxbuster's auto-tune into
+  an unbounded backoff *livelock* — sleeping, 0 CPU, no output — that hung the whole pipeline for
+  hours with no way out. `--time-limit` is `--smart`-compatible and exits gracefully keeping partial
+  results. *Rejected for now:* a subprocess-`timeout` backstop and a general per-tool cap in `_run`
+  (deferred — `--time-limit` covers the observed failure).
+
+- **EyeWitness is optional, runs on a single host, and is fed via a one-line `-f` file.** *Why:*
+  it's a heavy Selenium app, so it degrades like shortscan/wpprobe (skipped if absent — httpx stays
+  the screenshot baseline). It runs on `best_host` (like the httpx screenshot), and via `-f` with one
+  URL rather than `--single` because **only the `-f` report path writes `Requests.csv`** (the
+  "Default Creds" column we parse). Its default-cred hits are **signature-based leads**, not verified
+  logins. Installed at `/opt/EyeWitness` with its own venv so Selenium Manager auto-provisions
+  chromedriver (no apt/sudo/Xvfb; `--headless=new`).
+
+- **Clustering is precision-first and keys on app identity, never infrastructure.** *Why:* over-merge
+  (fusing different apps) is a **correctness** bug here — a group shares one `endpoints.txt`/`hosts`,
+  cross-fuzzes, and one screenshot represents it — whereas over-split is only wasted work. So the
+  union-find uses only app-identity signals (redirect-final, exact body, apex-scoped favicon +
+  fingerprint) and *when in doubt does not merge*. *Rejected:* the old exact `Title|CL|Webserver` key
+  (brittle: drifts on a token, collides on blank titles); **cert** and **ip+header+tech** edges (infra
+  — one cert/box fronts distinct apps → over-merge); DBSCAN/embedding clustering (non-deterministic,
+  breaks the stable `app_id` contract); LSH/simhash near-dup and a `recluster` deep-path pass
+  (deferred, not needed yet).
+
+- **Gated headless crawl keyed on a *measured* JS-render signal, not a framework label.** `crawl`
+  classifies each app (`is_js_rendered`: raw `<a href>` vs the JS-parsed/crawley surface + thin-shell
+  markers, recorded in `crawl_class.json`); `crawl_headless` renders only the JS bucket, RAM-capped by
+  a process-wide semaphore. *Why:* the benchmark showed framework labels lie (a "React" app can behave
+  traditionally), and headless RAM (1-5 GB/host) is the scale constraint. *Rejected:* the old `is_spa`
+  framework-keyword heuristic (removed); a Prefect per-stage concurrency tag for the RAM cap (the
+  semaphore works because `ThreadPoolTaskRunner` is one process); `-sc`/system-chrome (hangs for
+  katana here — uses the bundled rod chromium). It was a slip-of-the-tongue "nuclei -headless" → the
+  intent was katana crawling.
+
+- **Two crawlers run in parallel (`katana ∥ crawley`); no SPA detection.** *Why:* the benchmark's best
+  coverage/cost knee was katana-fx + crawley; crawley adds form-POST/asset URLs katana-fx misses at
+  ~zero marginal cost in parallel. katana is the downloader (`-srd` store for offline mining); crawley
+  is pure URL discovery → its URLs join the `fetch_delta` candidates. SPA handling moved to the gated
+  headless pass above, so the old SPA-detection + katana `-headless` branch was removed.
 
 ## Pin to keep
 
