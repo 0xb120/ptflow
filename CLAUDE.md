@@ -171,8 +171,12 @@ stable under minority membership changes. `meta.json` records `id_anchor` + `sig
 debuggability, plus **`body_by_host`** (url → response-body sha256) — the active scanners
 (`crawl`/`crawl_headless`/`content_discovery`) read it via `_scan_hosts`/`dedup_by_body` to scan one
 host per distinct body (collapse same-backend aliases, keep distinct environments). `passive_probe`,
-`subenum` and `takeover` deliberately stay on ALL hosts (per-domain/apex/hostname data differs).
-Oversized groups log a WARNING (`CLUSTER_MAX_HOSTS`). The residual (same-apex hosts
+`subenum` and `takeover` deliberately stay on ALL hosts (per-domain/apex/hostname data differs). It
+also records **`headers_by_host`** (url → httpx's `header` dict, captured via `-irh`) for later
+reasoning, plus **`header_signals`** — a curated, gate-on-able view (`cache` · `cdn:*` · `backend:*` ·
+`stack:*` · `waf:*` · `hsts`/`csp`, via `header_signals()`) unioned over the group, the header analog
+of `tech` for dispatching per-stack tools. Oversized groups log a WARNING (`CLUSTER_MAX_HOSTS`). The
+residual (same-apex hosts
 with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) is what a future
 `recluster` deep-path confirmation pass would resolve. The example stub still hashes a fabricated sig.
 
@@ -308,6 +312,16 @@ gracefully, keeping partial results).
 
 The architecture sections above say *what* the recon pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **Response headers captured as a structured signal, gated like `tech`.** httpx `-irh` emits a
+  ready `header` dict (no parsing); `cluster()` stores `headers_by_host` (raw, for ad-hoc reasoning)
+  + `header_signals` (curated: `cache`/`cdn:*`/`backend:*`/`stack:*`/`waf:*`/`hsts`/`csp`) in
+  `meta.json`, so per-stack stages can dispatch tools on header presence (e.g. a cache probe when
+  `cache ∈ signals`) the same way they do on `tech`. *Why `-irh` not `-irr`:* `-irh` gives the
+  structured dict without the inline response **body** that `-irr` embeds — that body is heavy and
+  already in the `responses/` store (nothing read it inline), so `-irr` was swapped out. *Rejected:*
+  headers as a clustering EDGE — they're volatile (Date/Set-Cookie/request-ids) → noise/over-split;
+  they're a per-app gating signal, not a grouping key.
 
 - **Active scanners target one host per distinct response body — not all-hosts, not best_host.**
   `crawl`/`crawl_headless`/`content_discovery` go through `_scan_hosts` → `dedup_by_body` (keyed on

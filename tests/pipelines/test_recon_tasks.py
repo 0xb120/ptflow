@@ -305,6 +305,19 @@ def test_cluster_groups_by_signature(tmp_path):
     assert by_sig["Login|50|nginx"] == ["https://c.example.com"]
 
 
+def test_header_signals():
+    h = {
+        "x_cache": "HIT", "server": "nginx/1.25", "x_powered_by": "PHP/8.2",
+        "set_cookie": "JSESSIONID=abc; Path=/", "cf_ray": "abc-LHR",
+        "strict_transport_security": "max-age=63072000", "date": "irrelevant",
+    }
+    assert tasks.header_signals(h) == sorted([
+        "cache", "backend:nginx", "stack:php", "stack:java", "cdn:cloudflare", "hsts",
+    ])
+    assert tasks.header_signals({}) == []          # no headers → no signals
+    assert tasks.header_signals({"date": "x"}) == []  # only volatile → no signals
+
+
 def test_dedup_by_body():
     # same backend served as domain + IP (identical body) → one rep (best_host: non-IP wins)
     same = {"http://45.33.32.156": "B1", "http://scanme.nmap.org": "B1"}

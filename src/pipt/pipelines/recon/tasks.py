@@ -307,6 +307,37 @@ def tech_extensions(tech: list[str], mapping: dict[str, list[str]]) -> list[str]
     return tools.dedupe(out)
 
 
+# response-header NAME present ⇒ signal (httpx normalizes header keys to snake_case lowercase)
+_HEADER_PRESENT = {
+    "x_cache": "cache", "cf_cache_status": "cache", "x_varnish": "cache",
+    "x_proxy_cache": "cache", "x_drupal_cache": "cache", "age": "cache",
+    "cf_ray": "cdn:cloudflare", "x_amz_cf_id": "cdn:cloudfront",
+    "x_fastly_request_id": "cdn:fastly", "x_akamai_transformed": "cdn:akamai",
+    "x_sucuri_id": "waf:sucuri", "x_amzn_waf_action": "waf:aws",
+    "strict_transport_security": "hsts", "content_security_policy": "csp",
+}
+_SERVER_FAMILIES = ("nginx", "apache", "iis", "envoy", "openresty", "caddy", "litespeed")
+_POWERED_BY = {"php": "stack:php", "asp.net": "stack:aspnet", "express": "stack:express", "next.js": "stack:nextjs"}
+_COOKIE_STACK = {"jsessionid": "stack:java", "phpsessid": "stack:php", "asp.net_sessionid": "stack:aspnet",
+                 "laravel_session": "stack:laravel", "_rails": "stack:rails", "csrftoken": "stack:django"}
+
+
+def header_signals(headers: dict) -> list[str]:
+    """Actionable signals from a response-header dict (httpx's `header`) — a small controlled
+    vocabulary downstream stages can gate tools on, like `tech`. Encodes PRESENCE/family
+    (cache · cdn:* · backend:* · stack:* · waf:* · hsts/csp), never volatile values (Date,
+    Set-Cookie value, request ids). Returns a sorted list (JSON-friendly)."""
+    h = {str(k).lower(): str(v).lower() for k, v in (headers or {}).items()}
+    sig = {s for name, s in _HEADER_PRESENT.items() if name in h}
+    server = h.get("server", "")
+    sig |= {f"backend:{fam}" for fam in _SERVER_FAMILIES if fam in server}
+    powered = h.get("x_powered_by", "")
+    sig |= {s for key, s in _POWERED_BY.items() if key in powered}
+    cookies = h.get("set_cookie", "")
+    sig |= {s for name, s in _COOKIE_STACK.items() if name in cookies}
+    return sorted(sig)
+
+
 def parse_ferox(out: str) -> list[dict]:
     """Keep feroxbuster --json 'response' records (drop stats/garbage); normalize."""
     records: list[dict] = []
@@ -608,7 +639,7 @@ def httpx_fingerprint(activity: Activity) -> None:
     out = _run(
         "httpx",
         [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
-         "-favicon", "-location", "-fr", "-irr", "-j"],
+         "-favicon", "-location", "-fr", "-irh", "-j"],
         stdin=httpx_input, dest=canon("httpx_full_metadata.jsonl"), label="fingerprint",
     )
     records = [json.loads(ln) for ln in out.splitlines() if ln.strip()]
@@ -764,6 +795,10 @@ def cluster(activity: Activity) -> list[str]:
         # per-host response-body hash → lets per-app stages dedup same-backend hosts (domain+IP,
         # http+https) while keeping distinct environments (staging vs test). See dedup_by_body.
         body_by_host = {r["url"]: (r.get("hash") or {}).get("body_sha256") for r in members}
+        # raw response headers (httpx -irh) kept per host for later reasoning; header_signals is the
+        # curated, gate-on-able view (cache/cdn/backend/stack/waf), unioned over the group's hosts.
+        headers_by_host = {r["url"]: (r.get("header") or {}) for r in members}
+        signals = sorted({s for hdrs in headers_by_host.values() for s in header_signals(hdrs)})
         if len(urls) > CLUSTER_MAX_HOSTS:
             log.warning("⚠ cluster %s has %d hosts — possible residual collision (id_anchor=%s)",
                         app_id, len(urls), key)
@@ -781,6 +816,8 @@ def cluster(activity: Activity) -> list[str]:
                 "tech": rep.get("tech") or [],
                 "hosts": urls,
                 "body_by_host": body_by_host,
+                "headers_by_host": headers_by_host,
+                "header_signals": signals,
             },
         )
         tools.write_lines(ws.hosts, urls)
