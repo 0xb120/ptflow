@@ -9,11 +9,18 @@ memory. Pure transforms are module-level so they can be unit-tested.
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
+import os
+import re
+import shlex
 import shutil
+import threading
 from collections import Counter
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -45,10 +52,40 @@ NUCLEI_RETRIES = "2"    # -retries
 GAU_THREADS = "5"
 KATANA_DEPTH = "3"
 KATANA_CONC = "2"
+# crawley — a SECOND crawler run ∥ katana for coverage (see crawl()). Headless here means
+# "skip the HEAD pre-flight", NOT browser rendering. Workers/delay mirror the manually-tuned
+# combo; for wide fan-out across many apps consider dialing -workers down / -delay up.
+CRAWLEY_DEPTH = "3"
+CRAWLEY_WORKERS = "15"
+CRAWLEY_DELAY = "0"         # per-request delay ("0" disables it; crawley's default is 150ms)
+# headless crawl (TIER 1) — browser-backed, RAM-heavy; gated on the JS-render classification
+# (is_js_rendered). Uses katana's bundled rod chromium (NOT -sc/system-chrome, which hangs here);
+# -aff stays OFF (it would submit real forms). RAM (1-5 GB/host) is the dominant constraint at
+# scale, so concurrent headless processes are capped PROCESS-WIDE by _HEADLESS_SLOTS (the
+# ThreadPoolTaskRunner runs every stage as a thread in one process, so a module semaphore caps
+# them across all app groups). -ct bounds runaway SPAs per host (footgun: per-host cap is a must).
+HEADLESS_DEPTH = "3"
+HEADLESS_CONC = "5"          # -c page concurrency within ONE headless process (RAM ∝ this)
+HEADLESS_CT = "180"          # -ct crawl-duration cap per host (seconds)
+HEADLESS_RL = "50"           # -rl requests/second
+HEADLESS_PARALLELISM = 2     # max concurrent headless processes across ALL app groups
+_HEADLESS_SLOTS = threading.BoundedSemaphore(HEADLESS_PARALLELISM)
+# JS-render classification (NO browser) — calibrated on the crawler benchmark (handoff doc §6).
+# Headless pays off only when the non-headless LINK surface is small yet JS-parse (fx) finds much
+# more, or a thin-shell framework marker is present. A healthy link surface ⇒ traditional ⇒ skip.
+JS_LINK_CEILING = 40   # link surface (max of raw <a href>, crawley) at/above this ⇒ traditional
+JS_FX_MIN = 20         # require at least this many fx endpoints (avoid tiny-sample noise)
+JS_FX_RATIO = 3        # ...and fx must dwarf the link surface by this factor
+THIN_SHELL_MARKERS = ("__next_data__", "/_next/", "/_nuxt/", "__nuxt__", "ng-version", "data-reactroot")
 SUBJACK_THREADS = "100"
 SUBJACK_TIMEOUT = "30"
 SCREENSHOT_TIMEOUT = "20"   # httpx -screenshot per-page timeout (seconds)
-SPA_FRAMEWORKS = frozenset({"react", "vue", "angular", "svelte", "next", "nuxt", "gatsby", "ember"})
+# EyeWitness (OPTIONAL) — adds signature-based default-credential detection on the SAME single
+# best-host as the httpx screenshot (one URL per group, fed via a one-line -f file). Not a single
+# binary (Selenium app); resolved best-effort by _eyewitness_cmd: PIPT_EYEWITNESS override, else
+# `eyewitness` on PATH, else the known venv install at /opt/EyeWitness (_EYEWITNESS_DIR) — skipped if
+# none resolve. Selenium ≥4.6 auto-provisions chromedriver (Selenium Manager); runs --headless=new.
+EYEWITNESS_TIMEOUT = "15"   # --timeout per-URL seconds
 NOISE_EXTENSIONS = frozenset({
     "jpg", "jpeg", "png", "gif", "svg", "bmp", "webp", "ico",
     "woff", "woff2", "ttf", "eot", "otf", "css",
@@ -77,6 +114,16 @@ TECH_EXTENSIONS = {  # detected-tech keyword → file extensions to fuzz
     "coldfusion": ["cfm", "cfc"],
 }
 
+# clustering (surfagr.sh port) — group webapps into application-groups by union-find over
+# APP-IDENTITY signals only (see _cluster_signals/_CLUSTER_EDGES). Tuned PRECISION-FIRST: never
+# merge logically-different apps (over-merge is a correctness bug); a duplicate scanned twice is
+# acceptable waste. A GLOBAL signal value (body hash, final host) spanning more than
+# GENERIC_MAX_APEXES distinct apexes is treated as generic (a default/error page, a parking
+# redirect) and does NOT merge; the fuzzy signals (favicon, root fingerprint) are apex-scoped so
+# they never merge across organizations regardless.
+GENERIC_MAX_APEXES = 8   # global signal shared across more distinct apexes than this ⇒ generic, ignored
+CLUSTER_MAX_HOSTS = 50   # a group larger than this ⇒ WARNING (likely residual collision)
+
 # `httpx` on PATH is the pyenv shim; the ProjectDiscovery binary lives in ~/go/bin.
 _HTTPX_BIN = Path.home() / "go" / "bin" / "httpx"
 HTTPX = str(_HTTPX_BIN) if _HTTPX_BIN.exists() else "httpx"
@@ -95,6 +142,14 @@ SHORTSCAN_CONC = "20"  # shortscan -c concurrency (its default)
 # jsluice (offline JS endpoint/secret mining of the response store) lives in ~/go/bin.
 _JSLUICE_BIN = Path.home() / "go" / "bin" / "jsluice"
 JSLUICE = str(_JSLUICE_BIN) if _JSLUICE_BIN.exists() else "jsluice"
+
+# crawley (the second crawler, run ∥ katana) lives in ~/go/bin.
+_CRAWLEY_BIN = Path.home() / "go" / "bin" / "crawley"
+CRAWLEY = str(_CRAWLEY_BIN) if _CRAWLEY_BIN.exists() else "crawley"
+
+# EyeWitness (optional, screenshot step) — known venv install (own .venv + Python/EyeWitness.py);
+# resolved by _eyewitness_cmd (overridable via PIPT_EYEWITNESS / `eyewitness` on PATH).
+_EYEWITNESS_DIR = Path("/opt/EyeWitness")
 
 
 # --- pure transforms (unit-tested) ---
@@ -282,6 +337,73 @@ def parse_shortscan(out: str) -> list[str]:
     return tools.dedupe(w.lower() for w in words if w.strip())
 
 
+def parse_eyewitness_csv(text: str) -> list[dict]:
+    """Default-credential leads from an EyeWitness `Requests.csv` (pure).
+
+    Columns: Protocol,Port,Domain,URL,Resolved,Request Status,Title,Category,Default Creds,
+    Screenshot Path, Source Path. EyeWitness matches the page source against its signatures.txt
+    and writes the known default creds (or 'None') into the "Default Creds" column. Keeps only
+    rows with a real match → {url, title, category, creds}. NB: these are signature-based LEADS
+    (a page that ships with known defaults), not verified logins.
+    """
+    findings: list[dict] = []
+    for row in csv.DictReader(io.StringIO(text)):
+        creds = (row.get("Default Creds") or "").strip()
+        if creds and creds.lower() != "none":
+            findings.append({
+                "url": (row.get("URL") or "").strip(),
+                "title": (row.get("Title") or "").strip(),
+                "category": (row.get("Category") or "").strip(),
+                "creds": creds,
+            })
+    return findings
+
+
+def parse_katana(out: str) -> list[str]:
+    """URLs from katana -j JSONL output: the `endpoint` nested under each `request`.
+
+    katana emits one JSON object per crawled request ({"request":{"endpoint":...}}).
+    Unparseable lines and records without an endpoint are skipped; order is preserved
+    (dedup happens at the merge in crawl())."""
+    urls: list[str] = []
+    for rec in _jsonl_str(out):
+        endpoint = (rec.get("request") or {}).get("endpoint")
+        if endpoint:
+            urls.append(endpoint)
+    return urls
+
+
+def count_hrefs(html: str) -> int:
+    """Number of <a href=...> links in raw HTML — the 'traditional' link-surface baseline.
+
+    Counts only anchor links (not <link href>, <area>, etc.); used by the JS-render
+    classification to compare the raw HTML surface against the JS-parsed one."""
+    return len(re.findall(r"<a\b[^>]*\bhref\s*=", html, flags=re.IGNORECASE))
+
+
+def has_thin_shell_marker(html: str) -> bool:
+    """Whether the HTML carries a JS-framework thin-shell marker (Next/Nuxt/Angular/React)."""
+    blob = html.lower()
+    return any(m in blob for m in THIN_SHELL_MARKERS)
+
+
+def is_js_rendered(raw_href: int, fx: int, crawley: int, *, marker: bool) -> bool:
+    """Classify (NO browser) whether an app's surface lives in JS ⇒ a headless crawl pays off.
+
+    Validated signal from the crawler benchmark (handoff §6): headless wins only when the
+    non-headless LINK surface (raw <a href> and crawley) is small yet JS-parse (katana -fx /
+    jsluice) finds far more — or a thin-shell framework marker is present. A healthy link
+    surface means ordinary crawling already saw the site (traditional, or a React/finto-SPA that
+    behaves traditionally), so a browser launch would be pure cost. Thresholds are tunable.
+    """
+    link = max(raw_href, crawley)
+    if link >= JS_LINK_CEILING:
+        return False                              # link-crawl already found a healthy surface
+    if marker:
+        return True                               # thin shell + framework marker ⇒ JS-rendered
+    return fx >= JS_FX_MIN and fx >= JS_FX_RATIO * max(link, 1)
+
+
 def is_js_url(url: str) -> bool:
     """True if the URL points at a JavaScript file (path ends .js, ignoring the query)."""
     last = url.split("?", 1)[0].rsplit("/", 1)[-1]
@@ -300,12 +422,6 @@ def http_body(text: str) -> str:
         if not lines[j].strip():
             return "\n".join(lines[j + 1:]).strip("\n")
     return ""
-
-
-def is_spa(tech: list[str]) -> bool:
-    """Whether the cluster's detected tech (meta.json) suggests a JS SPA → headless crawl."""
-    blob = " ".join(tech).lower()
-    return any(fw in blob for fw in SPA_FRAMEWORKS)
 
 
 # --- helpers ---
@@ -470,7 +586,7 @@ def httpx_fingerprint(activity: Activity) -> None:
     out = _run(
         "httpx",
         [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
-         "-location", "-fr", "-j"],
+         "-favicon", "-location", "-fr", "-j"],
         stdin=httpx_input, dest=canon("httpx_full_metadata.jsonl"), label="fingerprint",
     )
     records = [json.loads(ln) for ln in out.splitlines() if ln.strip()]
@@ -509,53 +625,201 @@ def nuclei_scope(activity: Activity) -> None:
 
 
 # --- clustering (surfagr.sh port) ---
-def cluster(activity: Activity) -> list[str]:
-    """Group httpx vhosts by (Title, Content-Length, Webserver) into scans/<app_id>/.
+def _cluster_signals(record: dict) -> dict:
+    """Clustering signals for one httpx record (pure), tuned PRECISION-FIRST.
 
-    Port of surfagr.sh. Each distinct signature becomes one application-group
-    workspace with meta.json (identity) + hosts.txt (the group's URLs — the input
-    the per-app enum phase consumes). Returns the sorted app_ids.
+    Goal: never merge logically-different apps (over-merge is a correctness bug here — merged
+    apps share one endpoints.txt and get cross-fuzzed); over-split (a duplicate scanned twice)
+    is only wasted work. So we cluster on APP-IDENTITY signals, NOT infrastructure (cert/IP,
+    which routinely span distinct apps under one company). Each value is a bucket key; None =
+    no edge. The fuzzy app-fingerprint signals (fav, sig) are APEX-SCOPED — keyed by (value,
+    apex) — so they can never merge across organizations, only sibling subdomains of one apex.
     """
-    records = tools.read_jsonl(activity.asset_discovery_canonical("httpx_full_metadata.jsonl"))
-    groups: dict[str, dict] = {}
-    for r in records:
-        url = r.get("url")
-        if not url:
-            continue
-        signature = f"{r.get('title') or ''}|{r.get('content_length')}|{r.get('webserver') or ''}"
-        group = groups.setdefault(_app_id(signature), {"signature": signature, "rep": r, "urls": []})
-        group["urls"].append(url)
+    host = url_host(record.get("url") or "")
+    apex_of = apex(host)
+    digests = record.get("hash") or {}
+    favicon = record.get("favicon")
+    favicon = favicon if favicon not in (None, "", "0") else None
+    status = record.get("status_code") or 0
+    body = digests.get("body_sha256") if 200 <= status < 400 else None  # noqa: PLR2004
+    title, server = record.get("title") or "", record.get("webserver") or ""
+    signature = f"{title}|{record.get('content_length')}|{server}"
+    return {
+        "host": host, "apex": apex_of,
+        "final": host or None,                              # GLOBAL, safe: redirect-converged final host
+        "body": body or None,                               # GLOBAL, safe: identical 2xx/3xx bytes (demoted)
+        "fav": (favicon, apex_of) if favicon else None,     # apex-scoped app fingerprint
+        "sig": (signature, apex_of) if (title or server) else None,  # apex-scoped, non-blank only
+    }
 
-    for app_id, group in groups.items():
+
+# Only APP-IDENTITY edges. Dropped vs the first v2: `cert` and `iht` (ip+header+tech) — those are
+# INFRASTRUCTURE (one cert / one box routinely fronts distinct apps) and over-merge. `final`+`body`
+# are cross-apex safe; `fav`+`sig` are apex-scoped so they never merge across organizations.
+_CLUSTER_EDGES = ("final", "body", "fav", "sig")
+
+
+def _connected_components(n: int, to_union: list[list[int]]) -> list[list[int]]:
+    """Union-find: merge each index-list in `to_union`, return components as sorted index
+    lists ordered by smallest index (deterministic)."""
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # path halving
+            x = parent[x]
+        return x
+
+    for idxs in to_union:
+        for j in idxs[1:]:
+            parent[find(j)] = find(idxs[0])
+    comps: dict[int, list[int]] = {}
+    for i in range(n):
+        comps.setdefault(find(i), []).append(i)
+    return sorted((sorted(c) for c in comps.values()), key=lambda c: c[0])
+
+
+def cluster_partition(records: list[dict]) -> list[list[int]]:
+    """Partition httpx records into application-groups (pure, deterministic).
+
+    For each signal, records sharing a value are unioned — UNLESS the value spans more than
+    GENERIC_MAX_APEXES distinct apexes (a generic default/error page or parking redirect →
+    demoted, no merge). The apex-scoped signals (fav, sig) sit in one apex by construction, so
+    demotion only ever bites the global `body` edge. Components are the groups, sorted.
+    """
+    sigs = [_cluster_signals(r) for r in records]
+    to_union: list[list[int]] = []
+    for edge in _CLUSTER_EDGES:
+        buckets: dict[object, list[int]] = {}
+        for i, s in enumerate(sigs):
+            if s[edge] is not None:
+                buckets.setdefault(s[edge], []).append(i)
+        for value, idxs in buckets.items():
+            if len({sigs[i]["apex"] for i in idxs}) > GENERIC_MAX_APEXES:
+                log.debug("  · demote generic %s value (%r) across many apexes", edge, value)
+            else:
+                to_union.append(idxs)
+    return _connected_components(len(records), to_union)
+
+
+def _cluster_anchor(members: list[dict]) -> tuple[str, str]:
+    """Stable, collision-free id anchor for a group: plurality (favicon, apex), else host.
+
+    A (favicon, apex) pair is unique across groups — two groups sharing it would have merged via
+    the apex-scoped favicon edge — and intrinsic, so it stays stable when a minority member joins
+    or leaves. Failing that, a host is in exactly one group, so plurality host is also unique.
+    Ties broken deterministically (highest count, then value).
+    """
+    sigs = [_cluster_signals(r) for r in members]
+    favs = Counter(s["fav"] for s in sigs if s["fav"])  # keys are (favicon, apex)
+    if favs:
+        favicon, apex_of = max(favs, key=lambda k: (favs[k], k))
+        return "favicon", f"{favicon}@{apex_of}"
+    hosts = Counter(s["host"] for s in sigs)
+    return "host", max(hosts, key=lambda v: (hosts[v], v))
+
+
+def cluster(activity: Activity) -> list[str]:
+    """Group httpx vhosts into scans/<app_id>/ via union-find over APP-IDENTITY signals.
+
+    Port of surfagr.sh, precision-first. Connected-components partition (cluster_partition) over
+    redirect-final host, exact body hash, and apex-scoped favicon / root-fingerprint — chosen so
+    logically-different apps are NEVER merged (infra signals like cert/IP are deliberately not
+    used). When in doubt it does NOT merge: a duplicate scanned twice is cheaper than two apps
+    fused into one workspace. Each group becomes one application-group workspace with meta.json +
+    hosts.txt. Returns the sorted app_ids.
+    """
+    canon = activity.asset_discovery_canonical
+    records = [r for r in tools.read_jsonl(canon("httpx_full_metadata.jsonl")) if r.get("url")]
+
+    app_ids: list[str] = []
+    for idxs in cluster_partition(records):
+        members = [records[i] for i in idxs]
+        key, value = _cluster_anchor(members)
+        app_id = _app_id(f"{key}:{value}")
+        rep = min(members, key=lambda r: r["url"])
+        urls = tools.dedupe(r["url"] for r in members)
+        if len(urls) > CLUSTER_MAX_HOSTS:
+            log.warning("⚠ cluster %s has %d hosts — possible residual collision (id_anchor=%s)",
+                        app_id, len(urls), key)
         ws = activity.app(app_id).ensure()
-        rep = group["rep"]
-        members = tools.dedupe(group["urls"])
         workspace.write_meta(
             ws.meta,
             {
                 "app_id": app_id,
-                "signature": group["signature"],
+                "id_anchor": key,  # signal the STABLE id is derived from (not necessarily the merge reason)
+                "signature": f"{rep.get('title') or ''}|{rep.get('content_length')}|{rep.get('webserver') or ''}",
                 "title": rep.get("title"),
                 "webserver": rep.get("webserver"),
                 "content_length": rep.get("content_length"),
                 "status_code": rep.get("status_code"),
                 "tech": rep.get("tech") or [],
-                "hosts": members,
+                "hosts": urls,
             },
         )
-        tools.write_lines(ws.hosts, members)
-        log.info("  → app %s [%s] — %d host(s)", app_id, group["signature"], len(members))
-    return sorted(groups)
+        tools.write_lines(ws.hosts, urls)
+        log.info("  → app %s [id:%s] — %d host(s)", app_id, key, len(urls))
+        app_ids.append(app_id)
+    return sorted(app_ids)
 
 
 # --- depth sub-phases (per app group; chain via the app workspace on disk) ---
-def screenshot(activity: Activity, app_id: str) -> None:
-    """LOOP 1 (first step) — root-page screenshot of the cluster's best host.
+def _eyewitness_cmd() -> list[str] | None:
+    """How to invoke EyeWitness, or None if unavailable (best-effort, like shortscan/wpprobe).
 
-    Picks one URL per app (non-IP preferred; see best_host) and captures its root page
-    with system Chrome via httpx -screenshot. httpx names the PNG under raw/; it's
-    promoted to the canonical scans/<app_id>/screenshot.png, or a screenshot.failed
-    marker on miss. No needs — runs right after cluster fan-out, ∥ the other loop-1 steps.
+    Not a single binary (Selenium app): PIPT_EYEWITNESS — a full launch command, e.g.
+    "python3 /opt/EyeWitness/Python/EyeWitness.py" or a venv wrapper — takes precedence; else a
+    pip-installed `eyewitness` on PATH. The operator owns the Python/deps/chromedriver behind it.
+    """
+    explicit = os.environ.get("PIPT_EYEWITNESS")
+    if explicit:
+        return shlex.split(explicit)
+    found = shutil.which("eyewitness")
+    if found:
+        return [found]
+    # known install: a dedicated venv python + EyeWitness.py (PATH-independent)
+    venv_py = _EYEWITNESS_DIR / ".venv" / "bin" / "python"
+    script = _EYEWITNESS_DIR / "Python" / "EyeWitness.py"
+    return [str(venv_py), str(script)] if venv_py.exists() and script.exists() else None
+
+
+def _eyewitness(activity: Activity, ws: AppWorkspace, target: str, app_id: str) -> None:
+    """OPTIONAL — EyeWitness on the SINGLE best-host `target` (like httpx, one URL per group):
+    screenshot + signature-based default-cred detection. Fed via a one-line -f file — the -f report
+    path is the one that writes Requests.csv (--single skips it). Parses Requests.csv →
+    default_creds.jsonl (the leads); the HTML report stays under raw/eyewitness/. No-op when
+    EyeWitness isn't resolvable (best-effort)."""
+    cmd = _eyewitness_cmd()
+    if cmd is None:
+        log.debug("  · skip eyewitness (not installed) for %s", app_id)
+        return
+    out_dir = ws.raw("eyewitness")
+    if out_dir.exists():
+        shutil.rmtree(out_dir)  # EyeWitness wants a fresh -d (else it prompts / appends)
+    target_file = activity.tmp / f"eyewitness_{app_id}.txt"
+    tools.write_lines(target_file, [target])
+    log.info("  → eyewitness (%s) — %s", app_id, target)
+    tools.run(
+        [*cmd, "--web", "-f", str(target_file), "-d", str(out_dir), "--no-prompt",
+         "--timeout", EYEWITNESS_TIMEOUT],
+        stream_stderr=is_verbose(),
+    )
+    csv_path = out_dir / "Requests.csv"
+    findings = (parse_eyewitness_csv(csv_path.read_text(encoding="utf-8", errors="replace"))
+                if csv_path.exists() else [])
+    n = tools.write_jsonl(ws.canonical("default_creds.jsonl"), findings)
+    if n:
+        log.info("    eyewitness (%s) → %d default-cred lead(s) → default_creds.jsonl", app_id, n)
+
+
+def screenshot(activity: Activity, app_id: str) -> None:
+    """LOOP 1 (first step) — root-page screenshot + (optional) EyeWitness default-cred detection.
+
+    Captures the cluster's best host (non-IP preferred; see best_host) via httpx -screenshot →
+    the canonical scans/<app_id>/screenshot.png (or a screenshot.failed marker). Then, best-effort,
+    runs EyeWitness on the SAME single best host for its signature-based default-credential leads
+    (→ default_creds.jsonl) plus an HTML report — skipped cleanly if EyeWitness isn't installed,
+    so httpx stays the reliable screenshot baseline. No needs — runs right after cluster fan-out.
     """
     ws = activity.app(app_id)
     target = best_host(tools.read_lines(ws.hosts))
@@ -578,6 +842,7 @@ def screenshot(activity: Activity, app_id: str) -> None:
     else:
         ws.canonical("screenshot.failed").write_text("", encoding="utf-8")
         log.info("    screenshot (%s) → screenshot.failed", app_id)
+    _eyewitness(activity, ws, target, app_id)
 
 
 def passive_probe(activity: Activity, app_id: str) -> None:
@@ -591,29 +856,125 @@ def passive_probe(activity: Activity, app_id: str) -> None:
     tools.write_lines(ws.canonical("endpoints_passive.txt"), [*gau, *urls])
 
 
-def crawl(activity: Activity, app_id: str) -> None:
-    """DEPTH 2 — active crawl that fetches the linked surface ONCE and keeps it.
+def _run_katana(ws: AppWorkspace, hosts: list[str], app_id: str) -> list[str]:
+    """katana — the DOWNLOADER crawler: parses JS endpoints (-jc/-jsl), known files
+    (-kf all), forms (-fx), climbs parent paths (-pc), scoped to each host's fqdn
+    (-fs fqdn), and stores every response under responses/ (-srd) for offline mining.
+    JSONL output (-j, bodies/raw omitted from stdout — the bodies still land on disk
+    via -srd). Returns the crawled URLs (request.endpoint per record)."""
+    cmd = ["katana", "-silent", "-j", "-jc", "-jsl", "-kf", "all", "-fx", "-pc",
+           "-fs", "fqdn", "-d", KATANA_DEPTH, "-c", KATANA_CONC,
+           "-omit-raw", "-omit-body", "-srd", str(ws.responses)]
+    out = _run("katana", cmd, stdin="\n".join(hosts),
+               dest=ws.raw("katana") / "out.jsonl", label=app_id)
+    return parse_katana(out)
 
-    katana with -jc/-jsl (parse JS endpoints), -kf all (robots.txt/sitemap.xml) and
-    -srd (store every response). Its URL output already contains JS-discovered and
-    known-file paths, so endpoints.txt is the JS-enriched corpus; the stored bodies
-    under responses/ are the per-app corpus that offline steps mine WITHOUT
-    re-fetching (the crawler is the downloader for the linked surface). Clusters whose
-    detected tech is a JS SPA (is_spa) also get -headless to render the app. Merges with
-    passive + denoise → endpoints.txt.
+
+def _run_crawley(hosts: list[str], app_id: str) -> list[str]:
+    """crawley — the second DISCOVERY crawler, run ∥ katana to widen the corpus.
+
+    Takes a single positional URL (not stdin), so it runs once per host; bypasses
+    _run like subjack/feroxbuster. Static URL discovery only (-all/-js scan css/js
+    for endpoints) — it does NOT download bodies, so its URLs flow into fetch_delta
+    as candidates (like the passive sources). -headless skips the HEAD pre-flight."""
+    if not hosts:
+        return []
+    log.info("  → crawley (%s) — %d host(s)", app_id, len(hosts))
+    urls: list[str] = []
+    for host in hosts:
+        out = tools.run(
+            [CRAWLEY, "-headless", "-depth", CRAWLEY_DEPTH, "-workers", CRAWLEY_WORKERS,
+             "-all", "-js", "-robots", "crawl", "-delay", CRAWLEY_DELAY, "-silent", host],
+            stream_stderr=is_verbose(),
+        )
+        urls += _lines(out)
+    log.info("    crawley (%s) → %d url(s)", app_id, len(urls))
+    return urls
+
+
+def _stored_root_html(ws: AppWorkspace, hosts: list[str]) -> str:
+    """Root-page HTML from katana's response store (fetch once) — for JS classification.
+
+    Returns the body of the stored response whose URL is one of the app's host roots,
+    or '' if none was stored. Reused instead of a fresh curl (the cheap crawl already
+    fetched the root)."""
+    roots = {h.rstrip("/") for h in hosts}
+    for stored, url in _store_index(ws.responses / "index.txt"):
+        if url.rstrip("/") in roots:
+            return http_body(Path(stored).read_text(encoding="utf-8", errors="replace"))
+    return ""
+
+
+def crawl(activity: Activity, app_id: str) -> None:
+    """DEPTH 2 — TWO crawlers in PARALLEL (TIER 0 cheap layer) + JS-render classification.
+
+    katana (downloader) and crawley (second discovery engine) run concurrently against
+    the app's hosts. katana stores every response under responses/ (-srd) as the per-app
+    corpus offline steps mine WITHOUT re-fetching; its URL output is JS-/form-enriched.
+    crawley adds the URLs katana didn't reach. Their union plus the passive sources,
+    denoised, is endpoints.txt; crawley's discovery is also persisted (endpoints_crawley.txt)
+    so fetch_delta downloads the bodies only it found.
+
+    Then it CLASSIFIES (no browser) whether the app's surface lives in JS — comparing the
+    raw <a href> count + crawley against the JS-parsed (fx) count, plus thin-shell markers —
+    and records the verdict in crawl_class.json. The gated headless pass (crawl_headless)
+    reads it and only renders the apps that actually benefit.
     """
     ws = activity.app(app_id)
     hosts = tools.read_lines(ws.hosts)
     if hosts:
         ws.responses.mkdir(parents=True, exist_ok=True)
-    katana = ["katana", "-silent", "-jc", "-jsl", "-kf", "all", "-d", KATANA_DEPTH, "-c", KATANA_CONC,
-              "-srd", str(ws.responses)]
-    if is_spa(workspace.read_meta(ws.meta).get("tech") or []):
-        katana += ["-headless", "-system-chrome"]  # render JS SPAs (detected framework)
-    crawled = _lines(_run("katana", katana, stdin="\n".join(hosts),
-                          dest=ws.raw("katana") / "out.txt", label=app_id))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        katana_fut = pool.submit(_run_katana, ws, hosts, app_id)
+        crawley_fut = pool.submit(_run_crawley, hosts, app_id)
+        katana_urls, crawley_urls = katana_fut.result(), crawley_fut.result()
+    tools.write_lines(ws.canonical("endpoints_crawley.txt"), crawley_urls)
     passive = tools.read_lines(ws.canonical("endpoints_passive.txt"))
-    tools.write_lines(ws.canonical("endpoints.txt"), denoise(tools.dedupe([*passive, *crawled])))
+    tools.write_lines(ws.canonical("endpoints.txt"),
+                      denoise(tools.dedupe([*passive, *katana_urls, *crawley_urls])))
+
+    root_html = _stored_root_html(ws, hosts)
+    raw_href, marker = count_hrefs(root_html), has_thin_shell_marker(root_html)
+    fx_n, cr_n = len(tools.dedupe(katana_urls)), len(tools.dedupe(crawley_urls))
+    js_render = is_js_rendered(raw_href, fx_n, cr_n, marker=marker)
+    workspace.write_meta(ws.canonical("crawl_class.json"), {
+        "js_render": js_render, "raw_href": raw_href, "fx": fx_n, "crawley": cr_n,
+        "thin_shell_marker": marker,
+    })
+    log.info("    classify (%s) — raw_href=%d fx=%d crawley=%d marker=%s → js_render=%s",
+             app_id, raw_href, fx_n, cr_n, marker, js_render)
+
+
+def crawl_headless(activity: Activity, app_id: str) -> None:
+    """DEPTH 2b — headless katana, run ONLY on the JS-rendered bucket (TIER 1, gated).
+
+    crawl classified each app (crawl_class.json). Traditional apps skip this entirely —
+    headless is browser-backed and RAM-heavy (1-5 GB/host), so concurrent launches are
+    capped process-wide (_HEADLESS_SLOTS). On a JS-rendered app it renders the SPA (-hl)
+    and extracts what link-crawling can't reach — JS-built routes and XHR/fetch URLs
+    (-jsl/-xhr) — storing bodies under responses/headless/ for offline mining. -iqp folds
+    query-param variants; -ct bounds runaway SPAs per host; -aff is OFF (never submit forms).
+    Output endpoints_headless.txt is folded into the loop-2 wordlist (like endpoints_js.txt).
+    """
+    ws = activity.app(app_id)
+    cls_path = ws.canonical("crawl_class.json")
+    if not (cls_path.exists() and workspace.read_meta(cls_path).get("js_render")):
+        log.debug("  · skip headless (not JS-rendered) for %s", app_id)
+        return
+    hosts = tools.read_lines(ws.hosts)
+    if not hosts:
+        return
+    store = ws.responses / "headless"
+    store.mkdir(parents=True, exist_ok=True)
+    cmd = ["katana", "-silent", "-j", "-hl", "-nos", "-jc", "-jsl", "-xhr", "-fx", "-iqp",
+           "-fs", "fqdn", "-d", HEADLESS_DEPTH, "-c", HEADLESS_CONC, "-ct", HEADLESS_CT,
+           "-rl", HEADLESS_RL, "-omit-raw", "-omit-body", "-srd", str(store)]
+    log.info("  → headless (%s) — JS-rendered, %d host(s) (capped at %d concurrent)",
+             app_id, len(hosts), HEADLESS_PARALLELISM)
+    with _HEADLESS_SLOTS:
+        out = _run("katana-headless", cmd, stdin="\n".join(hosts),
+                   dest=ws.raw("katana_headless") / "out.jsonl", label=app_id)
+    tools.write_lines(ws.canonical("endpoints_headless.txt"), denoise(parse_katana(out)))
 
 
 def subenum(activity: Activity, app_id: str) -> None:
@@ -670,14 +1031,15 @@ def build_wordlist(activity: Activity, app_id: str) -> None:
     No fetching: the crawl (loop 1) already downloaded and JS-parsed the linked
     surface — its JS-discovered endpoints and robots/sitemap paths are already in
     endpoints.txt, and the bodies are under responses/. This step tokenizes
-    endpoints.txt into path segments, filename basenames and parameter names
-    (tokenize_urls) and merges any tech-specific static lists keyed on the cluster's
-    detected tech. Output: scans/<app_id>/wl_custom/seed.txt (the activity wl_global/ holds
-    shared/global lists instead). Reads loop-1 artifacts directly — the cross-loop
-    barrier guarantees they exist.
+    endpoints.txt (plus the gated headless crawl's endpoints_headless.txt, when present)
+    into path segments, filename basenames and parameter names (tokenize_urls) and
+    merges any tech-specific static lists keyed on the cluster's detected tech. Output:
+    scans/<app_id>/wl_custom/seed.txt (the activity wl_global/ holds shared/global lists
+    instead). Reads loop-1 artifacts directly — the cross-loop barrier guarantees they exist.
     """
     ws = activity.app(app_id)
-    words = tokenize_urls(tools.read_lines(ws.canonical("endpoints.txt")))
+    words = tokenize_urls([*tools.read_lines(ws.canonical("endpoints.txt")),
+                           *tools.read_lines(ws.canonical("endpoints_headless.txt"))])
 
     tech = workspace.read_meta(ws.meta).get("tech") or []
     static: list[str] = []
@@ -689,18 +1051,23 @@ def build_wordlist(activity: Activity, app_id: str) -> None:
 
 
 def fetch_delta(activity: Activity, app_id: str) -> None:
-    """LOOP 2.2 — download the OSINT delta into the response store (∥ wordlist).
+    """LOOP 2.2 — download the discovery delta into the response store (∥ wordlist).
 
-    passive_probe's URLs (endpoints_passive.txt) that the crawl never fetched are
-    the only ones a separate downloader needs — the crawler already downloaded the
-    linked surface. httpx fetches the live ones (it drops dead hosts) and stores
-    their bodies under responses/osint/, so offline body-mining covers archived/OSINT
-    URLs too. Reads loop-1 artifacts directly — the barrier guarantees they exist.
+    The discovery sources whose bodies katana never downloaded — passive_probe
+    (gau/urlfinder) and crawley (endpoints_crawley.txt) — are the only URLs a separate
+    downloader needs; katana already stored everything IT fetched (responses/index.txt
+    is that record). httpx fetches the delta's live URLs (dropping dead hosts) and
+    stores their bodies under responses/osint/, so offline body-mining covers the
+    archived/OSINT/crawley-only surface too. Reads loop-1 artifacts directly — the
+    barrier guarantees they exist.
     """
     ws = activity.app(app_id)
+    have = [url for idx in (ws.responses / "index.txt", ws.responses / "headless" / "index.txt")
+            for _, url in _store_index(idx)]  # bodies katana stored (cheap + headless crawl)
     delta = passive_delta(
-        tools.read_lines(ws.canonical("endpoints_passive.txt")),
-        tools.read_lines(ws.raw("katana") / "out.txt"),
+        [*tools.read_lines(ws.canonical("endpoints_passive.txt")),
+         *tools.read_lines(ws.canonical("endpoints_crawley.txt"))],
+        have,
     )
     if not delta:
         log.debug("  · skip osint fetch (empty delta) for %s", app_id)
@@ -738,16 +1105,17 @@ def _jsonl_str(out: str) -> list[dict]:
 def mine_responses(activity: Activity, app_id: str) -> None:
     """LOOP 2 — mine the per-app response store OFFLINE (cashes in 'fetch once').
 
-    Reads the stored HTTP responses (crawl + fetch_delta -srd) WITHOUT re-fetching:
-    extracts each JS body (http_body) and runs jsluice for endpoints (→ endpoints_js.txt,
-    folded into the content_discovery wordlist) and secrets (→ secrets.jsonl). Needs
-    fetch_delta so the OSINT bodies are present; the crawl bodies are guaranteed by the
-    loop barrier. Port of run-web-sast.sh, but AST-based via jsluice.
+    Reads the stored HTTP responses (cheap crawl + headless crawl + fetch_delta -srd)
+    WITHOUT re-fetching: extracts each JS body (http_body) and runs jsluice for endpoints
+    (→ endpoints_js.txt, folded into the content_discovery wordlist) and secrets
+    (→ secrets.jsonl). Needs fetch_delta so the OSINT bodies are present; the crawl bodies
+    are guaranteed by the loop barrier. Port of run-web-sast.sh, but AST-based via jsluice.
     """
     ws = activity.app(app_id)
     js_dir = ws.raw("js")
     js_files: list[str] = []
-    for index in (ws.responses / "index.txt", ws.responses / "osint" / "response" / "index.txt"):
+    for index in (ws.responses / "index.txt", ws.responses / "headless" / "index.txt",
+                  ws.responses / "osint" / "response" / "index.txt"):
         for stored, url in _store_index(index):
             if not is_js_url(url):
                 continue

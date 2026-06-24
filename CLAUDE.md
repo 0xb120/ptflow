@@ -96,14 +96,19 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
   scope.txt                              # raw input
   scope/  scope_init|urls|dns|ip.txt     # parsed/expanded scope
   scans/
-    asset_discovery/  raw/<tool>/  <canonical files>      # BREADTH (+ takeovers_scope.jsonl)
+    asset_discovery/  raw/<tool>/  <canonical files>      # BREADTH (httpx_full_metadata.jsonl,
+                                                           #   takeovers_scope.jsonl, …)
     <app_id>/                            # one clustered app group (per-app loops)
       meta.json  hosts.txt  endpoints.txt  subs.txt  takeover.txt  …
+      endpoints_passive.txt  endpoints_crawley.txt   #   discovery sources fetch_delta downloads
+      crawl_class.json                   #   JS-render verdict + signals (gates crawl_headless)
+      endpoints_headless.txt             #   gated headless crawl (JS-rendered apps only)
       screenshot.png                     #   root-page screenshot (or screenshot.failed)
+      default_creds.jsonl                #   EyeWitness signature-based default-cred leads (optional)
       endpoints_js.txt  secrets.jsonl    #   mine_responses (jsluice over the stored JS)
       content_discovery.jsonl            #   feroxbuster forced-browse results
       wl_custom/seed.txt                 #   per-app GENERATED wordlist (loop 2, offline)
-      responses/                         #   downloaded HTML/JS corpus (katana/httpx -srd) — mined offline
+      responses/  responses/headless/    #   downloaded HTML/JS corpus (katana/httpx -srd) — mined offline
       raw/<tool>/  (incl. raw/js/ extracted JS bodies)
   findings/hypotheses.jsonl              # dormant agent fan-in output
   poc/  tmp/  logs/
@@ -136,10 +141,36 @@ In recon, `_run(tool, cmd, *, stdin, dest, label)` enforces this: it writes a to
 the single caller-chosen `dest`. Keep pure transforms (e.g. `honeypot_split`, `tokenize_urls`,
 `denoise`) module-level so they're unit-testable apart from subprocess plumbing.
 
-### Stable app ids
+### Clustering — union-find over app-identity signals (precision-first)
 
-`scans/<app_id>/` is keyed on a hash of the cluster *identity* — never a mutable string.
-recon hashes `Title|Content-Length|Webserver`; the example stub hashes a fabricated signature.
+`scans/<app_id>/` groups httpx vhosts into "application-groups". The purpose is **dedup** — scan one
+real app once, not once per hostname. **Over-merge (fusing logically-different apps) is a correctness
+bug**, not a cosmetic one: a group shares ONE `endpoints.txt`/`hosts.txt`, `content_discovery` fuzzes
+the combined wordlist across all its hosts, and `screenshot`/`best_host` represent the group with one
+host — so a different app hidden in a group gets under-scanned and mis-attributed. **Over-split (a
+duplicate scanned twice) is only wasted work.** Clustering is therefore tuned **precision-first: when
+in doubt, do NOT merge.**
+
+It's a **connected-components partition** (`cluster_partition`, pure/unit-tested) over **app-identity**
+signals only — deliberately **not** infrastructure (cert / IP routinely front distinct apps under one
+company → over-merge):
+- **GLOBAL, safe edges**: **redirect-final host** (`-fr`; the #1 true-duplicate — apex/www/http↔https
+  converging) and **exact body** sha256 (2xx/3xx). A global value spanning more than
+  `GENERIC_MAX_APEXES` apexes is demoted (default/error page, parking) — apex-based, so one app under
+  one apex is never demoted.
+- **APEX-SCOPED, fuzzy edges**: **favicon** mmh3 (`httpx -favicon`) and the **root fingerprint**
+  `Title|CL|Webserver` (non-blank) — keyed by `(value, apex)`, so they merge only sibling subdomains
+  of one apex and **never across organizations**. They're the over-split fix (favicon survives a
+  `content_length` token-drift) at minimal over-merge risk.
+
+Dropped on purpose (were in an earlier draft): **leaf cert** and **ip+header+tech** — infra, over-merge.
+
+**Stable id:** `app_id` is anchored on the group's plurality `(favicon, apex)` → else plurality host
+(`_cluster_anchor`) — collision-free (two groups can't share an apex-scoped favicon, nor a host) and
+stable under minority membership changes. `meta.json` records `id_anchor` + `signature` for
+debuggability; oversized groups log a WARNING (`CLUSTER_MAX_HOSTS`). The residual (same-apex hosts
+with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) is what a future
+`recluster` deep-path confirmation pass would resolve. The example stub still hashes a fabricated sig.
 
 ## The two pipelines
 
@@ -154,9 +185,10 @@ recon hashes `Title|Content-Length|Webserver`; the example stub hashes a fabrica
     joined at the fan-in (`findings/nuclei_scope.jsonl`). It runs `nuclei -ut` (update templates)
     first, then scans with `-duc`. Per-app would multiply traffic on shared backends, so it's
     whole-scope, not per-app.
-  - **Loop 1 — enumeration** (`phase=1`): `screenshot` (root-page shot of the cluster's best host, ∥) ;
-    `passive_probe` → `crawl` (SPA clusters get `-headless`, see `is_spa`) ; `subenum` ; `takeover`
-    (← crawl + subenum).
+  - **Loop 1 — enumeration** (`phase=1`): `screenshot` (best-host root shot via httpx -screenshot, +
+    OPTIONAL EyeWitness on the SAME single best host for default-credential leads → `default_creds.jsonl`, ∥) ;
+    `passive_probe` → `crawl` (katana ∥ crawley + JS-render classification, see below) →
+    `crawl_headless` (gated TIER-1 headless, ∥ takeover) ; `subenum` ; `takeover` (← crawl + subenum).
   - **Loop 2 — content discovery** (`phase=2`): `wordlist` (offline) → `tech_enum` (surface-generating
     per-stack scanners) ; `fetch_delta` (OSINT delta) → `mine_responses` (offline JS/secret mining) ;
     both feed `content_discovery` (feroxbuster forced browsing). See below.
@@ -166,18 +198,44 @@ recon hashes `Title|Content-Length|Webserver`; the example stub hashes a fabrica
 
 ### Fetch once, mine offline
 
-The **crawler is the downloader for the linked surface** — don't fetch the same bytes twice. Loop 1
-`crawl` runs `katana -jc -jsl -kf all -srd <responses/>` (depth ≥3 for `-kf`): it parses JS endpoints
-and known files inline (so `endpoints.txt` is already JS-enriched) **and** stores every response body
-under `scans/<app_id>/responses/`. Downstream steps mine that corpus offline rather than re-fetching.
-A separate downloader is justified only for URLs the crawl never reached — and only over that delta:
-the `fetch_delta` step (`passive_delta` + httpx `-srd`) downloads the live OSINT delta (passive
-gau/urlfinder URLs minus what the crawl already requested, static assets dropped) into
-`responses/osint/`. `mine_responses` then mines the store **offline** (jsluice over the stored JS
-bodies) → JS endpoints (`endpoints_js.txt`, folded into the content_discovery wordlist) + secrets
-(`secrets.jsonl`). This is where the "fetch once" design pays off — no re-fetching.
+Loop 1 `crawl` runs **two crawlers in parallel** (`ThreadPoolExecutor`) for maximum coverage:
+- **katana** is the **downloader** — `katana -j -jc -jsl -kf all -fx -pc -fs fqdn -srd <responses/>`
+  (depth ≥3 for `-kf`): it parses JS endpoints, known files and forms inline (so `endpoints.txt` is
+  JS-/form-enriched) **and** stores every response body under `scans/<app_id>/responses/` (`-omit-body`
+  only trims stdout; `-srd` still writes full bodies to disk). It's the downloader for the linked
+  surface — don't fetch the same bytes twice.
+- **crawley** is a second **discovery** engine — `crawley -headless -all -js -robots crawl` per host
+  (one positional URL each). It only finds URLs (no body store), so its discoveries
+  (`endpoints_crawley.txt`) join the passive sources as `fetch_delta` candidates. (`-headless` here =
+  skip the HEAD pre-flight, **not** browser rendering.)
 
-`build_wordlist` (`wordlist` step) is therefore **pure offline**: it tokenizes `endpoints.txt` into
+These two are the **TIER-0** cheap layer (no browser). `crawl` then **classifies** each app for the
+gated headless pass (`is_js_rendered`, recorded in `crawl_class.json`): it compares the raw `<a href>`
+count of the stored root page + the crawley surface against the JS-parsed (`-fx`) count, plus
+thin-shell framework markers (Next/Nuxt/Angular). The validated signal (crawler benchmark) is that
+headless **only** pays off when the non-headless link surface is small yet JS-parse finds far more —
+a React/"finto-SPA" with a healthy link surface is traditional and skips the browser. **No framework
+label / `is_spa` heuristic** — that was unreliable (a "React" app can behave traditionally).
+
+**`crawl_headless`** is the **TIER-1** pass: headless katana
+(`-hl -nos -jc -jsl -xhr -fx -iqp -fs fqdn -ct`, bundled rod chromium, `-aff` OFF) run **only** on the
+JS-rendered bucket. It renders the SPA and extracts JS-built routes + XHR/fetch URLs link-crawling
+can't reach, storing bodies under `responses/headless/` (mined offline like the rest). Browser RAM
+(1-5 GB/host) is the scale constraint, so concurrent headless processes are capped **process-wide** by
+a module `BoundedSemaphore` (`HEADLESS_PARALLELISM`, since the `ThreadPoolTaskRunner` runs every stage
+in one process), and `-ct` bounds each host. Its `endpoints_headless.txt` is folded into the loop-2
+`build_wordlist` (like `endpoints_js.txt`), and its `-srd` store joins the "already have" set so
+`fetch_delta` doesn't re-download it.
+
+A separate downloader is justified only for URLs neither crawl-stored — and only over that delta:
+the `fetch_delta` step (`passive_delta` + httpx `-srd`) downloads the live delta — passive
+(gau/urlfinder) **+ crawley** URLs minus what katana already stored (`responses/index.txt`), static
+assets dropped — into `responses/osint/`. `mine_responses` then mines the store **offline** (jsluice
+over the stored JS bodies) → JS endpoints (`endpoints_js.txt`, folded into the content_discovery
+wordlist) + secrets (`secrets.jsonl`). This is where the "fetch once" design pays off — no re-fetching.
+
+`build_wordlist` (`wordlist` step) is therefore **pure offline**: it tokenizes `endpoints.txt`
+(+ `endpoints_headless.txt` when the headless pass ran) into
 path segments, filename basenames and parameter names (`tokenize_urls`) and merges any tech-specific
 static lists for the cluster's detected tech (`wordlists.tech_role_paths` → `wl_global/<role>.txt`,
 best-effort). Output: the per-app `scans/<app_id>/wl_custom/seed.txt`.
@@ -220,6 +278,15 @@ errors/times out) + low `-t`/`-L`/`--timeout` (`FEROX_THREADS`/`FEROX_SCAN_LIMIT
   recon tasks). Other tools (subfinder, dnsx, naabu, tlsx, mapcidr, shuffledns, katana, nerva,
   assetfinder, gau, urlfinder, subjack, …) are in `~/go/bin`; feroxbuster in `~/.local/bin`.
 - Trusted resolvers: `/opt/resolvers/resolvers-trusted.txt`.
+- **EyeWitness (optional, `screenshot` step)** — a Selenium app, **installed** at `/opt/EyeWitness`
+  with its own venv (`/opt/EyeWitness/.venv`, selenium ≥4.45 → Selenium Manager auto-provisions
+  chromedriver; runs `--headless=new`, no Xvfb/sudo needed). `_eyewitness_cmd` resolves it
+  automatically (PIPT_EYEWITNESS override › `eyewitness` on PATH › `_EYEWITNESS_DIR` = `/opt/EyeWitness`);
+  if it ever goes missing
+  the step just runs the httpx screenshot and skips EyeWitness. It's fed ONE URL (best host) via a
+  one-line `-f` file — the `-f` report path writes `Requests.csv` (which `--single` skips), and that
+  CSV's "Default Creds" column is what we parse. Headless katana uses the bundled rod chromium, NOT
+  system chrome (`-sc`/`-system-chrome` hangs for katana here — but works for httpx -screenshot).
 - Recon tunables (rates, port counts, honeypot threshold, crawl depths, wordlist constants) are at the
   top of `pipelines/recon/tasks.py` — tuned conservatively for live infra; don't bump blindly.
 - **Authorized test scope only:** `https://ginandjuice.shop/` (PortSwigger demo), `scanme.nmap.org`

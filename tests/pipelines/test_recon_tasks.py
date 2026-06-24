@@ -47,7 +47,7 @@ def test_pipeline_object_shape():
     assert activity == ["provision_wl", "expand", "resolve", "portscan", "httpx", "nerva"]
     assert spanning == ["nuclei_scope"]
     assert app == [
-        "screenshot", "passive_probe", "crawl", "subenum", "takeover",
+        "screenshot", "passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
         "wordlist", "fetch_delta", "mine_responses", "tech_enum", "content_discovery",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
@@ -60,8 +60,11 @@ def test_pipeline_object_shape():
     # subenum ∥ passive_probe/crawl; takeover waits for both crawl and subenum
     assert by_name["subenum"].needs == ()
     assert set(by_name["takeover"].needs) == {"crawl", "subenum"}
+    # gated headless crawl is a loop-1 step that needs the cheap crawl (for the classification)
+    assert by_name["crawl_headless"].needs == ("crawl",)
     # loop 1 = enumeration; loop 2 = content discovery (separate per-app loop)
-    assert {by_name[n].phase for n in ("screenshot", "passive_probe", "crawl", "subenum", "takeover")} == {1}
+    assert {by_name[n].phase
+            for n in ("screenshot", "passive_probe", "crawl", "crawl_headless", "subenum", "takeover")} == {1}
     assert by_name["screenshot"].needs == ()  # first loop-1 step, runs right after cluster
     # loop 2 stages cross the loop-1 barrier (no cross-loop `needs`)
     loop2 = ("wordlist", "fetch_delta", "mine_responses", "tech_enum", "content_discovery")
@@ -140,6 +143,30 @@ def test_parse_ferox_keeps_response_records():
     ]
 
 
+def test_parse_eyewitness_csv_keeps_default_cred_leads():
+    csv_text = (
+        "Protocol,Port,Domain,URL,Resolved,Request Status,Title,Category,Default Creds,Screenshot Path, Source Path\n"
+        'https,443,admin.x.com,https://admin.x.com,1.2.3.4,Successful,"Apache Tomcat",Default Cred,"tomcat/tomcat",screens/a.png,source/a.txt\n'
+        'https,443,www.x.com,https://www.x.com,1.2.3.5,Successful,"Home","Web Server","None",screens/b.png,source/b.txt\n'
+        'https,443,p.x.com,https://p.x.com,1.2.3.6,Successful,"Printer","Web Server",,screens/c.png,source/c.txt\n'
+    )
+    # only the row with a real "Default Creds" match survives ("None"/empty dropped)
+    assert tasks.parse_eyewitness_csv(csv_text) == [
+        {"url": "https://admin.x.com", "title": "Apache Tomcat", "category": "Default Cred", "creds": "tomcat/tomcat"},
+    ]
+
+
+def test_eyewitness_cmd_resolves_env_then_path(monkeypatch, tmp_path):
+    # explicit env override wins
+    monkeypatch.setenv("PIPT_EYEWITNESS", "python3 /opt/EyeWitness/Python/EyeWitness.py")
+    assert tasks._eyewitness_cmd() == ["python3", "/opt/EyeWitness/Python/EyeWitness.py"]
+    # nothing resolvable (no env, no PATH eyewitness, no install dir) ⇒ None ⇒ step skips cleanly
+    monkeypatch.delenv("PIPT_EYEWITNESS", raising=False)
+    monkeypatch.setattr(tasks.shutil, "which", lambda _: None)
+    monkeypatch.setattr(tasks, "_EYEWITNESS_DIR", tmp_path / "absent")  # no known-location install
+    assert tasks._eyewitness_cmd() is None
+
+
 def test_parse_shortscan_harvests_surface_words():
     out = (
         '{"type":"status","url":"https://x/","server":"Microsoft-IIS/10.0","vulnerable":true}\n'
@@ -170,11 +197,41 @@ def test_build_wordlist_offline(tmp_path):
     assert {"admin", "index.php", "index", "id"} <= set(words)
 
 
-def test_is_spa_detects_js_frameworks():
-    assert tasks.is_spa(["React", "Webpack"])
-    assert tasks.is_spa(["Nginx", "Vue.js"])
-    assert not tasks.is_spa(["Apache HTTP Server:2.4.7", "Ubuntu"])
-    assert not tasks.is_spa([])
+def test_parse_katana_extracts_request_endpoints():
+    out = (
+        '{"timestamp":"t","request":{"method":"GET","endpoint":"https://x/"},"response":{"status_code":200}}\n'
+        '{"timestamp":"t","request":{"method":"GET","endpoint":"https://x/app.js","tag":"script"}}\n'
+        '{"request":{"method":"POST"}}\n'   # dropped — no endpoint
+        "not json\n"                        # dropped — unparseable
+        "\n"
+    )
+    assert tasks.parse_katana(out) == ["https://x/", "https://x/app.js"]
+
+
+def test_count_hrefs_counts_only_anchors():
+    html = '<a href="/a">x</a> <A HREF="/b">y</A> <link href="x.css"> <a class="z" href="/c">'
+    assert tasks.count_hrefs(html) == 3   # the three <a href>, not <link href>
+    assert tasks.count_hrefs("<html><body>no links</body></html>") == 0
+
+
+def test_has_thin_shell_marker():
+    assert tasks.has_thin_shell_marker('<script id="__NEXT_DATA__" type="application/json">')
+    assert tasks.has_thin_shell_marker('<script src="/_nuxt/entry.abc.js"></script>')
+    assert tasks.has_thin_shell_marker('<app-root ng-version="17.0.0"></app-root>')
+    assert not tasks.has_thin_shell_marker("<html><body><h1>classic site</h1></body></html>")
+
+
+def test_is_js_rendered_matches_benchmark_cases():
+    # JS-rendered (headless wins big): small non-headless link surface, fx dwarfs it
+    assert tasks.is_js_rendered(raw_href=8, fx=106, crawley=27, marker=False)   # telepass Next.js SSR
+    assert tasks.is_js_rendered(raw_href=5, fx=124, crawley=6, marker=False)    # octofence Nuxt thin-shell
+    # traditional / finto-SPA (headless = pure cost): a healthy link surface short-circuits
+    assert not tasks.is_js_rendered(raw_href=6, fx=29, crawley=114, marker=False)    # academy (the trap)
+    assert not tasks.is_js_rendered(raw_href=50, fx=263, crawley=110, marker=False)  # testfire classic
+    # a thin-shell marker forces headless even with tiny counts
+    assert tasks.is_js_rendered(raw_href=2, fx=0, crawley=1, marker=True)
+    # ...but a healthy link surface wins over the marker (don't pay for a browser)
+    assert not tasks.is_js_rendered(raw_href=0, fx=0, crawley=200, marker=True)
 
 
 def test_is_js_url():
@@ -230,18 +287,70 @@ def test_cluster_groups_by_signature(tmp_path):
     tools.write_jsonl(
         act.asset_discovery_canonical("httpx_full_metadata.jsonl"),
         [
-            {"url": "https://a.example", "title": "Home", "content_length": 100, "webserver": "nginx"},
-            {"url": "https://b.example", "title": "Home", "content_length": 100, "webserver": "nginx"},
-            {"url": "https://c.example", "title": "Login", "content_length": 50, "webserver": "nginx"},
+            # same apex + same root fingerprint ⇒ merged (apex-scoped signature edge)
+            {"url": "https://a.example.com", "title": "Home", "content_length": 100, "webserver": "nginx"},
+            {"url": "https://b.example.com", "title": "Home", "content_length": 100, "webserver": "nginx"},
+            {"url": "https://c.example.com", "title": "Login", "content_length": 50, "webserver": "nginx"},
             {"title": "NoUrl", "content_length": 1, "webserver": "x"},  # no url -> ignored
         ],
     )
     app_ids = tasks.cluster(act)
-    assert len(app_ids) == 2  # two distinct signatures
+    assert len(app_ids) == 2  # two distinct root fingerprints under the one apex
 
     by_sig = {
         workspace.read_meta(act.app(a).meta)["signature"]: sorted(tools.read_lines(act.app(a).hosts))
         for a in app_ids
     }
-    assert by_sig["Home|100|nginx"] == ["https://a.example", "https://b.example"]
-    assert by_sig["Login|50|nginx"] == ["https://c.example"]
+    assert by_sig["Home|100|nginx"] == ["https://a.example.com", "https://b.example.com"]
+    assert by_sig["Login|50|nginx"] == ["https://c.example.com"]
+
+
+def test_cluster_partition_merges_same_apex_via_favicon():
+    # same app on two sibling subdomains, content_length shifted by a token (→ different v1
+    # signature) but identical favicon + same apex ⇒ merged (the over-split fix)
+    records = [
+        {"url": "https://a.x.com", "title": "App", "content_length": 100, "favicon": "999"},
+        {"url": "https://b.x.com", "title": "App", "content_length": 137, "favicon": "999"},
+    ]
+    assert tasks.cluster_partition(records) == [[0, 1]]
+
+
+def test_cluster_partition_favicon_scoped_to_apex():
+    # identical favicon but DIFFERENT apexes ⇒ never merged (no cross-org merge on a fuzzy signal)
+    records = [
+        {"url": "https://x.com", "title": "App", "content_length": 1, "favicon": "999"},
+        {"url": "https://y.org", "title": "App", "content_length": 1, "favicon": "999"},
+    ]
+    assert tasks.cluster_partition(records) == [[0], [1]]
+
+
+def test_cluster_partition_ignores_infra_signals():
+    # same IP + header-hash + tech (and imagine the same cert) but different apps ⇒ NOT merged:
+    # infrastructure is not app identity (precision-first dropped the cert/iht edges)
+    infra = {"hash": {"header_sha256": "h1"}, "a": ["1.2.3.4"], "tech": ["nginx"]}
+    records = [
+        {"url": "https://api.x.com", "title": "Api", "content_length": 1, "favicon": "1", **infra},
+        {"url": "https://shop.y.org", "title": "Shop", "content_length": 2, "favicon": "2", **infra},
+    ]
+    assert tasks.cluster_partition(records) == [[0], [1]]
+
+
+def test_cluster_partition_merges_via_redirect_final_host():
+    # two seeds (e.g. apex + www) that httpx followed (-fr) to the SAME final host ⇒ merged (safe)
+    records = [
+        {"url": "https://www.x.com/", "title": "A", "content_length": 1},
+        {"url": "https://www.x.com/", "title": "B", "content_length": 2},
+    ]
+    assert tasks.cluster_partition(records) == [[0, 1]]
+
+
+def test_cluster_partition_demotes_generic_body(monkeypatch):
+    # an identical body (e.g. a default error page) across many apexes = generic ⇒ no merge
+    monkeypatch.setattr(tasks, "GENERIC_MAX_APEXES", 2)
+    body = {"status_code": 200, "hash": {"body_sha256": "same"}}
+    records = [
+        {"url": "https://x.com", "title": "1", "content_length": 1, **body},
+        {"url": "https://y.org", "title": "2", "content_length": 2, **body},
+        {"url": "https://z.net", "title": "3", "content_length": 3, **body},
+    ]
+    assert tasks.cluster_partition(records) == [[0], [1], [2]]

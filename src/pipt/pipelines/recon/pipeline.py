@@ -29,6 +29,8 @@ class ReconPipeline:
         Stage("screenshot", tasks.screenshot, per_app=True, phase=1),  # root-page shot (∥ entry)
         Stage("passive_probe", tasks.passive_probe, per_app=True, phase=1),
         Stage("crawl", tasks.crawl, needs=("passive_probe",), per_app=True, phase=1),
+        # gated TIER-1 headless crawl — runs only on the JS-rendered bucket (∥ takeover)
+        Stage("crawl_headless", tasks.crawl_headless, needs=("crawl",), per_app=True, phase=1),
         Stage("subenum", tasks.subenum, per_app=True, phase=1),  # ∥ passive_probe/crawl
         Stage("takeover", tasks.takeover, needs=("crawl", "subenum"), per_app=True, phase=1),
         # per-app LOOP 2 — content discovery (reads loop-1 artifacts across the barrier)
