@@ -81,12 +81,15 @@ FLOWMETA: dict[str, StepMeta] = {
     ),
     # --- loop 1: enumeration ---
     "screenshot": StepMeta(
-        summary="Post-cluster, UNA run su 1 candidato/gruppo → dashboard unica nativa (httpx ∥ EyeWitness).",
+        summary="Post-cluster, UNA run su 1 candidato/gruppo → screenshot + fingerprint (status/title/"
+                "server/tech/header, stile EyeWitness) → dashboard unica nativa (httpx ∥ EyeWitness).",
         commands=("httpx -ss -system-chrome -srd <activity>/screenshots -svrc   # screenshot.html",
+                  "      -sc -cl -title -td -server -ip -favicon -irh -j        # fingerprint (-j)",
                   "eyewitness --web -f <tutti gli url> --no-prompt   # report.html (opzionale)"),
-        outputs=("screenshots/screenshot/screenshot.html", "scans/<app_id>/screenshot.png",
-                 "default_creds.jsonl"),
-        notes=("riconciliazione per URL (index_screenshot.txt / Requests.csv) → ogni shot al suo gruppo",
+        outputs=("screenshots/screenshot/screenshot.html", "screenshots/screenshot/fingerprints.jsonl",
+                 "scans/<app_id>/screenshot.png", "scans/<app_id>/screenshot.json", "default_creds.jsonl"),
+        notes=("riconciliazione per URL (index_screenshot.txt / -j url / Requests.csv) → shot+fingerprint al suo gruppo",
+               "fingerprint per-gruppo in screenshot.json (status/title/server/tech/header_signals)",
                "batch: 1 avvio EyeWitness invece di N (gira ∥ ai per-app loop)"),
     ),
     "passive_probe": StepMeta(

@@ -17,7 +17,7 @@ class ReconPipeline:
     name = "recon"
     stages: Sequence[Stage] = (
         # activity scope (whole-scope asset discovery)
-        Stage("provision_wl", tasks.provision_wl),  # resolve global wordlist roles → wl_global/ (∥)
+        Stage("provision_wl", tasks.provision_wl, net=False),  # wordlist roles → wl_global/ (offline, ∥)
         Stage("expand", tasks.expand),
         Stage("resolve", tasks.resolve, needs=("expand",)),
         Stage("portscan", tasks.portscan, needs=("resolve",)),
@@ -39,9 +39,10 @@ class ReconPipeline:
         Stage("subenum", tasks.subenum, per_app=True, phase=1),  # ∥ passive_probe/crawl
         Stage("takeover", tasks.takeover, needs=("crawl", "subenum"), per_app=True, phase=1),
         # per-app LOOP 2 — content discovery (reads loop-1 artifacts across the barrier)
-        Stage("wordlist", tasks.build_wordlist, per_app=True, phase=2),
+        Stage("wordlist", tasks.build_wordlist, per_app=True, phase=2, net=False),  # offline tokenise
         Stage("fetch_delta", tasks.fetch_delta, per_app=True, phase=2),  # ∥ wordlist
-        Stage("mine_responses", tasks.mine_responses, needs=("fetch_delta",), per_app=True, phase=2),
+        Stage("mine_responses", tasks.mine_responses, needs=("fetch_delta",), per_app=True, phase=2,
+              net=False),  # offline: extract + jsluice the stored corpus, no network
         Stage("tech_enum", tasks.tech_enum, needs=("wordlist",), per_app=True, phase=2),
         Stage("content_discovery", tasks.content_discovery,
               needs=("wordlist", "tech_enum", "mine_responses"), per_app=True, phase=2),

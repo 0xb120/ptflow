@@ -21,6 +21,46 @@ def test_extract_bodies_skips_missing_indexed_file(tmp_path):
     assert any(bodies.iterdir())  # the good body was extracted
 
 
+def test_screenshot_fingerprint_slims_record():
+    rec = {
+        "url": "https://ginandjuice.shop", "status_code": 200, "title": "Gin & Juice",
+        "webserver": "Apache", "tech": ["PHP", "Apache"], "content_length": 10487,
+        "host_ip": "34.249.203.140", "favicon": "1165564288",
+        "header": {"server": "nginx", "x_powered_by": "PHP/8.1"},
+    }
+    fp = tasks._screenshot_fingerprint(rec)
+    assert fp["status"] == 200
+    assert fp["title"] == "Gin & Juice"
+    assert fp["webserver"] == "Apache"
+    assert fp["tech"] == ["PHP", "Apache"]
+    assert fp["ip"] == "34.249.203.140"
+    assert "backend:nginx" in fp["header_signals"]  # curated signals derived from the header dict
+    assert "stack:php" in fp["header_signals"]
+
+
+def test_resolve_profile_from_env(monkeypatch):
+    monkeypatch.setenv("PIPT_PROFILE", "home")
+    assert tasks._resolve_profile().name == "home"
+    monkeypatch.setenv("PIPT_PROFILE", "WIDE")  # case-insensitive
+    assert tasks._resolve_profile().name == "wide"
+    monkeypatch.setenv("PIPT_PROFILE", "nonsense")  # unknown → default wide
+    assert tasks._resolve_profile().name == "wide"
+    monkeypatch.delenv("PIPT_PROFILE", raising=False)
+    assert tasks._resolve_profile().name == "wide"  # default
+
+
+def test_home_profile_is_gentler_than_wide():
+    assert int(tasks.HOME.naabu_rate) < int(tasks.WIDE.naabu_rate)  # the key "clogs router" knob
+    assert int(tasks.HOME.nuclei_rl) < int(tasks.WIDE.nuclei_rl)
+    assert int(tasks.HOME.ferox_threads) <= int(tasks.WIDE.ferox_threads)
+    assert int(tasks.HOME.naabu_conc) < int(tasks.WIDE.naabu_conc)
+
+
+def test_wide_profile_matches_legacy_rates():
+    # `wide` must reproduce today's values so the default run is unchanged
+    assert (tasks.WIDE.naabu_rate, tasks.WIDE.nuclei_rl, tasks.WIDE.ferox_threads) == ("1000", "150", "5")
+
+
 def test_slug_is_filesystem_safe():
     assert tasks._slug("Ginandjuice.Shop") == "ginandjuice.shop"  # lowercased, dots kept
     assert tasks._slug("a b/c:d") == "a-b-c-d"                     # non [a-z0-9.-] → '-'

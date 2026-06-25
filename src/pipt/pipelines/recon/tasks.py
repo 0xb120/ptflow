@@ -23,6 +23,7 @@ import time
 from collections import Counter
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -36,10 +37,43 @@ if TYPE_CHECKING:
 
 log = get_logger()
 
+
+# --- rate profiles (PIPT_PROFILE, resolved at import — set it BEFORE launching) ---
+# The aggregate network load is roughly concurrency x per-tool rate. A `net` concurrency cap alone
+# doesn't bound it (the heavy hitters — the full-port naabu flood, nuclei -rl — are single stages),
+# so the per-tool RATES are the real lever. Two profiles: `wide` (today's values, for real
+# bandwidth) and `home` (gentle on a domestic line/router — naabu especially, the full-port packet
+# flood that exhausts a consumer NAT/conntrack table).
+@dataclass(frozen=True)
+class Profile:
+    name: str
+    naabu_rate: str   # naabu -rate (packets/s) — the prime "clogs my router" knob (full-port flood)
+    naabu_conc: str   # naabu -c
+    nuclei_rl: str    # nuclei -rl (req/s, global)
+    nuclei_conc: str  # nuclei -c (templates in parallel)
+    ferox_threads: str       # feroxbuster -t
+    ferox_scan_limit: str    # feroxbuster -L (concurrent dir scans)
+
+
+WIDE = Profile(name="wide", naabu_rate="1000", naabu_conc="50", nuclei_rl="150", nuclei_conc="25",
+               ferox_threads="5", ferox_scan_limit="2")
+HOME = Profile(name="home", naabu_rate="300", naabu_conc="20", nuclei_rl="50", nuclei_conc="10",
+               ferox_threads="3", ferox_scan_limit="1")
+_PROFILES = {p.name: p for p in (WIDE, HOME)}
+
+
+def _resolve_profile() -> Profile:
+    """Active profile from env PIPT_PROFILE (default `wide`; unknown → `wide`). Read each call so it's
+    testable; the module constants below bind it once at import (set PIPT_PROFILE before launching)."""
+    return _PROFILES.get(os.environ.get("PIPT_PROFILE", "wide").lower().strip(), WIDE)
+
+
+PROFILE = _resolve_profile()
+
 # --- tunables (mirror scope2surface.sh; conservative — live infra) ---
 NAABU_TLS_TOP_PORTS = "1000"
-NAABU_TLS_RATE = "1000"
-NAABU_TLS_CONC = "50"
+NAABU_RATE = PROFILE.naabu_rate   # applied to every naabu run (TLS harvest + web + full portscan)
+NAABU_CONC = PROFILE.naabu_conc
 HONEYPOT_MIN_OPEN_PORTS = 15      # >= this many open ports => suspected honeypot
 RESOLVERS = "/opt/resolvers/resolvers-trusted.txt"
 
@@ -67,9 +101,9 @@ WEB_PORTS = (
 )
 
 # whole-scope nuclei scan (spanning stage — ONE process, ONE global rate cap)
-NUCLEI_CONC = "25"      # -c  templates in parallel
+NUCLEI_CONC = PROFILE.nuclei_conc   # -c  templates in parallel (profile-driven)
 NUCLEI_BULK = "25"      # -bs hosts per template
-NUCLEI_RL = "150"       # -rl global requests/second
+NUCLEI_RL = PROFILE.nuclei_rl       # -rl global requests/second (profile-driven)
 NUCLEI_TIMEOUT = "10"   # -timeout seconds
 NUCLEI_RETRIES = "2"    # -retries
 
@@ -133,8 +167,8 @@ WL_TARGETED_CAP = 2000  # in `targeted`, keep only the top-N of each traditional
 # out; low -t/-L keep concurrency bounded from the start. (--rate-limit is mutually exclusive
 # with --smart, and is per-directory anyway, so it's the wrong tool here.)
 FEROX_DEPTH = "2"        # -d recursion depth (feroxbuster default is 4)
-FEROX_THREADS = "5"      # -t threads per scan (default 50 is aggressive for fragile apps)
-FEROX_SCAN_LIMIT = "2"   # -L concurrent directory scans (caps recursion fan-out)
+FEROX_THREADS = PROFILE.ferox_threads        # -t threads per scan (profile-driven; default 50 is aggressive)
+FEROX_SCAN_LIMIT = PROFILE.ferox_scan_limit  # -L concurrent directory scans (profile-driven)
 FEROX_TIMEOUT = "15"     # --timeout per-request seconds (tolerate slow apps)
 # --time-limit caps TOTAL scan wall-clock (--timeout is only per-request). Without it, a target that
 # throttles under --smart can send feroxbuster's auto-tune into an unbounded backoff livelock that
@@ -250,6 +284,8 @@ def preflight() -> None:
     """Log which external tools resolve at run start, so a missing binary degrades a stage VISIBLY
     instead of yielding a silent empty result. Never aborts (best-effort): a missing CORE tool is a
     WARNING (that stage produces nothing); missing OPTIONAL tools just skip their best-effort stage."""
+    log.info("  → profile: %s (naabu -rate %s -c %s · nuclei -rl %s · ferox -t %s -L %s)",
+             PROFILE.name, NAABU_RATE, NAABU_CONC, NUCLEI_RL, FEROX_THREADS, FEROX_SCAN_LIMIT)
     core_missing = sorted(n for n, cmd in _CORE_TOOLS.items() if shutil.which(cmd) is None)
     opt_missing = sorted(n for n, cmd in _OPTIONAL_TOOLS.items() if shutil.which(cmd) is None)
     ew = _eyewitness_cmd() is not None
@@ -776,7 +812,7 @@ def expand(activity: Activity) -> None:
     naabu_tls = _lines(
         _run("naabu",
              ["naabu", "-silent", "-top-ports", NAABU_TLS_TOP_PORTS, "-exclude-cdn",
-              "-c", NAABU_TLS_CONC, "-rate", NAABU_TLS_RATE],
+              "-c", NAABU_CONC, "-rate", NAABU_RATE],
              stdin="\n".join(scope_ips), dest=_raw(activity, "naabu", "tls_ports"), label="tls_ports")
     )
     tls_names = _lines(
@@ -849,7 +885,8 @@ def portscan(activity: Activity) -> None:
     canon = activity.asset_discovery_canonical
     unique_ips = tools.read_lines(canon("unique_ips.txt"))
     scanned = _lines(
-        _run("naabu", ["naabu", "-silent", "-p", WEB_PORTS, "-exclude-cdn"],
+        _run("naabu", ["naabu", "-silent", "-p", WEB_PORTS, "-exclude-cdn",
+                       "-c", NAABU_CONC, "-rate", NAABU_RATE],
              stdin="\n".join(unique_ips), dest=_raw(activity, "naabu", "web"), label="web")
     )
     valid_ips, honeypots = honeypot_split(scanned)
@@ -866,7 +903,8 @@ def portscan_full(activity: Activity) -> None:
     canon = activity.asset_discovery_canonical
     honeypots = set(tools.read_lines(canon("honeypots.txt")))
     valid = [ip for ip in tools.read_lines(canon("unique_ips.txt")) if ip not in honeypots]
-    _run("naabu", ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn"],
+    _run("naabu", ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn",
+                   "-c", NAABU_CONC, "-rate", NAABU_RATE],
          stdin="\n".join(valid), dest=canon("naabu_full.txt"), label="full")
 
 
@@ -1149,16 +1187,34 @@ def _eyewitness_batch(activity: Activity, url_to_app: dict[str, str]) -> None:
         log.info("    eyewitness → report.html · %d default-cred lead(s) across %d group(s)", n, len(by_app))
 
 
+def _screenshot_fingerprint(record: dict) -> dict:
+    """Slim an httpx `-ss -j` record to the EyeWitness-style fingerprint shown beside a screenshot:
+    status, title, web server, tech, content-length, IP, favicon + curated header signals. Pure."""
+    return {
+        "url": record.get("url"),
+        "status": record.get("status_code"),
+        "title": record.get("title"),
+        "webserver": record.get("webserver"),
+        "tech": record.get("tech") or [],
+        "content_length": record.get("content_length"),
+        "ip": record.get("host_ip"),
+        "favicon": record.get("favicon"),
+        "header_signals": header_signals(record.get("header") or {}),
+    }
+
+
 def screenshot_all(activity: Activity) -> None:
     """SPANNING post-cluster — ONE batched screenshot run over a single best-host candidate per app
     group, so the tools' NATIVE aggregate reports give a UNIFIED gallery (no hand-built HTML).
 
-    httpx `-ss -srd <activity>/screenshots -svrc` over all candidates writes
-    screenshots/screenshot/screenshot.html (the gallery) + per-host PNGs + index_screenshot.txt;
-    EyeWitness (optional) writes its own report.html + Requests.csv. Each screenshot is then
-    reconciled back to scans/<app_id>/screenshot.png by URL (via the index — no hash-guessing), and
-    EyeWitness's default-cred leads are split per group. Runs ∥ the per-app loops (cluster_scope): it
-    reads only the cluster's meta/hosts and writes distinct filenames, so there's no race.
+    httpx `-ss … -j` over all candidates screenshots each best host AND fingerprints it (status,
+    title, web server, tech, content-length, IP, favicon, headers — like EyeWitness shows beside each
+    shot). The gallery (screenshot.html) + per-host PNGs + index land under screenshots/screenshot/;
+    the `-j` fingerprint is captured, reconciled by URL, and written per group to
+    scans/<app_id>/screenshot.json (+ a consolidated fingerprints.jsonl). EyeWitness (optional) adds
+    its own report.html + default-cred leads. Each PNG is reconciled to scans/<app_id>/screenshot.png
+    by URL (via the index). Runs ∥ the per-app loops (cluster_scope): reads only meta/hosts, writes
+    distinct filenames — no race.
     """
     apps = activity.list_apps()
     url_to_app = {t: ws.root.name for ws in apps if (t := best_host(tools.read_lines(ws.hosts)))}
@@ -1168,12 +1224,18 @@ def screenshot_all(activity: Activity) -> None:
     store = activity.screenshots
     store.mkdir(parents=True, exist_ok=True)
     log.info("▶ screenshot — %d candidate(s) (one per group), batched", len(url_to_app))
-    tools.run(
+    out = tools.run(
         [HTTPX, "-ss", "-system-chrome", "-no-screenshot-full-page", "-st", SCREENSHOT_TIMEOUT,
-         "-silent", "-srd", str(store), "-svrc"],
+         "-silent", "-srd", str(store), "-svrc",
+         # fingerprint each candidate too (EyeWitness-style), captured from the -j stream:
+         "-sc", "-cl", "-title", "-td", "-server", "-ip", "-favicon", "-location", "-irh", "-j"],
         stdin="\n".join(url_to_app), stream_stderr=is_verbose(),
         reap_group=True,  # sweep any system-chrome the screenshot left behind, even on clean exit
     )
+    norm = {u.rstrip("/"): a for u, a in url_to_app.items()}
+    fp_by_app = {app: _screenshot_fingerprint(rec)
+                 for rec in _jsonl_str(out)
+                 if (app := norm.get((rec.get("url") or "").rstrip("/")))}
     shot_dir = store / "screenshot"
     by_app = reconcile_by_url(_store_index(shot_dir / "index_screenshot.txt"), url_to_app)
     n_shot = 0
@@ -1184,8 +1246,11 @@ def screenshot_all(activity: Activity) -> None:
             n_shot += 1
         else:
             ws.canonical("screenshot.failed").write_text("", encoding="utf-8")
-    log.info("    screenshot → %s · %d/%d group(s) reconciled",
-             shot_dir / "screenshot.html", n_shot, len(url_to_app))
+        if (fp := fp_by_app.get(ws.root.name)):
+            workspace.write_meta(ws.canonical("screenshot.json"), fp)  # per-group fingerprint
+    tools.write_jsonl(shot_dir / "fingerprints.jsonl", list(fp_by_app.values()))
+    log.info("    screenshot → %s · %d/%d shot · %d fingerprint(s)",
+             shot_dir / "screenshot.html", n_shot, len(url_to_app), len(fp_by_app))
     _eyewitness_batch(activity, url_to_app)
 
 

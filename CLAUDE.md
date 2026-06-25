@@ -112,8 +112,16 @@ future activity-scope aggregation (e.g. a cross-app wordlist corpus) would slot 
 
 Concurrency: `ThreadPoolTaskRunner(max_workers=N)` caps total in-flight stages **across all
 apps**. Intra-app parallelism therefore competes with fan-out width — only parallelize slow,
-network-bound steps. Every network stage is tagged `net` (cap with a Prefect concurrency limit:
-`uv run prefect concurrency-limit create net 10`).
+network-bound steps. Network stages (`Stage.net`, the default; offline ones set `net=False`) are
+tagged `net`. Two in-process caps gate them (module `BoundedSemaphore`s in `orchestrator.py`,
+acquired in `_run_stage` in fixed order net→fan-out so they can't deadlock):
+- **`_FANOUT_SLOTS`** = `fanout.max_workers` — per-app chain cap (the pool is sized larger, fan-out +
+  spanning headroom, so spanning runs ∥ the loops; this re-imposes the real fan-out limit).
+- **`_NET_SLOTS`** = **`PIPT_NET_LIMIT`** (else `4` when `PIPT_PROFILE=home`, else `fanout.net_limit`)
+  — GLOBAL network-concurrency cap over per-app **and** spanning, so the aggregate uplink load stays
+  bounded (a home line / consumer router can choke). In-process (no Prefect server dependency), unlike
+  the native `net`-tag limit (`prefect concurrency-limit create net N`) which needs a persistent server
+  to be reliable. Complements the rate profile — aggregate load ≈ concurrency × per-tool rate.
 
 **A `Pipeline` (`core/stage.py`)** satisfies a Protocol: `name`, `stages` (a sequence of
 `Stage`), `cluster(activity) -> list[str]`, and `provider() -> HypothesisProvider`. Register
@@ -141,6 +149,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       crawl_class.json                   #   JS-render verdict + signals (gates crawl_headless)
       endpoints_headless.txt             #   gated headless crawl (JS-rendered apps only)
       screenshot.png                     #   per-group shot, reconciled from the batched run (or screenshot.failed)
+      screenshot.json                    #   per-group fingerprint (status/title/server/tech/header_signals)
       default_creds.jsonl                #   EyeWitness signature-based default-cred leads (optional)
       endpoints_js.txt                   #   mine_responses (jsluice endpoints, round-0 seed)
       content_discovery.jsonl            #   feroxbuster forced-browse results (merge of all fixpoint rounds)
@@ -447,6 +456,12 @@ its centerpiece. Open it locally in a browser; a git diff of it shows exactly ho
   (`-sc`/`-system-chrome` hangs for katana here — but works for httpx -screenshot).
 - Recon tunables (rates, port counts, honeypot threshold, crawl depths, wordlist constants) are at the
   top of `pipelines/recon/tasks.py` — tuned conservatively for live infra; don't bump blindly.
+- **Rate profile** (env **`PIPT_PROFILE`** ∈ `wide|home`, default `wide`, resolved at import — set it
+  *before* launching): `wide` = today's rates (real bandwidth); `home` throttles naabu `-rate`
+  (300 vs 1000 — the full-port packet flood that exhausts a consumer NAT/router), nuclei `-rl`
+  (50 vs 150) and feroxbuster `-t`/`-L`, for a domestic line. Aggregate load ≈ concurrency × rate,
+  so the per-tool rate is the real lever (a `net` concurrency cap alone won't tame the single
+  full-port/nuclei stages). The active profile is logged at run start (preflight).
 - **Authorized test scope only:** `https://ginandjuice.shop/` (PortSwigger demo), `scanme.nmap.org`
   (Nmap-sanctioned).
 
@@ -524,9 +539,13 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
 
 - **Unified screenshot: ONE batched run post-cluster, not per-group.** `screenshot` is a
   `cluster_scope` (post-cluster spanning) step: it picks one `best_host` per group, builds a
-  `url→app_id` map, and runs httpx `-ss -srd <activity>/screenshots -svrc` **once** over all
-  candidates → the tools' NATIVE aggregate output is the unified gallery
-  (`screenshots/screenshot/screenshot.html` + `index_screenshot.txt` + `vision_recon_clusters.json`).
+  `url→app_id` map, and runs httpx `-ss … -j` **once** over all candidates → the tools' NATIVE
+  aggregate output is the unified gallery (`screenshots/screenshot/screenshot.html` +
+  `index_screenshot.txt` + `vision_recon_clusters.json`). The same run **fingerprints** each candidate
+  (`-sc -cl -title -td -server -ip -favicon -irh`, EyeWitness-style) — captured from the `-j` stream,
+  reconciled by URL, written per group to `scans/<app_id>/screenshot.json` (+ a consolidated
+  `screenshots/screenshot/fingerprints.jsonl`), so a screenshot ships with its status/title/server/
+  tech/header_signals, not just a PNG.
   EyeWitness (optional, best-effort like shortscan/wpprobe) runs **once** over the same `-f` URL list →
   its own `report.html` + `Requests.csv`. *Why batched:* the per-group design produced N trivial
   1-site reports and N **Selenium startups** (EyeWitness is heavy); one run gives the unified view for
