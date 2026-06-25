@@ -64,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
             resume=args.resume, observe=args.observe,
         )
         print(base)  # noqa: T201
+        if failures < 0:
+            return 130  # interrupted (SIGINT) — partial results saved; resume with --resume
         return 1 if failures else 0  # non-zero exit when any stage failed (CI/automation signal)
 
     return 1

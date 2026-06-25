@@ -27,6 +27,28 @@ log = get_logger()
 _live: set[subprocess.Popen] = set()
 _live_lock = threading.Lock()
 
+# Abort flag. Set on interrupt/teardown (signal_abort); while set, run()/pipe() refuse to spawn a NEW
+# subprocess and raise AbortedError instead. Without this, after a Ctrl-C the worker threads Prefect drains
+# keep launching fresh tools (feroxbuster round N+1, httpx downloads, trufflehog network-verify) for
+# minutes — so the network never goes quiet. Cleared at the start of every run (same-process reruns).
+_aborting = threading.Event()
+
+
+class AbortedError(RuntimeError):
+    """Raised by run()/pipe() when the run is aborting — the subprocess is NOT spawned."""
+
+
+def signal_abort() -> None:
+    _aborting.set()
+
+
+def clear_abort() -> None:
+    _aborting.clear()
+
+
+def is_aborting() -> bool:
+    return _aborting.is_set()
+
 
 def _register(proc: subprocess.Popen) -> None:
     with _live_lock:
@@ -101,6 +123,9 @@ def run(  # noqa: PLR0913
     headless chromium from `httpx -ss`/EyeWitness); safe because start_new_session gives
     the child its own group (pgid == pid)."""
     cmd_str = shlex.join(list(cmd))
+    if _aborting.is_set():  # run is tearing down → don't launch new network work
+        msg = f"aborted before spawning: {cmd_str}"
+        raise AbortedError(msg)
     log.debug("$ %s", cmd_str)
     proc = subprocess.Popen(
         list(cmd),
@@ -138,6 +163,9 @@ def run(  # noqa: PLR0913
 def pipe(stages: Sequence[Command], *, stdin: str | None = None) -> str:
     if not stages:
         return ""
+    if _aborting.is_set():  # run is tearing down → don't launch new network work
+        msg = "aborted before spawning pipe"
+        raise AbortedError(msg)
     log.debug("$ %s", " | ".join(shlex.join(list(s)) for s in stages))
     procs: list[subprocess.Popen[bytes]] = []
     first = subprocess.Popen(

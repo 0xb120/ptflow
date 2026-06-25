@@ -60,6 +60,20 @@ def test_fanout_semaphore_bound_matches_config():
     assert orchestrator._FANOUT_SLOTS._initial_value == CONFIG.fanout.max_workers
 
 
+def test_stage_tags_omit_net_for_offline():
+    netty = Stage("a", lambda *_: None)               # net defaults True
+    offline = Stage("b", lambda *_: None, net=False)
+    assert "net" in orchestrator._stage_tags(netty)
+    assert "net" not in orchestrator._stage_tags(offline)   # offline stage not counted against net cap
+
+
+def test_net_slots_is_bounded_semaphore():
+    import threading
+
+    assert isinstance(orchestrator._NET_SLOTS, threading.BoundedSemaphore)
+    assert orchestrator._NET_SLOTS._initial_value == orchestrator._NET_LIMIT
+
+
 def test_stage_tags_by_band():
     base = Stage("a", lambda *_: None)
     span = Stage("b", lambda *_: None, spanning=True)

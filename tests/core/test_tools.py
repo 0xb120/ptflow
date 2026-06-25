@@ -104,6 +104,20 @@ def test_run_tolerates_non_utf8_output():
     assert "�" in out  # replaced, not raised
 
 
+def test_run_aborts_without_spawning():
+    import pytest
+
+    tools.signal_abort()
+    try:
+        with pytest.raises(tools.AbortedError):
+            tools.run(["printf", "x"])  # must NOT spawn while aborting
+        with pytest.raises(tools.AbortedError):
+            tools.pipe([["printf", "x"]])
+    finally:
+        tools.clear_abort()
+    assert tools.run(["printf", "x"]) == "x"  # spawns normally again after clear
+
+
 def test_run_reap_group_returns_output():
     # reap_group SIGKILLs the child's process group on exit (to sweep stragglers like headless
     # chrome); a normal command with no stragglers must still return its stdout unaffected

@@ -8,7 +8,9 @@ reconstructs the Activity/Pipeline and runs a single stage by name.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import os
 import threading
 import urllib.error
 import urllib.request
@@ -39,6 +41,17 @@ log = get_logger()
 # once the spanning stages free the pool. (The ThreadPoolTaskRunner runs every stage in one process,
 # so a module semaphore caps them across all app groups — same pattern as the headless RAM cap.)
 _FANOUT_SLOTS = threading.BoundedSemaphore(CONFIG.fanout.max_workers)
+
+# Global NETWORK-concurrency cap. Bounds how many `net` stages (per-app AND spanning) run at once, so
+# the aggregate uplink load stays bounded (a home line / consumer router can choke on too much at
+# once). Resolved at import from PIPT_NET_LIMIT, else a profile-aware default: PIPT_PROFILE=home → a
+# gentle 4, else CONFIG.fanout.net_limit (non-binding for real bandwidth). Complements the per-tool
+# rate profile — aggregate load ≈ concurrency x rate, so both levers matter.
+_NET_LIMIT = int(os.environ.get(
+    "PIPT_NET_LIMIT",
+    "4" if os.environ.get("PIPT_PROFILE", "").lower().strip() == "home" else str(CONFIG.fanout.net_limit),
+))
+_NET_SLOTS = threading.BoundedSemaphore(_NET_LIMIT)
 
 
 def topo_order(stages: list[Stage]) -> list[Stage]:
@@ -86,7 +99,7 @@ def _pool_size(stages: Sequence[Stage], fanout: int) -> int:
 
 def _stage_tags(stage: Stage) -> list[str]:
     """Band tag for the Prefect UI (so task runs group/filter by phase in the dashboard), plus the
-    shared `net` concurrency tag. Pure — derived from the Stage's own scope flags."""
+    `net` tag for network stages (offline ones omit it). Pure — derived from the Stage's flags."""
     if stage.spanning:
         band = "spanning"
     elif stage.cluster_scope:
@@ -95,7 +108,7 @@ def _stage_tags(stage: Stage) -> list[str]:
         band = f"loop:{stage.phase}"
     else:
         band = "breadth"
-    return ["net", band]
+    return ["net", band] if stage.net else [band]
 
 
 def _submit_dag(  # noqa: PLR0913
@@ -159,14 +172,19 @@ def _run_stage(  # noqa: PLR0913
         log.info("  ↺ skip %s%s (done)", stage_name, f" [{app_id}]" if app_id else "")
         return stage_name
     stage = next(s for s in pipeline.stages if s.name == stage_name)
-    if app_id is None:
-        log.info("  ▶ %s", stage_name)
-        stage.run(activity)
-    else:
-        # cap concurrent per-app chains at fanout.max_workers — the pool is larger (sized to also fit
-        # the spanning stages) so spanning runs ∥ the loops instead of starving their workers
-        with _FANOUT_SLOTS:
-            log.info("  ▶ %s [%s]", stage_name, app_id)
+    # Acquire slots in a FIXED order (net → fanout) so multi-slot stages can't deadlock:
+    #   _NET_SLOTS — global network-concurrency cap (per-app + spanning), bounds the uplink load;
+    #   _FANOUT_SLOTS — per-app fan-out cap (the pool is larger, sized to also fit the spanning
+    #   stages, so spanning runs ∥ the loops instead of starving them).
+    with contextlib.ExitStack() as slots:
+        if stage.net:
+            slots.enter_context(_NET_SLOTS)
+        if app_id is not None:
+            slots.enter_context(_FANOUT_SLOTS)
+        log.info("  ▶ %s%s", stage_name, f" [{app_id}]" if app_id else "")
+        if app_id is None:
+            stage.run(activity)
+        else:
             stage.run(activity, app_id)
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("", encoding="utf-8")  # mark done only AFTER success → failed stages re-run
@@ -205,6 +223,7 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *, resume
     ThreadPoolTaskRunner shutdown (the nuclei teardown-hang). On a clean run it's a no-op.
     With `resume`, stages with a completion marker are skipped (only failed/incomplete ones rerun).
     """
+    tools.clear_abort()  # fresh run (a prior aborted run in this process must not poison this one)
     pipeline = load_pipeline(pipeline_name)
     activity = Activity.named(activity_name, Path(root) if root else None)
     activity_stages = [s for s in pipeline.stages
@@ -249,6 +268,9 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *, resume
         log.info("▶ agent")
         n = propose_hypotheses(activity, pipeline.provider())
         log.info("  → %d hypothesis(es)", n)
+    except KeyboardInterrupt:  # Ctrl-C/SIGINT: stop the draining workers from spawning new tools
+        tools.signal_abort()   # (feroxbuster r+1, downloads, trufflehog…) → network goes quiet fast
+        raise
     finally:
         killed = tools.terminate_all()
         if killed:
@@ -319,15 +341,27 @@ def orchestrate(  # noqa: PLR0913
     preflight = getattr(pipeline, "preflight", None)  # log present/missing external tools (best-effort)
     if callable(preflight):
         preflight()
+    log.info("  → concurrency: fan-out %d · network cap %d", CONFIG.fanout.max_workers, _NET_LIMIT)
     # name the flow run after the activity (UI), and size the pool to fan-out + spanning headroom so
     # the spanning stages run ∥ the loops instead of starving them (_FANOUT_SLOTS holds the fan-out cap)
     pool = ThreadPoolTaskRunner(max_workers=_pool_size(pipeline.stages, CONFIG.fanout.max_workers))
     run = _run_dag.with_options(flow_run_name=f"{pipeline.name}:{activity_name}", task_runner=pool)
-    if observe:
-        # redirect this run to the persistent server + let it capture the `pipt` logger, scoped to
-        # the run (no global profile/env mutation). temporary_settings overrides at runtime.
-        with temporary_settings({PREFECT_API_URL: observe, PREFECT_LOGGING_EXTRA_LOGGERS: ["pipt"]}):
-            failures = run(pipeline.name, activity_name, root, resume=resume)
-    else:
-        failures = run(pipeline.name, activity_name, root, resume=resume)
+    def _go() -> int:
+        if observe:
+            # redirect this run to the persistent server + let it capture the `pipt` logger, scoped to
+            # the run (no global profile/env mutation). temporary_settings overrides at runtime.
+            with temporary_settings({PREFECT_API_URL: observe, PREFECT_LOGGING_EXTRA_LOGGERS: ["pipt"]}):
+                return run(pipeline.name, activity_name, root, resume=resume)
+        return run(pipeline.name, activity_name, root, resume=resume)
+
+    try:
+        failures = _go()
+    except (KeyboardInterrupt, Exception) as exc:
+        # a Ctrl-C (or the Prefect ConnectError cascade after the ephemeral server dies with it) →
+        # clean exit, not a traceback. tools.is_aborting() was set by _run_dag's KeyboardInterrupt
+        # handler; a genuine error (not aborting) is re-raised so it still surfaces.
+        if isinstance(exc, KeyboardInterrupt) or tools.is_aborting():
+            log.warning("⚠ interrupted — partial results in %s; rerun with --resume", activity.base)
+            return activity.base, -1  # sentinel: interrupted (CLI → exit 130)
+        raise
     return activity.base, failures

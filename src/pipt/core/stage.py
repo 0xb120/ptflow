@@ -52,6 +52,11 @@ class Stage:
     phase: int = 1
     spanning: bool = False
     cluster_scope: bool = False
+    net: bool = True
+    """Whether the stage does network I/O. Network stages are tagged ``net`` and counted against the
+    global network-concurrency cap (``_NET_SLOTS``); set ``net=False`` for purely offline stages
+    (wordlist tokenisation, response-store mining, wordlist provisioning) so they neither claim a
+    network slot nor get the ``net`` tag."""
 
 
 class Pipeline(Protocol):

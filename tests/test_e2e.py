@@ -97,6 +97,15 @@ def test_cli_observe_forwards_api_url_to_orchestrate(tmp_path, monkeypatch):
     assert captured["observe"] is None  # no --observe → no redirect (plain ephemeral run)
 
 
+def test_cli_interrupted_returns_130(tmp_path, monkeypatch):
+    from pipt import cli
+
+    # orchestrate returns the interrupted sentinel (-1) → CLI exits 130
+    monkeypatch.setattr(cli, "orchestrate", lambda *_a, **_k: (tmp_path, -1))
+    scope_file = _scope(tmp_path)
+    assert main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path)]) == 130
+
+
 def test_cli_serve_starts_prefect_server(monkeypatch):
     from pipt import cli
 
