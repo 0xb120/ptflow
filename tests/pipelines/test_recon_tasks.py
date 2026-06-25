@@ -2,6 +2,14 @@ from pipt.core.scope import Target
 from pipt.pipelines.recon import tasks
 
 
+def test_web_ports_constant_is_250_distinct_valid():
+    ports = [int(p) for p in tasks.WEB_PORTS.split(",")]
+    assert len(ports) == 250                       # exactly 250 (the curated web set fed to naabu -p)
+    assert len(set(ports)) == 250                  # no duplicates
+    assert all(1 <= p <= 65535 for p in ports)     # valid TCP ports
+    assert {80, 443, 8080, 8443}.issubset(ports)   # the essentials are present
+
+
 def test_select_web_ports_keeps_valid_ip_lines():
     naabu = ["1.2.3.4:80", "1.2.3.4:8080", "9.9.9.9:443", "5.5.5.5:22"]
     # only ip:port lines whose IP is in the valid (non-honeypot) set survive → httpx web input

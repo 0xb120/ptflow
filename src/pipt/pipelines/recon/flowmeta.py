@@ -48,9 +48,9 @@ FLOWMETA: dict[str, StepMeta] = {
         outputs=("subdomains.txt", "unique_ips.txt", "domain_ip_map.txt"),
     ),
     "portscan": StepMeta(
-        summary="Scan VELOCE: top-1k → filtro honeypot → naabu_web.txt (il set web che legge httpx). "
-                "Il full-port è ora spanning (portscan_full), fuori dal percorso critico.",
-        commands=("naabu -top-ports 1000 -exclude-cdn   # → honeypot_split + select_web_ports",),
+        summary="Scan VELOCE su ~250 porte WEB curate (WEB_PORTS) → filtro honeypot → naabu_web.txt "
+                "(il set che legge httpx). Il full-port è spanning (portscan_full), fuori dal percorso critico.",
+        commands=("naabu -p <250 porte web> -exclude-cdn   # → honeypot_split + select_web_ports",),
         outputs=("honeypots.txt", "naabu_web.txt"),
     ),
     "portscan_full": StepMeta(

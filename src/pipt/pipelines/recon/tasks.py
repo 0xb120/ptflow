@@ -43,6 +43,29 @@ NAABU_TLS_CONC = "50"
 HONEYPOT_MIN_OPEN_PORTS = 15      # >= this many open ports => suspected honeypot
 RESOLVERS = "/opt/resolvers/resolvers-trusted.txt"
 
+# Curated WEB ports for the FAST portscan (feeds httpx -> cluster). 250 distinct HTTP(S)-bearing
+# ports: union of aquatone-xlarge, hosting-panels, 8xxx alt-HTTP, app/dev servers, data/ops UIs,
+# containers, IoT/devices, proxies. NOT nmap's generic top-1k - so httpx sees web apps on uncommon
+# ports (5601/8161/9200/7001/...) that top-1k misses, while staying fast. Non-web ports (SSH/DB/SMB/
+# RDP) are deliberately absent - portscan_full (full 65535, spanning) + nerva cover those.
+WEB_PORTS = (
+    "80,81,82,83,84,85,86,87,88,89,90,280,300,443,591,593,631,777,832,880,888,981,1010,"
+    "1024,1080,1311,2052,2053,2080,2082,2083,2086,2087,2095,2096,2222,2375,2376,2379,2380,"
+    "2480,3000,3001,3002,3003,3030,3127,3128,3129,3333,4000,4040,4080,4200,4243,4443,4444,"
+    "4445,4567,4643,4646,4711,4712,4848,4993,5000,5001,5002,5050,5080,5104,5108,5555,5601,"
+    "5800,5984,5985,5986,6080,6082,6346,6347,6379,6443,6488,6543,6588,6660,6661,6662,7000,"
+    "7001,7002,7070,7071,7080,7100,7200,7396,7443,7474,7547,7574,7676,7777,7778,7990,8000,"
+    "8001,8002,8003,8004,8005,8006,8007,8008,8009,8010,8011,8012,8013,8014,8015,8016,8020,"
+    "8030,8040,8042,8050,8051,8055,8060,8069,8070,8080,8081,8082,8083,8084,8085,8086,8087,"
+    "8088,8089,8090,8091,8092,8093,8094,8095,8096,8097,8098,8099,8100,8101,8102,8110,8118,"
+    "8123,8161,8172,8180,8181,8190,8200,8201,8222,8243,8280,8281,8300,8333,8377,8400,8443,"
+    "8444,8480,8500,8501,8510,8530,8531,8554,8585,8649,8666,8686,8688,8765,8787,8800,8834,"
+    "8843,8866,8880,8888,8889,8899,8983,8990,8991,8995,9000,9001,9002,9003,9009,9042,9043,"
+    "9050,9060,9080,9081,9090,9091,9092,9100,9200,9300,9443,9800,9981,9990,9991,9999,10000,"
+    "10001,10080,10250,10255,10443,11371,12443,15672,16080,18080,18091,18092,18443,19999,"
+    "20000,20720,28017,34567,37777,49152,50000,55440,55443"
+)
+
 # whole-scope nuclei scan (spanning stage — ONE process, ONE global rate cap)
 NUCLEI_CONC = "25"      # -c  templates in parallel
 NUCLEI_BULK = "25"      # -bs hosts per template
@@ -767,23 +790,24 @@ def resolve(activity: Activity) -> None:
 
 
 def portscan(activity: Activity) -> None:
-    """Phase 3 — FAST port scan: top-1k → honeypot filter → naabu_web.txt (the web target set httpx
-    probes). Reads unique_ips.txt; writes honeypots.txt + naabu_web.txt (canonical).
+    """Phase 3 — FAST web-port scan: WEB_PORTS → honeypot filter → naabu_web.txt (the web target set
+    httpx probes). Reads unique_ips.txt; writes honeypots.txt + naabu_web.txt (canonical).
 
-    The expensive full 65535-port scan is split into the SPANNING `portscan_full` stage so it no
-    longer serializes in front of httpx→cluster→loops (the observed ~15-min breadth block). top-1k
-    covers the common web ports (80/443/8080/8081/8443/…), so web coverage stays ~complete; exotic
-    non-web ports are picked up by portscan_full ∥ in the background (→ nerva). The top-1k stdout is
-    provenance (raw/naabu/), consumed in memory by honeypot_split/select_web_ports."""
+    Scans the curated ~250 HTTP(S)-bearing ports (WEB_PORTS), NOT nmap's generic top-1k — so httpx
+    sees web apps on uncommon ports (5601/8161/9200/7001/…) that top-1k would miss, while staying
+    fast. The expensive full 65535-port scan is split into the SPANNING `portscan_full` stage so it
+    no longer serializes in front of httpx→cluster→loops (the observed ~15-min breadth block);
+    non-web ports are picked up there ∥ in the background (→ nerva). The naabu stdout is provenance
+    (raw/naabu/), consumed in memory by honeypot_split/select_web_ports."""
     canon = activity.asset_discovery_canonical
     unique_ips = tools.read_lines(canon("unique_ips.txt"))
-    naabu_1k = _lines(
-        _run("naabu", ["naabu", "-silent", "-top-ports", "1000", "-exclude-cdn"],
-             stdin="\n".join(unique_ips), dest=_raw(activity, "naabu", "top1k"), label="top1k")
+    scanned = _lines(
+        _run("naabu", ["naabu", "-silent", "-p", WEB_PORTS, "-exclude-cdn"],
+             stdin="\n".join(unique_ips), dest=_raw(activity, "naabu", "web"), label="web")
     )
-    valid_ips, honeypots = honeypot_split(naabu_1k)
+    valid_ips, honeypots = honeypot_split(scanned)
     tools.write_lines(canon("honeypots.txt"), honeypots)
-    tools.write_lines(canon("naabu_web.txt"), select_web_ports(naabu_1k, valid_ips))
+    tools.write_lines(canon("naabu_web.txt"), select_web_ports(scanned, valid_ips))
 
 
 def portscan_full(activity: Activity) -> None:

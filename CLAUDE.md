@@ -238,7 +238,7 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
 - **`recon`** — the REAL ProjectDiscovery toolchain (`pipelines/recon/tasks.py`), a faithful port of
   bash recon scripts (`scope2surface.sh` breadth, `surfagr.sh` clustering). Stages:
   - **Breadth** (activity scope): `provision_wl` (resolve global wordlist roles → `wl_global/`) ∥
-    `expand` → `resolve` → `portscan` (FAST: top-1k → honeypot filter → `naabu_web.txt`) → `httpx`
+    `expand` → `resolve` → `portscan` (FAST: ~250 curated web ports `WEB_PORTS` → honeypot filter → `naabu_web.txt`) → `httpx`
     → `cluster` fan-out. The expensive **full 65535-port scan is off the critical path**:
     `portscan_full` (**spanning**, after `portscan`) → `naabu_full.txt` → `nerva` (**spanning**)
     run ∥ clustering + the loops, joined at the fan-in. `httpx` only needs the fast top-1k web set,
