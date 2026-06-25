@@ -218,7 +218,10 @@ Dropped on purpose (were in an earlier draft): **leaf cert** and **ip+header+tec
 
 **Stable id:** `app_id` is anchored on the group's plurality `(favicon, apex)` → else plurality host
 (`_cluster_anchor`) — collision-free (two groups can't share an apex-scoped favicon, nor a host) and
-stable under minority membership changes. `meta.json` records `id_anchor` + `signature` for
+stable under minority membership changes. It's rendered **pseudo-readable** as `<slug>-<hash8>`
+(`_app_id`/`_slug`): the slug is the anchor's apex (favicon-anchored) or host (host-anchored) for
+at-a-glance recognition (`ginandjuice.shop-1a2b3c4d`, `scanme.nmap.org-…`), the 8-hex anchor hash
+keeps it unique+stable even when the slug repeats. `meta.json` records `id_anchor` + `signature` for
 debuggability, plus **`body_by_host`** (url → response-body sha256) — the active scanners
 (`crawl`/`crawl_headless`/`content_discovery`) read it via `_scan_hosts`/`dedup_by_body` to scan one
 host per distinct body (collapse same-backend aliases, keep distinct environments). `passive_probe`,

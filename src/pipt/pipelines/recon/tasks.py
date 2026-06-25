@@ -697,9 +697,23 @@ def _lines(text: str) -> list[str]:
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
 
-def _app_id(signature: str) -> str:
-    """Stable app id from the cluster identity (NOT a mutable host/title string)."""
-    return hashlib.sha1(signature.encode()).hexdigest()[:12]  # noqa: S324
+def _slug(text: str, *, maxlen: int = 24) -> str:
+    """Filesystem-safe, readable slug from a host/apex: lowercase, keep [a-z0-9.-], everything else
+    collapses to '-'; trimmed; '' → 'app'. Cosmetic prefix for app_id (the hash carries identity)."""
+    s = re.sub(r"[^a-z0-9.-]+", "-", text.lower())
+    s = re.sub(r"-{2,}", "-", s).strip("-.")[:maxlen].strip("-.")
+    return s or "app"
+
+
+def _app_id(anchor_key: str, anchor_value: str) -> str:
+    """Stable, collision-free, PSEUDO-READABLE app id: ``<slug>-<hash8>``. The slug is the group's
+    apex (favicon-anchored) or host (host-anchored) for at-a-glance recognition; the 8-hex hash of
+    the full anchor preserves identity — two groups can't share an anchor, so the dir name is stable
+    across runs and never collides (even when the slug repeats, e.g. two ``appspot.com`` apps).
+    Filesystem-safe. NOT derived from a mutable host/title string — only the stable cluster anchor."""
+    readable = anchor_value.split("@", 1)[-1] if anchor_key == "favicon" else anchor_value
+    digest = hashlib.sha1(f"{anchor_key}:{anchor_value}".encode()).hexdigest()[:8]  # noqa: S324
+    return f"{_slug(readable)}-{digest}"
 
 
 def _run(tool: str, cmd: list[str], *, stdin: str, dest: Path, label: str) -> str:
@@ -1034,7 +1048,7 @@ def cluster(activity: Activity) -> list[str]:
     for idxs in cluster_partition(records):
         members = [records[i] for i in idxs]
         key, value = _cluster_anchor(members)
-        app_id = _app_id(f"{key}:{value}")
+        app_id = _app_id(key, value)
         rep = min(members, key=lambda r: r["url"])
         urls = tools.dedupe(r["url"] for r in members)
         # per-host response-body hash → lets per-app stages dedup same-backend hosts (domain+IP,
@@ -1238,7 +1252,9 @@ def _stored_root_html(ws: AppWorkspace, hosts: list[str]) -> str:
     fetched the root)."""
     roots = {h.rstrip("/") for h in hosts}
     for stored, url in _store_index(ws.responses / "index.txt"):
-        if url.rstrip("/") in roots:
+        # the -srd index can reference a body the store never wrote (empty/redirect response,
+        # partial store) — skip a missing file instead of crashing, keep looking for a root
+        if url.rstrip("/") in roots and Path(stored).is_file():
             return http_body(Path(stored).read_text(encoding="utf-8", errors="replace"))
     return ""
 
@@ -1528,7 +1544,10 @@ def _extract_bodies(ws: AppWorkspace) -> tuple[Path | None, list[str]]:
             dst = bodies / f"{Path(stored).stem}.{'js' if is_js else 'html'}"
             if dst.exists():
                 continue  # already extracted in an earlier call/round — idempotent
-            body = http_body(Path(stored).read_text(encoding="utf-8", errors="replace"))
+            src = Path(stored)
+            if not src.is_file():  # index references a body the -srd store never wrote → skip, not crash
+                continue
+            body = http_body(src.read_text(encoding="utf-8", errors="replace"))
             if not body.strip():
                 continue
             bodies.mkdir(parents=True, exist_ok=True)

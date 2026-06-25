@@ -2,6 +2,48 @@ from pipt.core.scope import Target
 from pipt.pipelines.recon import tasks
 
 
+def test_extract_bodies_skips_missing_indexed_file(tmp_path):
+    from pipt.core.paths import AppWorkspace
+
+    ws = AppWorkspace(tmp_path / "app").ensure()
+    store = ws.responses
+    store.mkdir(parents=True, exist_ok=True)
+    good = store / "good.txt"
+    good.write_text("http://x/\n\nHTTP/1.1 200 OK\nContent-Type: text/html\n\n<html>hi</html>\n")
+    # one real stored response + one index entry whose file does NOT exist (must be skipped, not crash)
+    (store / "index.txt").write_text(
+        f"{good} http://x/a.html (200)\n"
+        f"{store / 'missing.txt'} http://x/b.html (200)\n",
+    )
+    bodies, new_js = tasks._extract_bodies(ws)  # must not raise FileNotFoundError on the missing entry
+    assert bodies is not None
+    assert new_js == []
+    assert any(bodies.iterdir())  # the good body was extracted
+
+
+def test_slug_is_filesystem_safe():
+    assert tasks._slug("Ginandjuice.Shop") == "ginandjuice.shop"  # lowercased, dots kept
+    assert tasks._slug("a b/c:d") == "a-b-c-d"                     # non [a-z0-9.-] → '-'
+    assert tasks._slug("") == "app"                               # empty fallback
+    s = tasks._slug("x/y:z foo")
+    assert "/" not in s
+    assert ":" not in s
+    assert " " not in s
+
+
+def test_app_id_is_readable_stable_and_unique():
+    a = tasks._app_id("favicon", "1165564288@ginandjuice.shop")
+    assert a.startswith("ginandjuice.shop-")                       # apex slug for favicon anchor
+    assert a == tasks._app_id("favicon", "1165564288@ginandjuice.shop")  # deterministic/stable
+    assert tasks._app_id("host", "scanme.nmap.org").startswith("scanme.nmap.org-")  # host slug
+    # same slug (shared hosting), different anchors → distinct ids (hash disambiguates)
+    c1 = tasks._app_id("favicon", "111@appspot.com")
+    c2 = tasks._app_id("favicon", "222@appspot.com")
+    assert c1 != c2
+    assert c1.startswith("appspot.com-")
+    assert c2.startswith("appspot.com-")
+
+
 def test_preflight_runs_and_logs():
     import logging
 
