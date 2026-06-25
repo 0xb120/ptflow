@@ -87,6 +87,7 @@ def run(  # noqa: PLR0913
     timeout: int | None = None,
     cwd: Path | None = None,
     stream_stderr: bool = False,
+    reap_group: bool = False,
 ) -> str:
     """Run a command, return stdout. When `stream_stderr` is set, the tool's
     stderr is inherited (printed live to the terminal) instead of suppressed —
@@ -95,7 +96,10 @@ def run(  # noqa: PLR0913
     The child runs in its own session/process group and is tracked while live, so
     terminate_all() can kill it (and its grandchildren) at a teardown/abort — see the
     module registry. `timeout` is opt-in (no default); on expiry the whole group is
-    killed and TimeoutExpired re-raised."""
+    killed and TimeoutExpired re-raised. `reap_group` SIGKILLs the child's process group
+    on return — even a clean exit — to sweep stragglers the tool leaves behind (e.g. a
+    headless chromium from `httpx -ss`/EyeWitness); safe because start_new_session gives
+    the child its own group (pgid == pid)."""
     cmd_str = shlex.join(list(cmd))
     log.debug("$ %s", cmd_str)
     proc = subprocess.Popen(
@@ -118,6 +122,9 @@ def run(  # noqa: PLR0913
         raise
     finally:
         _unregister(proc)
+        if reap_group:  # sweep stragglers (e.g. headless chrome) even on a clean exit; pgid == pid
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
     rc = proc.returncode
     if check and rc != 0:
         raise subprocess.CalledProcessError(rc, list(cmd), output=out)
@@ -186,7 +193,7 @@ def dedupe(lines: Iterable[str]) -> list[str]:
 def read_lines(path: Path) -> list[str]:
     if not path.exists():
         return []
-    return [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return [ln.strip() for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
 
 
 def write_lines(path: Path, lines: Iterable[str]) -> int:
@@ -200,7 +207,7 @@ def read_jsonl(path: Path) -> list[dict]:
     """Read a JSONL file (one JSON object per line). Returns [] if missing."""
     if not path.exists():
         return []
-    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
 
 
 def write_jsonl(path: Path, records: Iterable[dict]) -> int:

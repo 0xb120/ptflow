@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -266,12 +268,24 @@ def _resume_ok(activity: Activity, scope_text: str, *, resume: bool) -> bool:
     (full rerun) and warn, so resuming never silently reuses results computed for a different scope."""
     sha = hashlib.sha256(scope_text.encode()).hexdigest()
     sha_file = activity.state / "scope.sha"
-    if resume and sha_file.exists() and sha_file.read_text(encoding="utf-8").strip() != sha:
+    if resume and sha_file.exists() and sha_file.read_text(encoding="utf-8", errors="replace").strip() != sha:
         log.warning("⚠ resume: scope changed since last run — ignoring stage markers (full rerun)")
         resume = False
     activity.state.mkdir(parents=True, exist_ok=True)
     sha_file.write_text(sha, encoding="utf-8")
     return resume
+
+
+def _server_reachable(api_url: str, timeout: float = 2.0) -> bool:
+    """True if the Prefect API at `api_url` answers /health — so --observe can fall back to ephemeral
+    instead of stalling/erroring on a dead server. Localhost probe; never raises."""
+    try:
+        with urllib.request.urlopen(  # noqa: S310 — localhost Prefect health probe
+            f"{api_url.rstrip('/')}/health", timeout=timeout,
+        ) as resp:
+            return 200 <= resp.status < 300  # noqa: PLR2004
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
 
 
 def orchestrate(  # noqa: PLR0913
@@ -292,12 +306,19 @@ def orchestrate(  # noqa: PLR0913
     unchanged. temporary_settings applies the redirect at runtime (env set post-import is too late)."""
     activity = Activity.named(activity_name, Path(root) if root else None).ensure()
     add_file_handler(activity.logs / "run.log")  # persist the full run log (every command + output)
-    scope_text = Path(scope_file).read_text(encoding="utf-8")
+    scope_text = Path(scope_file).read_text(encoding="utf-8", errors="replace")
     activity.scope.write_text(scope_text, encoding="utf-8")
     activity.scope_init.write_text(scope_text, encoding="utf-8")
     resume = _resume_ok(activity, scope_text, resume=resume)
+    if observe and not _server_reachable(observe):
+        log.warning("⚠ observe: Prefect server unreachable at %s — falling back to ephemeral "
+                    "(start it with `pipt serve`)", observe)
+        observe = None
     log.info("▶ pipeline '%s' on '%s'%s%s → %s", pipeline.name, activity_name,
              " [resume]" if resume else "", f" [observe→{observe}]" if observe else "", activity.base)
+    preflight = getattr(pipeline, "preflight", None)  # log present/missing external tools (best-effort)
+    if callable(preflight):
+        preflight()
     # name the flow run after the activity (UI), and size the pool to fan-out + spanning headroom so
     # the spanning stages run ∥ the loops instead of starving them (_FANOUT_SLOTS holds the fan-out cap)
     pool = ThreadPoolTaskRunner(max_workers=_pool_size(pipeline.stages, CONFIG.fanout.max_workers))

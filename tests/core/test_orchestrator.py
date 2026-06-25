@@ -36,6 +36,11 @@ def test_await_isolates_and_records_failure():
     assert failures == ["bad"]  # the good stage didn't abort; the bad one is recorded, not raised
 
 
+def test_server_reachable_false_for_dead_port():
+    # nothing listens on :1 → --observe falls back to ephemeral instead of stalling
+    assert orchestrator._server_reachable("http://127.0.0.1:1/api", timeout=0.5) is False
+
+
 def test_pool_size_adds_spanning_headroom():
     stages = [
         Stage("a", lambda *_: None),                      # breadth — not counted

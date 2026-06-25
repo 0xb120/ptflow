@@ -26,7 +26,7 @@ def discover(activity: Activity) -> None:
     Reads the scope from scope/scope_init.txt; writes scope/scope_{urls,dns,ip}.txt
     (split by kind) and the canonical asset_discovery/hosts.jsonl (apex + www host).
     """
-    targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8"))
+    targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8", errors="replace"))
     tools.write_lines(activity.scope_urls, [t.raw for t in targets if t.kind == "url"])
     tools.write_lines(
         activity.scope_dns, [t.normalized for t in targets if t.kind in ("domain", "wildcard")]

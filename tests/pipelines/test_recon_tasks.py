@@ -2,6 +2,23 @@ from pipt.core.scope import Target
 from pipt.pipelines.recon import tasks
 
 
+def test_preflight_runs_and_logs():
+    import logging
+
+    from pipt.core.log import get_logger
+
+    lg = get_logger()
+    recs: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = recs.append
+    lg.addHandler(handler)
+    try:
+        tasks.preflight()  # best-effort: must never raise regardless of which tools are installed
+    finally:
+        lg.removeHandler(handler)
+    assert any("preflight" in r.getMessage() for r in recs)  # always logs the tool-inventory summary
+
+
 def test_web_ports_constant_is_250_distinct_valid():
     ports = [int(p) for p in tasks.WEB_PORTS.split(",")]
     assert len(ports) == 250                       # exactly 250 (the curated web set fed to naabu -p)

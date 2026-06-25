@@ -230,6 +230,39 @@ X8 = str(_X8_BIN) if _X8_BIN.exists() else "x8"
 # resolved by _eyewitness_cmd (overridable via PIPT_EYEWITNESS / `eyewitness` on PATH).
 _EYEWITNESS_DIR = Path("/opt/EyeWitness")
 
+# --- preflight tool inventory (logical name → command/path resolved with shutil.which) ---
+# CORE: the pipeline genuinely relies on these — a missing one is a WARNING (its stage yields
+# nothing). OPTIONAL: best-effort fleet whose absence is expected/fine (the stage simply skips).
+_CORE_TOOLS = {
+    "mapcidr": "mapcidr", "naabu": "naabu", "dnsx": "dnsx", "tlsx": "tlsx",
+    "shuffledns": "shuffledns", "subfinder": "subfinder", "assetfinder": "assetfinder",
+    "httpx": HTTPX, "katana": "katana", "gau": "gau", "urlfinder": "urlfinder",
+    "nuclei": "nuclei", "nerva": "nerva", "subjack": "subjack", "feroxbuster": FEROX,
+}
+_OPTIONAL_TOOLS = {
+    "crawley": CRAWLEY, "jsluice": JSLUICE, "shortscan": SHORTSCAN, "shortutil": SHORTUTIL,
+    "gitleaks": GITLEAKS, "trufflehog": TRUFFLEHOG, "detect-secrets": DETECT_SECRETS,
+    "arjun": ARJUN, "x8": X8,
+}
+
+
+def preflight() -> None:
+    """Log which external tools resolve at run start, so a missing binary degrades a stage VISIBLY
+    instead of yielding a silent empty result. Never aborts (best-effort): a missing CORE tool is a
+    WARNING (that stage produces nothing); missing OPTIONAL tools just skip their best-effort stage."""
+    core_missing = sorted(n for n, cmd in _CORE_TOOLS.items() if shutil.which(cmd) is None)
+    opt_missing = sorted(n for n, cmd in _OPTIONAL_TOOLS.items() if shutil.which(cmd) is None)
+    ew = _eyewitness_cmd() is not None
+    log.info("  → preflight: core %d/%d · optional %d/%d · eyewitness %s",
+             len(_CORE_TOOLS) - len(core_missing), len(_CORE_TOOLS),
+             len(_OPTIONAL_TOOLS) - len(opt_missing), len(_OPTIONAL_TOOLS),
+             "present" if ew else "absent")
+    if core_missing:
+        log.warning("  ⚠ preflight: missing CORE tool(s) — these stages will produce nothing: %s",
+                    ", ".join(core_missing))
+    if opt_missing:
+        log.info("    optional tools absent (their stages skip): %s", ", ".join(opt_missing))
+
 
 # --- pure transforms (unit-tested) ---
 def split_scope(targets: list[Target]) -> tuple[list[str], list[str], list[str], list[str]]:
@@ -715,7 +748,7 @@ def expand(activity: Activity) -> None:
     (mapcidr-expanded), tls_names.txt, and scope/scope_dns.txt (the full candidate
     name set that `resolve` consumes).
     """
-    targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8"))
+    targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8", errors="replace"))
     urls, dns, wildcards, ips_cidr = split_scope(targets)
     tools.write_lines(activity.scope_urls, urls)
 
@@ -1086,7 +1119,7 @@ def _eyewitness_batch(activity: Activity, url_to_app: dict[str, str]) -> None:
     tools.write_lines(target_file, list(url_to_app))
     log.info("  → eyewitness — %d url(s), batched", len(url_to_app))
     tools.run([*cmd, "--web", "-f", str(target_file), "-d", str(out_dir), "--no-prompt",
-               "--timeout", EYEWITNESS_TIMEOUT], stream_stderr=is_verbose())
+               "--timeout", EYEWITNESS_TIMEOUT], stream_stderr=is_verbose(), reap_group=True)
     csv_path = out_dir / "Requests.csv"
     rows = (parse_eyewitness_csv(csv_path.read_text(encoding="utf-8", errors="replace"))
             if csv_path.exists() else [])
@@ -1125,6 +1158,7 @@ def screenshot_all(activity: Activity) -> None:
         [HTTPX, "-ss", "-system-chrome", "-no-screenshot-full-page", "-st", SCREENSHOT_TIMEOUT,
          "-silent", "-srd", str(store), "-svrc"],
         stdin="\n".join(url_to_app), stream_stderr=is_verbose(),
+        reap_group=True,  # sweep any system-chrome the screenshot left behind, even on clean exit
     )
     shot_dir = store / "screenshot"
     by_app = reconcile_by_url(_store_index(shot_dir / "index_screenshot.txt"), url_to_app)
@@ -1527,7 +1561,7 @@ def _run_gitleaks(ws: AppWorkspace, bodies: Path, app_id: str) -> list[dict]:
     report.parent.mkdir(parents=True, exist_ok=True)
     tools.run([GITLEAKS, "detect", "--no-git", "-s", str(bodies), "-f", "json", "-r", str(report)],
               stream_stderr=is_verbose())
-    return parse_gitleaks(report.read_text(encoding="utf-8") if report.exists() else "")
+    return parse_gitleaks(report.read_text(encoding="utf-8", errors="replace") if report.exists() else "")
 
 
 def _run_trufflehog(bodies: Path, app_id: str) -> list[dict]:
@@ -1687,7 +1721,7 @@ def _run_ferox(ws: AppWorkspace, hosts: list[str], words: list[str], round_idx: 
            "--smart", "-t", FEROX_THREADS, "-L", FEROX_SCAN_LIMIT, "--timeout", FEROX_TIMEOUT,
            "--time-limit", tl, "-d", FEROX_DEPTH, "-w", str(wordlist), *ext_args]
     tools.run(cmd, stdin="\n".join(hosts), stream_stderr=is_verbose())
-    return parse_ferox(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
+    return parse_ferox(out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else "")
 
 
 def _download_and_mine(ws: AppWorkspace, urls: list[str], round_idx: int) -> list[str]:
@@ -1928,7 +1962,7 @@ def _run_arjun(targets_file: Path, out_file: Path, params_wl: Path | None, app_i
         tools.run(cmd, timeout=PARAM_TOOL_TIMEOUT, stream_stderr=is_verbose())
     except subprocess.TimeoutExpired:
         log.warning("⚠ arjun hit the %ds cap for %s — keeping partial results", PARAM_TOOL_TIMEOUT, app_id)
-    return parse_arjun(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
+    return parse_arjun(out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else "")
 
 
 def _run_x8(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: str) -> list[dict]:
@@ -1948,7 +1982,7 @@ def _run_x8(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: 
         tools.run(cmd, timeout=PARAM_TOOL_TIMEOUT, stream_stderr=is_verbose())
     except subprocess.TimeoutExpired:
         log.warning("⚠ x8 hit the %ds cap for %s — keeping partial results", PARAM_TOOL_TIMEOUT, app_id)
-    return parse_x8(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
+    return parse_x8(out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else "")
 
 
 def param_fuzz(activity: Activity, app_id: str) -> None:

@@ -56,5 +56,9 @@ class ReconPipeline:
     def provider(self) -> HypothesisProvider:
         return StubProvider()
 
+    def preflight(self) -> None:
+        """Log present/missing external tools at run start (best-effort, never aborts)."""
+        tasks.preflight()
+
 
 PIPELINE = ReconPipeline()

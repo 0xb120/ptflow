@@ -68,6 +68,18 @@ def test_read_lines_strips(tmp_path):
     assert tools.read_lines(p) == ["a", "b"]
 
 
+def test_read_lines_tolerates_non_utf8(tmp_path):
+    p = tmp_path / "f.txt"
+    p.write_bytes(b"good\n\x93bad\nok\n")  # 0x93 = Windows-1252 byte, invalid UTF-8
+    assert tools.read_lines(p) == ["good", "�bad", "ok"]  # replaced, not raised
+
+
+def test_read_jsonl_tolerates_non_utf8(tmp_path):
+    p = tmp_path / "f.jsonl"
+    p.write_bytes(b'{"k": "a\x93b"}\n')  # invalid byte inside a JSON string value
+    assert tools.read_jsonl(p) == [{"k": "a�b"}]  # decoded with replace, still valid JSON
+
+
 def test_write_then_read_jsonl_roundtrip(tmp_path):
     p = tmp_path / "out.jsonl"
     n = tools.write_jsonl(p, [{"a": 1}, {"b": 2}])
@@ -90,6 +102,12 @@ def test_run_tolerates_non_utf8_output():
     assert out.startswith("a")
     assert out.endswith("b")
     assert "�" in out  # replaced, not raised
+
+
+def test_run_reap_group_returns_output():
+    # reap_group SIGKILLs the child's process group on exit (to sweep stragglers like headless
+    # chrome); a normal command with no stragglers must still return its stdout unaffected
+    assert tools.run(["printf", "ok"], reap_group=True) == "ok"
 
 
 def test_run_unregisters_after_completion():
