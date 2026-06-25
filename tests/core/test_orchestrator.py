@@ -20,6 +20,40 @@ def test_topo_order_ignores_foreign_needs():
     assert [x.name for x in orchestrator.topo_order([s])] == ["only"]
 
 
+def test_await_isolates_and_records_failure():
+    class _OkFut:
+        def result(self):
+            return "ok"
+
+    class _BadFut:
+        def result(self):
+            msg = "boom"
+            raise RuntimeError(msg)
+
+    failures: list[str] = []
+    orchestrator._await(_OkFut(), "good", failures)
+    orchestrator._await(_BadFut(), "bad", failures)
+    assert failures == ["bad"]  # the good stage didn't abort; the bad one is recorded, not raised
+
+
+def test_marker_path(tmp_path):
+    from pipt.core.paths import Activity
+
+    act = Activity.named("acme", root=tmp_path)
+    assert orchestrator._marker(act, "httpx", None) == act.state / "httpx.done"
+    assert orchestrator._marker(act, "crawl", "app1") == act.app("app1").state / "crawl.done"
+
+
+def test_resume_ok_invalidates_on_scope_change(tmp_path):
+    from pipt.core.paths import Activity
+
+    act = Activity.named("acme", root=tmp_path).ensure()
+    assert orchestrator._resume_ok(act, "scopeA", resume=True) is True   # first run: records hash, honored
+    assert orchestrator._resume_ok(act, "scopeA", resume=True) is True   # same scope → resume honored
+    assert orchestrator._resume_ok(act, "scopeB", resume=True) is False  # changed scope → markers stale
+    assert orchestrator._resume_ok(act, "scopeB", resume=False) is False  # never resumes when not asked
+
+
 def test_per_app_loops_groups_by_phase_in_order():
     stages = [
         Stage("expand", lambda *_: None),                          # activity → excluded

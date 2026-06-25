@@ -12,8 +12,11 @@ def _scope(tmp_path):
 
 def test_orchestrate_end_to_end(tmp_path):
     scope_file = _scope(tmp_path)
-    base = orchestrate(load_pipeline("example"), "acme", str(scope_file), root=str(tmp_path / "runs"))
+    base, failures = orchestrate(
+        load_pipeline("example"), "acme", str(scope_file), root=str(tmp_path / "runs")
+    )
     assert base == tmp_path / "runs" / "acme"
+    assert failures == 0  # clean run → no stage failures
 
     # scope expansion
     assert base.joinpath("scope.txt").exists()
@@ -21,12 +24,12 @@ def test_orchestrate_end_to_end(tmp_path):
     assert tools.read_lines(base / "scope" / "scope_dns.txt") == ["nmap.org"]
     assert tools.read_lines(base / "scope" / "scope_urls.txt") == ["https://example.com/"]
 
-    # asset discovery: 2 targets x (apex + www) = 4 hosts
-    hosts = tools.read_jsonl(base / "scans" / "asset_discovery" / "hosts.jsonl")
+    # asset discovery: 2 targets x (apex + www) = 4 hosts (top-level, not under scans/)
+    hosts = tools.read_jsonl(base / "asset_discovery" / "hosts.jsonl")
     assert len(hosts) == 4
 
-    # clustered app groups: 2 apexes -> 2 app dirs, each enumerated
-    app_dirs = [d for d in (base / "scans").iterdir() if d.is_dir() and d.name != "asset_discovery"]
+    # clustered app groups: scans/ holds ONLY app groups now → 2 apexes -> 2 app dirs
+    app_dirs = [d for d in (base / "scans").iterdir() if d.is_dir()]
     assert len(app_dirs) == 2
     for d in app_dirs:
         assert (d / "services.jsonl").exists()
@@ -57,3 +60,23 @@ def test_cli_run_verbose(tmp_path):
     scope_file = _scope(tmp_path)
     root = str(tmp_path / "runs")
     assert main(["run", "example", "acme", str(scope_file), "--root", root, "--verbose"]) == 0
+
+
+def test_cli_resume_reruns_cleanly(tmp_path):
+    scope_file = _scope(tmp_path)
+    root = str(tmp_path / "runs")
+    assert main(["run", "example", "acme", str(scope_file), "--root", root]) == 0
+    base = tmp_path / "runs" / "acme"
+    assert (base / ".state").is_dir()                      # completion markers were written
+    assert list((base / ".state").glob("*.done"))          # at least one stage marked done
+    # a --resume rerun completes cleanly (skipping done stages) and keeps the outputs
+    assert main(["run", "example", "acme", str(scope_file), "--root", root, "--resume"]) == 0
+    assert (base / "findings" / "hypotheses.jsonl").exists()
+
+
+def test_cli_run_returns_nonzero_on_failure(tmp_path, monkeypatch):
+    from pipt import cli
+
+    monkeypatch.setattr(cli, "orchestrate", lambda *_a, **_k: (tmp_path, 3))  # 3 stage failures
+    scope_file = _scope(tmp_path)
+    assert main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path)]) == 1

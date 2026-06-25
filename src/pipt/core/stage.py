@@ -37,6 +37,12 @@ class Stage:
     breadth→cluster barrier: it's launched once its breadth `needs` are done and awaited
     only at the terminal fan-in, so it overlaps clustering and all the per-app loops
     (e.g. a whole-scope nuclei scan running ∥ the rest of the pipeline).
+
+    `cluster_scope` marks a "spanning post-cluster" activity-scope stage (per_app=False): it runs
+    ONCE after `cluster` (so it can read every group's meta.json/hosts.txt via
+    `activity.list_apps()`), ∥ the per-app loops, joined at the terminal fan-in. Unlike `spanning`
+    (launched after breadth), it's launched after clustering — e.g. a single batched screenshot run
+    over one candidate per group, producing one unified gallery.
     """
 
     name: str
@@ -45,6 +51,7 @@ class Stage:
     per_app: bool = False
     phase: int = 1
     spanning: bool = False
+    cluster_scope: bool = False
 
 
 class Pipeline(Protocol):

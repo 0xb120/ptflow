@@ -1,7 +1,7 @@
 """Real asset_discovery (breadth) — faithful port of scope2surface.sh.
 
 Each tool's output is written ONCE. Intermediate steps that only feed later
-steps go to scans/asset_discovery/raw/<tool>/ (provenance). A tool whose output
+steps go to asset_discovery/raw/<tool>/ (top-level, not under scans/; provenance). A tool whose output
 IS a final artifact is written straight to its canonical name — no duplicate raw
 copy. Derived artifacts (unique IPs, honeypots, unique webapps) are computed in
 memory. Pure transforms are module-level so they can be unit-tested.
@@ -17,7 +17,9 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import threading
+import time
 from collections import Counter
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -95,6 +97,12 @@ NOISE_EXTENSIONS = frozenset({
 # wordlist synthesis (LOOP 2 — active collection → custom per-app wordlist)
 _TOKEN_MAX_LEN = 40                       # drop longer "segments" (hashes/junk)
 OSINT_FETCH_RL = "50"  # httpx req/s when downloading the OSINT delta into responses/osint/
+# wordlist STRATEGY (content_discovery combine): the CUSTOM layer (app-derived tokens) always goes in
+# full; how much of the TRADITIONAL layer (global content + tech CMS lists) rides along depends on the
+# mode. `auto` (override via env PIPT_WL_MODE ∈ auto|targeted|broad) → `targeted` when the app gave a
+# rich custom corpus (lean on it, cap the traditional lists), else `broad` (opaque app → full lists).
+WL_RICH_TOKENS = 200   # custom-token count at/above which `auto` picks `targeted`
+WL_TARGETED_CAP = 2000  # in `targeted`, keep only the top-N of each traditional list (freq-ordered)
 
 # content discovery (LOOP 2) — feroxbuster forced browsing. Global wordlists are
 # resolved by ROLE (see wordlists.py / wl_global/), never hardcoded here.
@@ -110,6 +118,31 @@ FEROX_TIMEOUT = "15"     # --timeout per-request seconds (tolerate slow apps)
 # hangs the whole pipeline (no per-request timeout breaks it). --smart-compatible; exits gracefully,
 # keeping partial results. See the scanme.nmap.org incident.
 FEROX_TIME_LIMIT = "20m"  # --time-limit total scan duration (normal scans here finish in ~5m)
+# content-discovery FIXPOINT (LOOP 2) — after round 0 (the classic forced-browse), feed the
+# feroxbuster-discovered bodies back through download → mine → tokenize → fuzz the NEW token delta,
+# until a fixpoint. Bounded by FOUR independent stops (no-new-words, no-new-urls, the per-app
+# wall-clock deadline, diminishing-returns) under a hard round cap — see content_discovery().
+CONTENT_FEEDBACK_ROUNDS = 2     # feedback rounds beyond round 0 (depth 3 total)
+CONTENT_DEADLINE_S = 900        # per-app wall-clock budget across ALL rounds (incl. round 0)
+DEEP_FEROX_TIME_LIMIT = "5m"    # --time-limit for feedback rounds (round 0 keeps FEROX_TIME_LIMIT)
+MIN_NEW_TOKENS = 20             # a round contributing fewer new fuzz words ⇒ stop (diminishing returns)
+DEEP_DOWNLOAD_CAP = 300         # max NEW urls downloaded+mined per round (logged when it bites)
+
+# parameter fuzzing (LOOP 3) — arjun ∥ x8 hidden-parameter discovery over the enumerated endpoints.
+# Per-endpoint and request-heavy (a 6.5k-name wordlist over N endpoints, two tools), so the endpoint
+# set is deduped by path-template and capped, and both tools run gently (low concurrency + rate cap).
+PARAM_MAX_ENDPOINTS = 50   # cap distinct endpoint shapes fuzzed per app (logged when it bites)
+ARJUN_THREADS = "5"        # arjun -t
+ARJUN_RATE = "20"          # arjun --rate-limit (req/s)
+ARJUN_TIMEOUT = "15"       # arjun -T (per-request seconds)
+X8_WORKERS = "2"           # x8 -W (concurrent url checks)
+X8_CONCURRENCY = "2"       # x8 -c (concurrent requests per url)
+X8_TIMEOUT = "15"          # x8 --timeout (seconds, per-request)
+X8_DELAY = "0"             # x8 -d (ms between requests)
+# arjun/x8 have NO total wall-clock cap of their own (arjun none; x8 --timeout is per-request), so a
+# slow/large target could run for hours — the feroxbuster-livelock lesson. PARAM_TOOL_TIMEOUT is the
+# hard per-tool backstop: on hit we keep whatever partial output was written (best-effort).
+PARAM_TOOL_TIMEOUT = 600   # seconds, per tool (arjun, x8) per app
 TECH_EXTENSIONS = {  # detected-tech keyword → file extensions to fuzz
     "php": ["php"],
     "asp.net": ["asp", "aspx", "ashx"],
@@ -148,9 +181,27 @@ SHORTSCAN_CONC = "20"  # shortscan -c concurrency (its default)
 _JSLUICE_BIN = Path.home() / "go" / "bin" / "jsluice"
 JSLUICE = str(_JSLUICE_BIN) if _JSLUICE_BIN.exists() else "jsluice"
 
+# secret-scanning fleet (mine_responses) — all best-effort, run ∥ over the extracted body corpus.
+# gitleaks/trufflehog in ~/go/bin, detect-secrets (pip) in ~/.local/bin. trufflehog runs with
+# --results=verified: it VALIDATES each hit against the credential's PROVIDER (network to AWS/GitHub/
+# …, not the target) → near-zero false positives. gitleaks (regex/any-file) + detect-secrets
+# (entropy, hashes only) are pure-offline recall layers; merge_secrets dedups across all sources.
+_GITLEAKS_BIN = Path.home() / "go" / "bin" / "gitleaks"
+GITLEAKS = str(_GITLEAKS_BIN) if _GITLEAKS_BIN.exists() else "gitleaks"
+_TRUFFLEHOG_BIN = Path.home() / "go" / "bin" / "trufflehog"
+TRUFFLEHOG = str(_TRUFFLEHOG_BIN) if _TRUFFLEHOG_BIN.exists() else "trufflehog"
+_DETECT_SECRETS_BIN = Path.home() / ".local" / "bin" / "detect-secrets"
+DETECT_SECRETS = str(_DETECT_SECRETS_BIN) if _DETECT_SECRETS_BIN.exists() else "detect-secrets"
+
 # crawley (the second crawler, run ∥ katana) lives in ~/go/bin.
 _CRAWLEY_BIN = Path.home() / "go" / "bin" / "crawley"
 CRAWLEY = str(_CRAWLEY_BIN) if _CRAWLEY_BIN.exists() else "crawley"
+
+# param_fuzz fleet (LOOP 3) — arjun (pip/uv, ~/.local/bin) ∥ x8 (cargo, ~/.cargo/bin). Best-effort.
+_ARJUN_BIN = Path.home() / ".local" / "bin" / "arjun"
+ARJUN = str(_ARJUN_BIN) if _ARJUN_BIN.exists() else "arjun"
+_X8_BIN = Path.home() / ".cargo" / "bin" / "x8"
+X8 = str(_X8_BIN) if _X8_BIN.exists() else "x8"
 
 # EyeWitness (optional, screenshot step) — known venv install (own .venv + Python/EyeWitness.py);
 # resolved by _eyewitness_cmd (overridable via PIPT_EYEWITNESS / `eyewitness` on PATH).
@@ -176,6 +227,13 @@ def honeypot_split(naabu_lines: list[str], threshold: int = HONEYPOT_MIN_OPEN_PO
     return valid, honeypots
 
 
+def select_web_ports(naabu_lines: list[str], valid_ips: list[str]) -> list[str]:
+    """Open `ip:port` lines on the VALID (non-honeypot) IPs — the FAST web target set httpx probes,
+    so the full 65535-port scan can move off the breadth critical path (it becomes spanning). Pure."""
+    valid = set(valid_ips)
+    return [ln for ln in naabu_lines if ":" in ln and ln.rsplit(":", 1)[0] in valid]
+
+
 def select_unique_webapps(httpx_records: list[dict]) -> list[str]:
     """Dedup httpx records by (Title, Content-Length, Webserver); return their URLs."""
     seen: set[tuple] = set()
@@ -198,6 +256,30 @@ def url_host(url: str) -> str:
 def is_ip(host: str) -> bool:
     parts = host.split(".")
     return len(parts) == 4 and all(p.isdigit() for p in parts)  # noqa: PLR2004
+
+
+def split_cdn_ip_records(records: list[dict], scope_ips: set[str]) -> tuple[list[dict], list[dict]]:
+    """Partition httpx records into (kept, dropped) for SCOPE HYGIENE (pure).
+
+    Drop a record ONLY when its host is a bare IP AND httpx flagged it CDN/cloud/WAF (cdncheck) —
+    that's a raw-IP probe of shared PROVIDER infra (out of scope: the IP belongs to the provider,
+    not the target; e.g. a Google frontend or an AWS ALB returning 421). KEEP:
+      - CDN-fronted HOSTNAMES (the real target behind a CDN/LB — scanned by name),
+      - self-hosted bare IPs (not CDN),
+      - any IP explicitly in `scope_ips` (user listed it → in scope, never dropped).
+    The dropped set is retained by the caller as an audit deliverable (excluded_cdn.jsonl). NB:
+    IPv4-only (is_ip); CDN over a bare IPv6 literal would slip through — acceptable for now.
+    """
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for r in records:
+        host = r.get("host") or url_host(r.get("url") or "")
+        is_cdn = bool(r.get("cdn")) or bool(r.get("cdn_name"))
+        if host and is_ip(host) and is_cdn and host not in scope_ips:
+            dropped.append(r)
+        else:
+            kept.append(r)
+    return kept, dropped
 
 
 def apex(host: str) -> str:
@@ -307,6 +389,24 @@ def tech_extensions(tech: list[str], mapping: dict[str, list[str]]) -> list[str]
     return tools.dedupe(out)
 
 
+def resolve_wl_mode(mode: str, custom_count: int, *, rich_threshold: int) -> str:
+    """Pick the wordlist strategy. An explicit 'targeted'/'broad' passes through; 'auto' (or anything
+    else) resolves by corpus richness: a rich custom corpus (>= rich_threshold app tokens) ⇒ 'targeted'
+    (lean on the app-specific list, cap the traditional ones), else 'broad' (opaque app ⇒ full lists)."""
+    if mode in ("targeted", "broad"):
+        return mode
+    return "targeted" if custom_count >= rich_threshold else "broad"
+
+
+def combine_wordlist(custom: list[str], traditional: list[list[str]], *, mode: str, cap: int) -> list[str]:
+    """Assemble the content-discovery wordlist. The custom layer (app-derived) always goes in FULL and
+    FIRST; the traditional layer (global content + tech CMS lists) rides along whole in 'broad', or
+    with each list capped to its top-`cap` in 'targeted' (SecLists are ~frequency-ordered, so top-N is
+    the high-value head). Deduped, custom-first preserved. Pure."""
+    trad = [w for lst in traditional for w in (lst if mode == "broad" else lst[:cap])]
+    return tools.dedupe([*custom, *trad])
+
+
 # response-header NAME present ⇒ signal (httpx normalizes header keys to snake_case lowercase)
 _HEADER_PRESENT = {
     "x_cache": "cache", "cf_cache_status": "cache", "x_varnish": "cache",
@@ -361,6 +461,39 @@ def parse_ferox(out: str) -> list[dict]:
     return records
 
 
+def select_new_urls(records: list[dict], seen: set[str], *, cap: int) -> list[str]:
+    """feroxbuster hits worth downloading+mining: 2xx/3xx URLs not already in the response store.
+
+    Dedups (order-preserving), drops anything in `seen` (already fetched) and non-2xx/3xx, and caps
+    the count to `cap` to bound a round's download fan-out — logging a WARNING when the cap actually
+    bites (no silent truncation). The frontier the content-discovery fixpoint feeds back. Pure."""
+    out: list[str] = []
+    picked: set[str] = set()
+    for r in records:
+        url, status = r.get("url"), r.get("status") or 0
+        if not url or url in seen or url in picked or not (200 <= status < 400):  # noqa: PLR2004
+            continue
+        picked.add(url)
+        out.append(url)
+    if len(out) > cap:
+        log.warning("⚠ content fixpoint: capping round delta %d→%d new url(s)", len(out), cap)
+        return out[:cap]
+    return out
+
+
+def merge_ferox_by_url(acc: list[dict], new: list[dict]) -> list[dict]:
+    """Accumulate feroxbuster `response` records across fixpoint rounds, deduped by url (first
+    wins), order preserved — the per-round merge that yields the single content_discovery.jsonl. Pure."""
+    seen = {r.get("url") for r in acc}
+    out = list(acc)
+    for r in new:
+        u = r.get("url")
+        if u and u not in seen:
+            seen.add(u)
+            out.append(r)
+    return out
+
+
 def parse_shortscan(out: str) -> list[str]:
     """Fuzz words from shortscan --output json 'result' records (schema: v0.9.2).
 
@@ -388,6 +521,32 @@ def parse_shortscan(out: str) -> list[str]:
         if short:
             words.append(short)
     return tools.dedupe(w.lower() for w in words if w.strip())
+
+
+def parse_shortscan_findings(out: str) -> list[dict]:
+    """Findings from shortscan `status` records with `vulnerable: true` — the IIS 8.3 short-name
+    (tilde) enumeration is itself an information-disclosure finding (one per vulnerable host). Pure.
+    (Surface words come from `parse_shortscan`; this is the dual-role's findings half.)"""
+    findings: list[dict] = []
+    for ln in out.splitlines():
+        text = ln.strip()
+        if not text:
+            continue
+        try:
+            r = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if r.get("type") == "status" and r.get("vulnerable"):
+            findings.append({
+                "type": "iis-tilde-enumeration",
+                "title": "IIS 8.3 short-name (tilde) enumeration",
+                "severity": "low",
+                "target": r.get("url"),
+                "server": r.get("server"),
+                "evidence": "shortscan: vulnerable",
+                "source": "shortscan",
+            })
+    return findings
 
 
 def parse_eyewitness_csv(text: str) -> list[dict]:
@@ -530,7 +689,7 @@ def expand(activity: Activity) -> None:
     """Phase 1 — expand the scope: split by kind, TLS/PTR harvest, wildcard enum.
 
     Reads scope/scope_init.txt; writes scope/scope_urls.txt, scope/scope_ip.txt
-    (mapcidr-expanded), tlsx_raw.txt, and scope/scope_dns.txt (the full candidate
+    (mapcidr-expanded), tls_names.txt, and scope/scope_dns.txt (the full candidate
     name set that `resolve` consumes).
     """
     targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8"))
@@ -553,7 +712,7 @@ def expand(activity: Activity) -> None:
     tls_names = _lines(
         _run("tlsx", ["tlsx", "-san", "-cn", "-silent", "-resp-only"],
              stdin="\n".join(naabu_tls),
-             dest=activity.asset_discovery_canonical("tlsx_raw.txt"), label="from_ports")
+             dest=activity.asset_discovery_canonical("tls_names.txt"), label="from_ports")
     )
     dns_names += _lines(
         _run("dnsx", ["dnsx", "-silent"],
@@ -581,7 +740,7 @@ def expand(activity: Activity) -> None:
 def resolve(activity: Activity) -> None:
     """Phase 2 — resolve candidate names to live subdomains; consolidate IPs.
 
-    Reads scope/scope_dns.txt, scope/scope_ip.txt, tlsx_raw.txt; writes
+    Reads scope/scope_dns.txt, scope/scope_ip.txt, tls_names.txt; writes
     subdomains.txt, unique_ips.txt, domain_ip_map.txt.
     """
     canon = activity.asset_discovery_canonical
@@ -596,7 +755,7 @@ def resolve(activity: Activity) -> None:
                  stdin=all_dns, dest=canon("subdomains.txt"), label="resolve_fallback")
         )
 
-    tls_names = tools.read_lines(canon("tlsx_raw.txt"))
+    tls_names = tools.read_lines(canon("tls_names.txt"))
     a_input = "\n".join([*subdomains, *tls_names])
     resolved_ips = _lines(
         _run("dnsx", ["dnsx", "-a", "-resp-only", "-silent"],
@@ -608,42 +767,71 @@ def resolve(activity: Activity) -> None:
 
 
 def portscan(activity: Activity) -> None:
-    """Phase 3 — tiered port scan (1k → honeypot filter → full) on unique IPs.
+    """Phase 3 — FAST port scan: top-1k → honeypot filter → naabu_web.txt (the web target set httpx
+    probes). Reads unique_ips.txt; writes honeypots.txt + naabu_web.txt (canonical).
 
-    Reads unique_ips.txt; writes naabu_1k.txt, honeypots.txt, naabu_full.txt.
-    """
+    The expensive full 65535-port scan is split into the SPANNING `portscan_full` stage so it no
+    longer serializes in front of httpx→cluster→loops (the observed ~15-min breadth block). top-1k
+    covers the common web ports (80/443/8080/8081/8443/…), so web coverage stays ~complete; exotic
+    non-web ports are picked up by portscan_full ∥ in the background (→ nerva). The top-1k stdout is
+    provenance (raw/naabu/), consumed in memory by honeypot_split/select_web_ports."""
     canon = activity.asset_discovery_canonical
     unique_ips = tools.read_lines(canon("unique_ips.txt"))
     naabu_1k = _lines(
         _run("naabu", ["naabu", "-silent", "-top-ports", "1000", "-exclude-cdn"],
-             stdin="\n".join(unique_ips), dest=canon("naabu_1k.txt"), label="top1k")
+             stdin="\n".join(unique_ips), dest=_raw(activity, "naabu", "top1k"), label="top1k")
     )
     valid_ips, honeypots = honeypot_split(naabu_1k)
     tools.write_lines(canon("honeypots.txt"), honeypots)
+    tools.write_lines(canon("naabu_web.txt"), select_web_ports(naabu_1k, valid_ips))
+
+
+def portscan_full(activity: Activity) -> None:
+    """SPANNING — full 65535-port scan on the valid (non-honeypot) IPs → naabu_full.txt, which feeds
+    nerva (non-HTTP service fingerprint). Launched after `portscan`, runs ∥ clustering + the per-app
+    loops, joined at the fan-in — off the critical path, since breadth→cluster→loops only needs the
+    fast top-1k web set (naabu_web.txt). Recomputes the valid set from disk (unique_ips minus
+    honeypots) — only strings cross the stage boundary."""
+    canon = activity.asset_discovery_canonical
+    honeypots = set(tools.read_lines(canon("honeypots.txt")))
+    valid = [ip for ip in tools.read_lines(canon("unique_ips.txt")) if ip not in honeypots]
     _run("naabu", ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn"],
-         stdin="\n".join(valid_ips), dest=canon("naabu_full.txt"), label="full")
+         stdin="\n".join(valid), dest=canon("naabu_full.txt"), label="full")
 
 
 def httpx_fingerprint(activity: Activity) -> None:
     """Phase 4a — HTTP fingerprinting (httpx) → httpx_full_metadata.jsonl + unique_webapps.txt.
 
-    Independent of nerva, so the two fingerprint stages run in parallel.
+    Independent of nerva, so the two fingerprint stages run in parallel. SCOPE HYGIENE: httpx flags
+    CDN/cloud/WAF hosts (cdncheck), and split_cdn_ip_records drops the raw-IP probes of that shared
+    PROVIDER infra (out of scope — the IP is the provider's, not the target's) while KEEPING the
+    CDN-fronted hostnames and any explicitly-in-scope IP. So the raw httpx dump (everything probed)
+    is provenance under raw/httpx/; the FILTERED records are the canonical metadata downstream reads
+    (cluster/nuclei/screenshot never see the dropped IPs); the dropped set is kept as the audit
+    deliverable excluded_cdn.jsonl (RoE evidence of what we deliberately skipped).
     """
     canon = activity.asset_discovery_canonical
     httpx_input = "\n".join(tools.dedupe([
-        *tools.read_lines(canon("tlsx_raw.txt")),
+        *tools.read_lines(canon("tls_names.txt")),
         *tools.read_lines(canon("subdomains.txt")),
-        *tools.read_lines(canon("naabu_full.txt")),
+        *tools.read_lines(canon("naabu_web.txt")),  # fast top-1k web set (full scan is now spanning)
         *tools.read_lines(canon("honeypots.txt")),
     ]))
     out = _run(
         "httpx",
         [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
          "-favicon", "-location", "-fr", "-irh", "-j"],
-        stdin=httpx_input, dest=canon("httpx_full_metadata.jsonl"), label="fingerprint",
+        stdin=httpx_input, dest=activity.asset_discovery_raw("httpx") / "fingerprint.jsonl",
+        label="fingerprint",
     )
     records = [json.loads(ln) for ln in out.splitlines() if ln.strip()]
-    tools.write_lines(canon("unique_webapps.txt"), select_unique_webapps(records))
+    kept, dropped = split_cdn_ip_records(records, set(tools.read_lines(activity.scope_ip)))
+    tools.write_jsonl(canon("httpx_full_metadata.jsonl"), kept)
+    tools.write_jsonl(canon("excluded_cdn.jsonl"), dropped)
+    if dropped:
+        log.info("  → scope: excluded %d raw-IP CDN/cloud target(s) (hostnames kept) → excluded_cdn.jsonl",
+                 len(dropped))
+    tools.write_lines(canon("unique_webapps.txt"), select_unique_webapps(kept))
 
 
 def nerva_fingerprint(activity: Activity) -> None:
@@ -846,66 +1034,87 @@ def _eyewitness_cmd() -> list[str] | None:
     return [str(venv_py), str(script)] if venv_py.exists() and script.exists() else None
 
 
-def _eyewitness(activity: Activity, ws: AppWorkspace, target: str, app_id: str) -> None:
-    """OPTIONAL — EyeWitness on the SINGLE best-host `target` (like httpx, one URL per group):
-    screenshot + signature-based default-cred detection. Fed via a one-line -f file — the -f report
-    path is the one that writes Requests.csv (--single skips it). Parses Requests.csv →
-    default_creds.jsonl (the leads); the HTML report stays under raw/eyewitness/. No-op when
-    EyeWitness isn't resolvable (best-effort)."""
+def reconcile_by_url(index_entries: list[tuple[str, str]], url_to_app: dict[str, str]) -> dict[str, str]:
+    """Map app_id → file by crossing a `-srd` index ([(file, url)]) with our url→app_id candidate map.
+    URLs are matched trailing-slash-insensitively; first file per app wins (one candidate/group). Pure."""
+    norm = {u.rstrip("/"): a for u, a in url_to_app.items()}
+    out: dict[str, str] = {}
+    for file, url in index_entries:
+        app_id = norm.get(url.rstrip("/"))
+        if app_id and app_id not in out:
+            out[app_id] = file
+    return out
+
+
+def _eyewitness_batch(activity: Activity, url_to_app: dict[str, str]) -> None:
+    """OPTIONAL — ONE EyeWitness run over every candidate URL (one per group): a unified report.html
+    + Requests.csv. The signature-based default-cred leads are split back per group (url→app_id) →
+    scans/<app_id>/default_creds.jsonl. Best-effort (no-op if EyeWitness isn't resolvable); batching a
+    single run avoids the per-group Selenium startup cost."""
     cmd = _eyewitness_cmd()
     if cmd is None:
-        log.debug("  · skip eyewitness (not installed) for %s", app_id)
+        log.debug("  · skip eyewitness (not installed)")
         return
-    out_dir = ws.raw("eyewitness")
+    out_dir = activity.screenshots / "eyewitness"
     if out_dir.exists():
         shutil.rmtree(out_dir)  # EyeWitness wants a fresh -d (else it prompts / appends)
-    target_file = activity.tmp / f"eyewitness_{app_id}.txt"
-    tools.write_lines(target_file, [target])
-    log.info("  → eyewitness (%s) — %s", app_id, target)
-    tools.run(
-        [*cmd, "--web", "-f", str(target_file), "-d", str(out_dir), "--no-prompt",
-         "--timeout", EYEWITNESS_TIMEOUT],
-        stream_stderr=is_verbose(),
-    )
+    target_file = activity.tmp / "eyewitness_targets.txt"
+    tools.write_lines(target_file, list(url_to_app))
+    log.info("  → eyewitness — %d url(s), batched", len(url_to_app))
+    tools.run([*cmd, "--web", "-f", str(target_file), "-d", str(out_dir), "--no-prompt",
+               "--timeout", EYEWITNESS_TIMEOUT], stream_stderr=is_verbose())
     csv_path = out_dir / "Requests.csv"
-    findings = (parse_eyewitness_csv(csv_path.read_text(encoding="utf-8", errors="replace"))
-                if csv_path.exists() else [])
-    n = tools.write_jsonl(ws.canonical("default_creds.jsonl"), findings)
+    rows = (parse_eyewitness_csv(csv_path.read_text(encoding="utf-8", errors="replace"))
+            if csv_path.exists() else [])
+    norm = {u.rstrip("/"): a for u, a in url_to_app.items()}
+    by_app: dict[str, list[dict]] = {}
+    for row in rows:
+        app_id = norm.get((row.get("url") or "").rstrip("/"))
+        if app_id:
+            by_app.setdefault(app_id, []).append(row)
+    n = sum(tools.write_jsonl(activity.app(a).canonical("default_creds.jsonl"), leads)
+            for a, leads in by_app.items())
     if n:
-        log.info("    eyewitness (%s) → %d default-cred lead(s) → default_creds.jsonl", app_id, n)
+        log.info("    eyewitness → report.html · %d default-cred lead(s) across %d group(s)", n, len(by_app))
 
 
-def screenshot(activity: Activity, app_id: str) -> None:
-    """LOOP 1 (first step) — root-page screenshot + (optional) EyeWitness default-cred detection.
+def screenshot_all(activity: Activity) -> None:
+    """SPANNING post-cluster — ONE batched screenshot run over a single best-host candidate per app
+    group, so the tools' NATIVE aggregate reports give a UNIFIED gallery (no hand-built HTML).
 
-    Captures the cluster's best host (non-IP preferred; see best_host) via httpx -screenshot →
-    the canonical scans/<app_id>/screenshot.png (or a screenshot.failed marker). Then, best-effort,
-    runs EyeWitness on the SAME single best host for its signature-based default-credential leads
-    (→ default_creds.jsonl) plus an HTML report — skipped cleanly if EyeWitness isn't installed,
-    so httpx stays the reliable screenshot baseline. No needs — runs right after cluster fan-out.
+    httpx `-ss -srd <activity>/screenshots -svrc` over all candidates writes
+    screenshots/screenshot/screenshot.html (the gallery) + per-host PNGs + index_screenshot.txt;
+    EyeWitness (optional) writes its own report.html + Requests.csv. Each screenshot is then
+    reconciled back to scans/<app_id>/screenshot.png by URL (via the index — no hash-guessing), and
+    EyeWitness's default-cred leads are split per group. Runs ∥ the per-app loops (cluster_scope): it
+    reads only the cluster's meta/hosts and writes distinct filenames, so there's no race.
     """
-    ws = activity.app(app_id)
-    target = best_host(tools.read_lines(ws.hosts))
-    if not target:
-        log.debug("  · skip screenshot (no host) for %s", app_id)
+    apps = activity.list_apps()
+    url_to_app = {t: ws.root.name for ws in apps if (t := best_host(tools.read_lines(ws.hosts)))}
+    if not url_to_app:
+        log.debug("  · skip screenshot (no candidates)")
         return
-    store = ws.raw("httpx_screenshot")
+    store = activity.screenshots
     store.mkdir(parents=True, exist_ok=True)
-    log.info("  → screenshot (%s) — %s", app_id, target)
-    out = tools.run(
-        [HTTPX, "-screenshot", "-system-chrome", "-no-screenshot-full-page", "-esb",
-         "-st", SCREENSHOT_TIMEOUT, "-silent", "-j", "-srd", str(store)],
-        stdin=target, stream_stderr=is_verbose(),
+    log.info("▶ screenshot — %d candidate(s) (one per group), batched", len(url_to_app))
+    tools.run(
+        [HTTPX, "-ss", "-system-chrome", "-no-screenshot-full-page", "-st", SCREENSHOT_TIMEOUT,
+         "-silent", "-srd", str(store), "-svrc"],
+        stdin="\n".join(url_to_app), stream_stderr=is_verbose(),
     )
-    (store / "out.json").write_text(out, encoding="utf-8")
-    pngs = sorted(store.rglob("*.png"))
-    if pngs:
-        shutil.copy(pngs[0], ws.canonical("screenshot.png"))
-        log.info("    screenshot (%s) → screenshot.png", app_id)
-    else:
-        ws.canonical("screenshot.failed").write_text("", encoding="utf-8")
-        log.info("    screenshot (%s) → screenshot.failed", app_id)
-    _eyewitness(activity, ws, target, app_id)
+    shot_dir = store / "screenshot"
+    by_app = reconcile_by_url(_store_index(shot_dir / "index_screenshot.txt"), url_to_app)
+    n_shot = 0
+    for ws in apps:
+        rel = by_app.get(ws.root.name)
+        if rel:  # COPY (the gallery keeps its own pngs) → per-group reconciled artifact
+            shutil.copy(shot_dir / rel, ws.canonical("screenshot.png"))
+            n_shot += 1
+        else:
+            ws.canonical("screenshot.failed").write_text("", encoding="utf-8")
+    log.info("    screenshot → %s · %d/%d group(s) reconciled",
+             shot_dir / "screenshot.html", n_shot, len(url_to_app))
+    _eyewitness_batch(activity, url_to_app)
 
 
 def passive_probe(activity: Activity, app_id: str) -> None:
@@ -937,7 +1146,7 @@ def _run_katana(ws: AppWorkspace, hosts: list[str], app_id: str) -> list[str]:
            "-fs", "fqdn", "-d", KATANA_DEPTH, "-c", KATANA_CONC,
            "-omit-raw", "-omit-body", "-srd", str(ws.responses)]
     out = _run("katana", cmd, stdin="\n".join(hosts),
-               dest=ws.raw("katana") / "out.jsonl", label=app_id)
+               dest=ws.raw("katana") / "crawl" / "out.jsonl", label=app_id)
     return parse_katana(out)
 
 
@@ -1046,7 +1255,7 @@ def crawl_headless(activity: Activity, app_id: str) -> None:
              app_id, len(hosts), HEADLESS_PARALLELISM)
     with _HEADLESS_SLOTS:
         out = _run("katana-headless", cmd, stdin="\n".join(hosts),
-                   dest=ws.raw("katana_headless") / "out.jsonl", label=app_id)
+                   dest=ws.raw("katana") / "headless" / "out.jsonl", label=app_id)
     tools.write_lines(ws.canonical("endpoints_headless.txt"), denoise(parse_katana(out)))
 
 
@@ -1084,7 +1293,7 @@ def takeover(activity: Activity, app_id: str) -> None:
     if not candidates:
         log.debug("  · skip subjack (no candidates) for %s", app_id)
         return
-    cand_file = ws.canonical("takeover_candidates.txt")
+    cand_file = ws.raw("subjack") / "candidates.txt"  # subjack -w input (provenance, not canonical)
     tools.write_lines(cand_file, candidates)
     log.info("  → subjack (%s) — %d candidate(s)", app_id, len(candidates))
     out = tools.run(
@@ -1100,28 +1309,21 @@ def takeover(activity: Activity, app_id: str) -> None:
 
 # --- LOOP 2 (content discovery) — runs after the loop-1 barrier ---
 def build_wordlist(activity: Activity, app_id: str) -> None:
-    """LOOP 2.1 — synthesize a custom per-app wordlist (wl_custom/seed.txt) OFFLINE.
+    """LOOP 2.1 — synthesize the per-app CUSTOM wordlist (wl_custom/seed.txt) OFFLINE.
 
-    No fetching: the crawl (loop 1) already downloaded and JS-parsed the linked
-    surface — its JS-discovered endpoints and robots/sitemap paths are already in
-    endpoints.txt, and the bodies are under responses/. This step tokenizes
-    endpoints.txt (plus the gated headless crawl's endpoints_headless.txt, when present)
-    into path segments, filename basenames and parameter names (tokenize_urls) and
-    merges any tech-specific static lists keyed on the cluster's detected tech. Output:
-    scans/<app_id>/wl_custom/seed.txt (the activity wl_global/ holds shared/global lists
-    instead). Reads loop-1 artifacts directly — the cross-loop barrier guarantees they exist.
+    No fetching: the crawl (loop 1) already downloaded and JS-parsed the linked surface — its
+    JS-discovered endpoints and robots/sitemap paths are already in endpoints.txt. This step
+    tokenizes endpoints.txt (plus the gated headless crawl's endpoints_headless.txt, when present)
+    into path segments, filename basenames and parameter names (tokenize_urls). Output is
+    **app-derived tokens only** — the traditional layer (global content + tech CMS lists) is added
+    later by content_discovery's combine, so 'custom' stays genuinely custom (see resolve_wl_mode /
+    combine_wordlist). Reads loop-1 artifacts directly — the cross-loop barrier guarantees they exist.
     """
     ws = activity.app(app_id)
     words = tokenize_urls([*tools.read_lines(ws.canonical("endpoints.txt")),
                            *tools.read_lines(ws.canonical("endpoints_headless.txt"))])
-
-    tech = workspace.read_meta(ws.meta).get("tech") or []
-    static: list[str] = []
-    for wl_file in wordlists.tech_role_paths(tech, activity.wl_global):
-        static += tools.read_lines(wl_file)
-
-    n = tools.write_lines(ws.wl_custom / "seed.txt", [*words, *static])
-    log.info("  → wordlist (%s) — %d term(s) (+%d tech), offline → wl_custom/seed.txt", app_id, n, len(static))
+    n = tools.write_lines(ws.wl_custom / "seed.txt", words)
+    log.info("  → wordlist (%s) — %d app token(s), offline → wl_custom/seed.txt", app_id, n)
 
 
 def fetch_delta(activity: Activity, app_id: str) -> None:
@@ -1136,8 +1338,7 @@ def fetch_delta(activity: Activity, app_id: str) -> None:
     barrier guarantees they exist.
     """
     ws = activity.app(app_id)
-    have = [url for idx in (ws.responses / "index.txt", ws.responses / "headless" / "index.txt")
-            for _, url in _store_index(idx)]  # bodies katana stored (cheap + headless crawl)
+    have = [url for idx in _all_store_indices(ws) for _, url in _store_index(idx)]  # already stored
     delta = passive_delta(
         [*tools.read_lines(ws.canonical("endpoints_passive.txt")),
          *tools.read_lines(ws.canonical("endpoints_crawley.txt"))],
@@ -1149,7 +1350,7 @@ def fetch_delta(activity: Activity, app_id: str) -> None:
     store = ws.responses / "osint"
     store.mkdir(parents=True, exist_ok=True)
     _run("httpx", [HTTPX, "-silent", "-srd", str(store), "-rl", OSINT_FETCH_RL],
-         stdin="\n".join(delta), dest=ws.raw("httpx_osint") / "out.txt", label=app_id)
+         stdin="\n".join(delta), dest=ws.raw("httpx") / "osint" / "out.txt", label=app_id)
 
 
 def _store_index(index: Path) -> list[tuple[str, str]]:
@@ -1161,6 +1362,17 @@ def _store_index(index: Path) -> list[tuple[str, str]]:
         if len(parts) >= 2:  # noqa: PLR2004
             out.append((parts[0], parts[1]))
     return out
+
+
+def _all_store_indices(ws: AppWorkspace) -> list[Path]:
+    """Every -srd store index under responses/ — katana cheap (responses/index.txt) + headless +
+    httpx osint + the content-discovery fixpoint's discovered/round*/ stores. Globbed so the corpus
+    is SELF-DESCRIBING: a new store is picked up automatically by fetch_delta's `have` set,
+    _extract_bodies and the fixpoint's `seen` set, with no hardcoded path list to keep in sync.
+    Returns [] before responses/ exists. Sorted for determinism."""
+    if not ws.responses.exists():
+        return []
+    return sorted(ws.responses.rglob("index.txt"))
 
 
 def _jsonl_str(out: str) -> list[dict]:
@@ -1176,62 +1388,202 @@ def _jsonl_str(out: str) -> list[dict]:
     return recs
 
 
-def mine_responses(activity: Activity, app_id: str) -> None:
-    """LOOP 2 — mine the per-app response store OFFLINE (cashes in 'fetch once').
+# --- secret-finding normalizers/parsers (pure; one shape: sources·type·secret·hash·file·line·verified) ---
+def _norm_jsluice_secret(rec: dict) -> dict:
+    """jsluice `secrets` record ({kind,data,filename,severity}) → the common secret shape."""
+    data = rec.get("data")
+    secret = data if isinstance(data, str) else (json.dumps(data, sort_keys=True) if data else None)
+    return {"sources": ["jsluice"], "type": rec.get("kind") or "secret", "secret": secret,
+            "file": Path(rec.get("filename") or "").name or None, "line": None,
+            "verified": False, "severity": rec.get("severity")}
 
-    Reads the stored HTTP responses (cheap crawl + headless crawl + fetch_delta -srd)
-    WITHOUT re-fetching: extracts each JS body (http_body) and runs jsluice for endpoints
-    (→ endpoints_js.txt, folded into the content_discovery wordlist) and secrets
-    (→ secrets.jsonl). Needs fetch_delta so the OSINT bodies are present; the crawl bodies
-    are guaranteed by the loop barrier. Port of run-web-sast.sh, but AST-based via jsluice.
-    """
-    ws = activity.app(app_id)
-    js_dir = ws.raw("js")
-    js_files: list[str] = []
-    for index in (ws.responses / "index.txt", ws.responses / "headless" / "index.txt",
-                  ws.responses / "osint" / "response" / "index.txt"):
+
+def parse_gitleaks(text: str) -> list[dict]:
+    """gitleaks `-f json` report (array of {RuleID,Secret,File,StartLine}) → common shape."""
+    try:
+        rows = json.loads(text) if text.strip() else []
+    except json.JSONDecodeError:
+        return []
+    return [{"sources": ["gitleaks"], "type": r.get("RuleID") or "secret",
+             "secret": r.get("Secret") or None, "file": Path(r.get("File") or "").name or None,
+             "line": r.get("StartLine"), "verified": False} for r in rows]
+
+
+def parse_trufflehog(text: str) -> list[dict]:
+    """trufflehog filesystem --json NDJSON → common shape (Verified carried through)."""
+    out: list[dict] = []
+    for r in _jsonl_str(text):
+        fs = ((r.get("SourceMetadata") or {}).get("Data") or {}).get("Filesystem") or {}
+        out.append({"sources": ["trufflehog"], "type": r.get("DetectorName") or "secret",
+                    "secret": r.get("Raw") or r.get("Redacted") or None,
+                    "file": Path(fs.get("file") or "").name or None, "line": fs.get("line"),
+                    "verified": bool(r.get("Verified"))})
+    return out
+
+
+def parse_detect_secrets(text: str) -> list[dict]:
+    """detect-secrets `scan` JSON ({results:{file:[{type,hashed_secret,line_number}]}}) → common
+    shape. detect-secrets emits only the HASH (no raw value) — kept as a typed lead."""
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError:
+        return []
+    out: list[dict] = []
+    for fname, hits in (data.get("results") or {}).items():
+        out += [{"sources": ["detect-secrets"], "type": h.get("type") or "secret", "secret": None,
+                 "hash": h.get("hashed_secret"), "file": Path(fname).name or None,
+                 "line": h.get("line_number"), "verified": bool(h.get("is_verified"))} for h in hits]
+    return out
+
+
+def merge_secrets(records: list[dict]) -> list[dict]:
+    """Dedup secret findings across tools by (file, raw-secret | #hash | #type); union `sources`
+    and OR `verified`. Deterministic order (sorted), so the same corpus always yields the same file."""
+    ordered = sorted(records, key=lambda r: (r.get("file") or "", r.get("type") or "",
+                                             str(r.get("secret") or r.get("hash") or "")))
+    by_key: dict[tuple, dict] = {}
+    for r in ordered:
+        ident = r.get("secret") or (f"#{r['hash']}" if r.get("hash") else f"#{r.get('type')}")
+        key = (r.get("file"), ident)
+        if key in by_key:
+            cur = by_key[key]
+            cur["sources"] = sorted(set(cur["sources"]) | set(r.get("sources", [])))
+            cur["verified"] = bool(cur.get("verified") or r.get("verified"))
+        else:
+            by_key[key] = {**r, "sources": sorted(set(r.get("sources", [])))}
+    return list(by_key.values())
+
+
+# --- offline corpus prep + the parallel secret-scanning fleet ---
+def _extract_bodies(ws: AppWorkspace) -> tuple[Path | None, list[str]]:
+    """Write every NOT-YET-EXTRACTED stored response BODY to raw/extracted/ — JS as .js (the new ones
+    returned, for jsluice), everything else as .html. IDEMPOTENT: a dst that already exists is
+    skipped, so the content-discovery fixpoint can call this once per round and get back only THAT
+    round's new JS to mine (no re-extraction, no re-mining). Reads every -srd store via
+    _all_store_indices (auto-covers the discovered/ rounds). Returns (bodies_dir, new_js_files), or
+    (None, []) when the corpus is still empty."""
+    bodies = ws.raw("extracted")
+    new_js: list[str] = []
+    for index in _all_store_indices(ws):
         for stored, url in _store_index(index):
-            if not is_js_url(url):
-                continue
+            is_js = is_js_url(url)
+            dst = bodies / f"{Path(stored).stem}.{'js' if is_js else 'html'}"
+            if dst.exists():
+                continue  # already extracted in an earlier call/round — idempotent
             body = http_body(Path(stored).read_text(encoding="utf-8", errors="replace"))
             if not body.strip():
                 continue
-            js_dir.mkdir(parents=True, exist_ok=True)
-            dst = js_dir / f"{Path(stored).stem}.js"
+            bodies.mkdir(parents=True, exist_ok=True)
             dst.write_text(body, encoding="utf-8")
-            js_files.append(str(dst))
-    if not js_files:
-        log.debug("  · skip mine_responses (no JS in store) for %s", app_id)
+            if is_js:
+                new_js.append(str(dst))
+    has_corpus = bodies.exists() and any(bodies.iterdir())
+    return (bodies, new_js) if has_corpus else (None, [])
+
+
+def _run_jsluice_secrets(js_files: list[str]) -> list[dict]:
+    if not js_files or shutil.which(JSLUICE) is None:
+        return []
+    return [_norm_jsluice_secret(r) for r in _jsonl_str(tools.run([JSLUICE, "secrets", *js_files]))]
+
+
+def _jsluice_urls(js_files: list[str]) -> list[str]:
+    """jsluice endpoint extraction over JS files (best-effort; [] if none, or jsluice is absent).
+    Reused by mine_responses (round 0) and the content_discovery fixpoint (each feedback round)."""
+    if not js_files or shutil.which(JSLUICE) is None:
+        return []
+    return [r["url"] for r in _jsonl_str(tools.run([JSLUICE, "urls", *js_files])) if r.get("url")]
+
+
+def _run_gitleaks(ws: AppWorkspace, bodies: Path, app_id: str) -> list[dict]:
+    if shutil.which(GITLEAKS) is None:
+        log.debug("  · skip gitleaks (not installed) for %s", app_id)
+        return []
+    report = ws.raw("gitleaks") / "report.json"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    tools.run([GITLEAKS, "detect", "--no-git", "-s", str(bodies), "-f", "json", "-r", str(report)],
+              stream_stderr=is_verbose())
+    return parse_gitleaks(report.read_text(encoding="utf-8") if report.exists() else "")
+
+
+def _run_trufflehog(bodies: Path, app_id: str) -> list[dict]:
+    if shutil.which(TRUFFLEHOG) is None:
+        log.debug("  · skip trufflehog (not installed) for %s", app_id)
+        return []
+    # --results=verified VALIDATES each hit against its provider (network to AWS/GitHub/…)
+    out = tools.run([TRUFFLEHOG, "filesystem", str(bodies), "--json", "--results=verified"],
+                    stream_stderr=is_verbose())
+    return parse_trufflehog(out)
+
+
+def _run_detect_secrets(bodies: Path, app_id: str) -> list[dict]:
+    if shutil.which(DETECT_SECRETS) is None:
+        log.debug("  · skip detect-secrets (not installed) for %s", app_id)
+        return []
+    # --all-files scans recursively (default = only git-tracked files → nothing here); it honors the
+    # CWD ('.'), not an absolute path arg — so run from inside the bodies dir.
+    return parse_detect_secrets(tools.run([DETECT_SECRETS, "scan", "--all-files", "."],
+                                          cwd=bodies, stream_stderr=is_verbose()))
+
+
+def _secret_fleet(ws: AppWorkspace, bodies: Path, js_files: list[str], app_id: str) -> list[dict]:
+    """Run the secret scanners CONCURRENTLY (independent, I/O-/network-bound) over the body corpus
+    and return their flattened findings — jsluice (JS AST) ∥ gitleaks (regex/any-file) ∥ trufflehog
+    (verified) ∥ detect-secrets (entropy/hashes). Each is best-effort (skipped if its binary is absent)."""
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(_run_jsluice_secrets, js_files),
+            pool.submit(_run_gitleaks, ws, bodies, app_id),
+            pool.submit(_run_trufflehog, bodies, app_id),
+            pool.submit(_run_detect_secrets, bodies, app_id),
+        ]
+        return [rec for f in futures for rec in f.result()]
+
+
+def mine_responses(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — mine the per-app response store OFFLINE for ENDPOINTS (cashes in 'fetch once').
+
+    Extracts every stored response body (cheap crawl + headless + fetch_delta) to raw/extracted/
+    WITHOUT re-fetching, then runs jsluice over the JS for endpoints (→ endpoints_js.txt), folded
+    into the round-0 content_discovery wordlist. Needs fetch_delta so the OSINT bodies are present;
+    the crawl bodies are guaranteed by the loop barrier.
+
+    Secret scanning is NOT here: the fleet runs ONCE at the tail of content_discovery, over the
+    corpus the fixpoint's downloads complete — so it also covers feroxbuster-discovered files, which
+    mine_responses (running before the fuzzing) never sees. raw/extracted/ is extended incrementally
+    (idempotent _extract_bodies), so the final fleet sees everything this step already wrote.
+    """
+    ws = activity.app(app_id)
+    bodies, js_files = _extract_bodies(ws)
+    if bodies is None:
+        log.debug("  · skip mine_responses (empty response store) for %s", app_id)
         return
-    endpoints = [r["url"] for r in _jsonl_str(tools.run([JSLUICE, "urls", *js_files])) if r.get("url")]
-    secrets = _jsonl_str(tools.run([JSLUICE, "secrets", *js_files]))
-    n_ep = tools.write_lines(ws.canonical("endpoints_js.txt"), endpoints)
-    n_sec = tools.write_jsonl(ws.canonical("secrets.jsonl"), secrets)
-    log.info("  → mine_responses (%s) — %d JS · %d endpoint(s) · %d secret(s)",
-             app_id, len(js_files), n_ep, n_sec)
+    n_ep = tools.write_lines(ws.canonical("endpoints_js.txt"), _jsluice_urls(js_files))
+    log.info("  → mine_responses (%s) — %d JS → %d endpoint(s) → endpoints_js.txt",
+             app_id, len(js_files), n_ep)
 
 
-def _shortscan_surface(activity: Activity, ws: AppWorkspace, app_id: str) -> list[str]:
-    """IIS 8.3 short-name enumeration → fuzz words (shortscan + shortutil rainbow).
+def _shortscan_surface(activity: Activity, ws: AppWorkspace, app_id: str) -> tuple[list[str], list[dict]]:
+    """IIS 8.3 short-name enumeration — DUAL-ROLE, one run: returns (surface words, findings).
 
-    Builds a shortutil rainbow table from the per-app seed + global list so shortscan
-    resolves the leaked 8.3 names to real filenames (on top of its HTTP autocomplete
-    oracles), then harvests those names as surface. Best-effort: no-op if the binaries
-    are missing or the app has no hosts.
+    Builds a shortutil rainbow table from the per-app seed + global list so shortscan resolves the
+    leaked 8.3 names to real filenames (on top of its HTTP autocomplete oracles), then harvests those
+    names as SURFACE (parse_shortscan) AND the IIS-tilde-enumeration FINDING per vulnerable host
+    (parse_shortscan_findings) from the same JSON. Best-effort: ([], []) if binaries missing / no hosts.
     """
     if shutil.which(SHORTSCAN) is None or shutil.which(SHORTUTIL) is None:
         log.debug("  · skip shortscan (not installed) for %s", app_id)
-        return []
+        return [], []
     hosts = tools.read_lines(ws.hosts)
     if not hosts:
-        return []
+        return [], []
     content_wl = wordlists.role_path(activity, "content")
-    rainbow_src = ws.wl_custom / "rainbow_src.txt"
+    rainbow_src = ws.raw("shortscan") / "rainbow_src.txt"  # shortutil scratch (not a wl product)
     tools.write_lines(rainbow_src, [
         *tools.read_lines(ws.wl_custom / "seed.txt"),
         *(tools.read_lines(content_wl) if content_wl else []),
     ])
-    rainbow = ws.wl_custom / "rainbow.txt"
+    rainbow = ws.raw("shortscan") / "rainbow.txt"
     rainbow.write_text(tools.run([SHORTUTIL, "wordlist", str(rainbow_src)]), encoding="utf-8")
     hosts_file = ws.raw("shortscan") / "hosts.txt"
     tools.write_lines(hosts_file, hosts)
@@ -1242,16 +1594,19 @@ def _shortscan_surface(activity: Activity, ws: AppWorkspace, app_id: str) -> lis
         stream_stderr=is_verbose(),
     )
     (ws.raw("shortscan") / "out.json").write_text(out, encoding="utf-8")
-    return parse_shortscan(out)
+    return parse_shortscan(out), parse_shortscan_findings(out)
 
 
 def tech_enum(activity: Activity, app_id: str) -> None:
     """LOOP 2 (surface) — specialized per-stack scanners whose output FEEDS enum.
 
     Best-effort dispatch keyed on the cluster's detected tech: a scanner runs only if
-    its tech matched AND its binary is installed. Output is SURFACE (fuzz words) →
-    wl_custom/shortnames.txt, which content_discovery merges into its wordlist. Scanners whose
-    output is findings-only (wpprobe, nuclei, …) belong to tech_vulnscan / loop 3.
+    its tech matched AND its binary is installed. Primary output is SURFACE (fuzz words) →
+    wl_custom/shortnames.txt, which content_discovery merges into its wordlist. A scanner may also be
+    DUAL-ROLE and emit findings: shortscan's IIS 8.3 short-name enumeration is itself an
+    information-disclosure finding → tilde_enum.jsonl (a dedicated artifact; the general findings
+    model/consolidate is backlog #4). Findings-only scanners (wpprobe, nuclei, …) belong to
+    tech_vulnscan / loop 3.
 
     Today: shortscan (IIS/ASP.NET 8.3 short-name enumeration). Reads loop-1 hosts
     across the barrier; needs the wordlist seed for the shortutil rainbow table.
@@ -1259,26 +1614,155 @@ def tech_enum(activity: Activity, app_id: str) -> None:
     ws = activity.app(app_id)
     tech = " ".join(workspace.read_meta(ws.meta).get("tech") or []).lower()
     surface: list[str] = []
+    findings: list[dict] = []
     if any(k in tech for k in ("iis", "asp.net", "microsoft-iis")):
-        surface += _shortscan_surface(activity, ws, app_id)
+        surface, findings = _shortscan_surface(activity, ws, app_id)
     n = tools.write_lines(ws.wl_custom / "shortnames.txt", surface)
-    log.info("  → tech_enum (%s) — %d surface term(s) → wl_custom/shortnames.txt", app_id, n)
+    if findings:  # per-app findings/ folder (#4 consolidate will lift these to <activity>/findings/)
+        tools.write_jsonl(ws.findings / "tilde_enum.jsonl", findings)
+    log.info("  → tech_enum (%s) — %d surface term(s) → shortnames.txt%s", app_id, n,
+             f" · {len(findings)} finding(s) → findings/tilde_enum.jsonl" if findings else "")
+
+
+def _dur_seconds(spec: str) -> int:
+    """Parse a feroxbuster-style duration ('20m', '300s', '1h') to seconds. Pure."""
+    s = spec.strip().lower()
+    unit = {"s": 1, "m": 60, "h": 3600}.get(s[-1:], 1)
+    return int(s[:-1] if s[-1:] in "smh" else s) * unit
+
+
+def _ferox_time_limit(round_idx: int, remaining_s: float) -> str:
+    """feroxbuster --time-limit for a fixpoint round: round 0 keeps the full FEROX_TIME_LIMIT (the
+    essential baseline pass); a feedback round gets min(DEEP_FEROX_TIME_LIMIT, remaining budget)."""
+    if round_idx == 0:
+        return FEROX_TIME_LIMIT
+    return f"{max(1, int(min(_dur_seconds(DEEP_FEROX_TIME_LIMIT), remaining_s)))}s"
+
+
+def _run_ferox(ws: AppWorkspace, hosts: list[str], words: list[str], round_idx: int,
+               *, remaining: float) -> list[dict]:
+    """One feroxbuster forced-browse pass over `hosts` with `words` → parsed `response` records.
+
+    Writes the round wordlist + raw JSON under wl_custom/ and raw/feroxbuster/ (feroxbuster writes
+    JSON to -o, not stdout, so it bypasses _run). --smart brings auto-tune soft-404 calibration +
+    collect-words/backups + link extraction/recursion. --time-limit is the hard cap that breaks
+    --smart's backoff livelock (the scanme.nmap.org incident). Returns [] for an empty wordlist."""
+    app_id = ws.root.name
+    wordlist = ws.wl_custom / f"round{round_idx}.txt"
+    n_wl = tools.write_lines(wordlist, words)
+    if not n_wl:
+        return []
+    exts = tech_extensions(workspace.read_meta(ws.meta).get("tech") or [], TECH_EXTENSIONS)
+    ext_args = ["-x", *exts] if exts else []
+    out_file = ws.raw("feroxbuster") / f"round{round_idx}.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    tl = _ferox_time_limit(round_idx, remaining)
+    log.info("  → feroxbuster (%s) r%d — %d host(s), %d term(s), --time-limit %s",
+             app_id, round_idx, len(hosts), n_wl, tl)
+    cmd = [FEROX, "--stdin", "--silent", "--json", "-o", str(out_file), "--no-state", "-k",
+           "--smart", "-t", FEROX_THREADS, "-L", FEROX_SCAN_LIMIT, "--timeout", FEROX_TIMEOUT,
+           "--time-limit", tl, "-d", FEROX_DEPTH, "-w", str(wordlist), *ext_args]
+    tools.run(cmd, stdin="\n".join(hosts), stream_stderr=is_verbose())
+    return parse_ferox(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
+
+
+def _download_and_mine(ws: AppWorkspace, urls: list[str], round_idx: int) -> list[str]:
+    """Download `urls` into responses/discovered/round<r>/ (httpx -srd), extract+mine their NEW
+    bodies, and return the grown fuzz tokens (jsluice endpoints + the urls' own paths/params),
+    tokenized — the next round's frontier. The downloaded bodies also join the corpus the final
+    secret fleet scans."""
+    app_id = ws.root.name
+    store = ws.responses / "discovered" / f"round{round_idx}"
+    store.mkdir(parents=True, exist_ok=True)
+    _run("httpx", [HTTPX, "-silent", "-srd", str(store), "-rl", OSINT_FETCH_RL],
+         stdin="\n".join(urls), dest=ws.raw("httpx") / "discovered" / f"round{round_idx}.txt",
+         label=f"{app_id} r{round_idx}")
+    _, new_js = _extract_bodies(ws)
+    return tokenize_urls([*_jsluice_urls(new_js), *urls])
+
+
+def _content_rounds(ws: AppWorkspace, hosts: list[str], frontier: list[str]) -> tuple[list[dict], int, str]:
+    """Drive the bounded content-discovery FIXPOINT and return (merged hits, rounds run, stop reason).
+
+    Round 0 fuzzes the combined wordlist; each feedback round fuzzes ONLY the NEW token delta, then
+    downloads+mines its hits to grow the frontier. Four independent stops keep it convergent:
+    wordlist-fixpoint (no new words), deadline (per-app wall-clock), round-cap (CONTENT_FEEDBACK_
+    ROUNDS), url-fixpoint (no new urls), diminishing-returns (< MIN_NEW_TOKENS). A token is never
+    re-fuzzed (`fuzzed`); a URL never re-downloaded (`seen`, from the -srd store indices)."""
+    app_id = ws.root.name
+    fuzzed: set[str] = set()
+    seen = {url for idx in _all_store_indices(ws) for _, url in _store_index(idx)}
+    hits: list[dict] = []
+    deadline = time.monotonic() + CONTENT_DEADLINE_S
+    rounds, stop = 0, "round-cap"
+    for r in range(CONTENT_FEEDBACK_ROUNDS + 1):
+        new_words = [w for w in tools.dedupe(frontier) if w not in fuzzed]
+        if not new_words:
+            stop = "wordlist-fixpoint"
+            break
+        remaining = deadline - time.monotonic()
+        if r > 0 and remaining <= 0:
+            stop = "deadline"
+            break
+        recs = _run_ferox(ws, hosts, new_words, r, remaining=remaining)
+        fuzzed |= set(new_words)
+        hits = merge_ferox_by_url(hits, recs)
+        rounds += 1
+        if r == CONTENT_FEEDBACK_ROUNDS:
+            break  # round cap reached — no feedback round left to consume new findings
+        new_urls = select_new_urls(recs, seen, cap=DEEP_DOWNLOAD_CAP)
+        if not new_urls:
+            stop = "url-fixpoint"
+            break
+        seen |= set(new_urls)
+        frontier = _download_and_mine(ws, new_urls, r)
+        n_new = len([w for w in frontier if w not in fuzzed])
+        log.info("    fixpoint (%s) r%d → %d new url(s) · %d new token(s)",
+                 app_id, r, len(new_urls), n_new)
+        if n_new < MIN_NEW_TOKENS:
+            stop = "diminishing-returns"
+            break
+    return hits, rounds, stop
+
+
+def _scan_secrets(ws: AppWorkspace, app_id: str) -> None:
+    """Secret-scanning fleet, run ONCE over the COMPLETE corpus (incl. the fuzz-discovered bodies —
+    mine_responses, running before the fuzzing, never sees them): jsluice ∥ gitleaks ∥ trufflehog
+    (--results=verified) ∥ detect-secrets, merged + deduped (merge_secrets) → secrets.jsonl.
+    Best-effort; no-op when the corpus is empty."""
+    bodies, _ = _extract_bodies(ws)
+    if bodies is None:
+        log.debug("  · no corpus to secret-scan for %s", app_id)
+        return
+    js_files = sorted(str(p) for p in bodies.glob("*.js"))
+    secrets = merge_secrets(_secret_fleet(ws, bodies, js_files, app_id))
+    n_sec = tools.write_jsonl(ws.canonical("secrets.jsonl"), secrets)
+    n_verified = sum(1 for s in secrets if s.get("verified"))
+    log.info("  → secrets (%s) — %d JS · %d secret(s) (%d verified) → secrets.jsonl",
+             app_id, len(js_files), n_sec, n_verified)
 
 
 def content_discovery(activity: Activity, app_id: str) -> None:
-    """LOOP 2.3 — forced browsing (feroxbuster) seeded by the custom wordlist.
+    """LOOP 2.3 — forced browsing to a FIXPOINT: fuzz → download → mine → fuzz the new token delta.
 
-    Discovers UNLINKED paths/files — the one thing reusing downloaded bodies can't
-    do, so it must make new requests. feroxbuster --smart brings auto-tune (soft-404
-    calibration), collect-words/backups and link extraction/recursion for free, so
-    the wordlist-feedback loop is built in. Targets the group's hosts deduped by response body
-    (_scan_hosts): one host per backend — same-backend aliases (domain+IP, http+https) are
-    collapsed (no re-fuzz; the scanme.nmap.org incident) but distinct environments (staging vs
-    test) are each fuzzed, since env-specific files differ. Combined wordlist (per-app
-    wl_custom/seed.txt first, then a global SecLists list) + tech-derived extensions. Output:
-    scans/<app_id>/content_discovery.jsonl.
+    Discovers UNLINKED paths/files — the one thing reusing downloaded bodies can't do, so it must
+    make new requests. Round 0 is the classic feroxbuster --smart pass (auto-tune soft-404 +
+    collect-words/backups + link extraction/recursion built in) over the combined wordlist. Then,
+    instead of dead-ending there, each feedback round feeds feroxbuster's NEW 2xx/3xx hits back
+    through the same machinery (_content_rounds): download their bodies into
+    responses/discovered/round<r>/, mine them (jsluice endpoints + tokenized paths/params), and fuzz
+    ONLY the resulting new tokens. This closes the cross-tool loop feroxbuster's own (link-only)
+    recursion can't — a fuzz-found JS file's API routes become the next round's wordlist.
 
-    feroxbuster writes JSON to -o (not stdout), so it bypasses _run.
+    Targets the group's hosts deduped by response body (_scan_hosts): one host per backend —
+    same-backend aliases (domain+IP, http+https) collapsed (no re-fuzz; the scanme.nmap.org incident)
+    but distinct environments (staging vs test) each fuzzed. Combined wordlist (per-app seed +
+    tech_enum surface + JS-mined paths, then a global SecLists list) + tech-derived extensions.
+    BOUNDED by four convergence/budget stops under a hard round cap (see _content_rounds), so it
+    never loops forever and never re-fuzzes/re-downloads.
+
+    Finally the secret-scanning fleet runs ONCE over the now-complete corpus (_scan_secrets) →
+    secrets.jsonl. Output: scans/<app_id>/content_discovery.jsonl (merge of all rounds, deduped).
     """
     ws = activity.app(app_id)
     hosts = _scan_hosts(ws)
@@ -1286,28 +1770,196 @@ def content_discovery(activity: Activity, app_id: str) -> None:
         log.debug("  · skip content_discovery (no host) for %s", app_id)
         return
 
-    # combined wordlist = per-app seed + tech_enum surface + JS-mined paths, then global SecLists
-    seed = tools.read_lines(ws.wl_custom / "seed.txt")
+    # CUSTOM layer (app-derived, high signal) — always in full, first
+    seed = tools.read_lines(ws.wl_custom / "seed.txt")              # build_wordlist app tokens
     shortnames = tools.read_lines(ws.wl_custom / "shortnames.txt")  # tech_enum surface (8.3 names)
     js_tokens = tokenize_urls(tools.read_lines(ws.canonical("endpoints_js.txt")))  # mine_responses
-    content_wl = wordlists.role_path(activity, "content")  # global list, resolved by role
-    global_wl = tools.read_lines(content_wl) if content_wl else []
-    wordlist = ws.wl_custom / "combined.txt"
-    n_wl = tools.write_lines(wordlist, [*seed, *shortnames, *js_tokens, *global_wl])
-    if not n_wl:
-        log.debug("  · skip content_discovery (empty wordlist) for %s", app_id)
-        return
+    custom = [*seed, *shortnames, *js_tokens]
+    # TRADITIONAL layer (global content + tech CMS lists), resolved by role; sized by the mode
+    tech = workspace.read_meta(ws.meta).get("tech") or []
+    content_wl = wordlists.role_path(activity, "content")
+    traditional = [tools.read_lines(content_wl) if content_wl else [],
+                   *(tools.read_lines(p) for p in wordlists.tech_role_paths(tech, activity.wl_global))]
+    mode = resolve_wl_mode(os.environ.get("PIPT_WL_MODE", "auto"),
+                           len(tools.dedupe(custom)), rich_threshold=WL_RICH_TOKENS)
+    wordlist = combine_wordlist(custom, traditional, mode=mode, cap=WL_TARGETED_CAP)
+    log.info("    wordlist (%s) — mode=%s · %d custom + %d traditional → %d combined", app_id, mode,
+             len(tools.dedupe(custom)), sum(len(t) for t in traditional), len(wordlist))
 
-    exts = tech_extensions(workspace.read_meta(ws.meta).get("tech") or [], TECH_EXTENSIONS)
-    ext_args = ["-x", *exts] if exts else []
-    out_file = ws.raw("feroxbuster") / "out.json"
+    hits, rounds, stop = _content_rounds(ws, hosts, wordlist)
+    n = tools.write_jsonl(ws.canonical("content_discovery.jsonl"), hits)
+    log.info("    content_discovery (%s) → %d result(s) over %d round(s) [stop: %s]",
+             app_id, n, rounds, stop)
+    _scan_secrets(ws, app_id)
+
+
+# --- LOOP 3 (param discovery) — arjun ∥ x8 hidden-parameter fuzzing ---
+def _is_id_segment(seg: str) -> bool:
+    """A path segment that's an id/hash → collapsed to '*' in a path template (pure)."""
+    if seg.isdigit():
+        return True
+    return len(seg) >= 8 and all(c in "0123456789abcdef" for c in seg.lower())  # noqa: PLR2004
+
+
+def path_template(url: str) -> str:
+    """Dedup key for an endpoint: scheme://host/path with query/fragment dropped and numeric/long-hex
+    segments collapsed to '*', so /user/123/edit and /user/456/edit share ONE template — we fuzz one
+    representative per endpoint SHAPE, not per id. Pure."""
+    clean = url.split("#", 1)[0].split("?", 1)[0]
+    scheme, sep, rest = clean.partition("://")
+    if not sep:
+        scheme, rest = "", clean
+    host, _, path = rest.partition("/")
+    norm = "/".join("*" if _is_id_segment(s) else s for s in path.split("/"))
+    base = f"{scheme}://{host}" if scheme else host
+    return f"{base}/{norm}"
+
+
+def select_param_endpoints(urls: Iterable[str], in_scope_hosts: set[str], *, cap: int) -> list[str]:
+    """The endpoints to param-fuzz: in-scope host, deduped by path_template (one shape, first wins,
+    query stripped), capped to `cap` (logged when it bites). Pure (logging only)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in urls:
+        u = raw.strip()
+        if not u:
+            continue
+        if in_scope_hosts and url_host(u) not in in_scope_hosts:
+            continue
+        clean = u.split("#", 1)[0].split("?", 1)[0]
+        tpl = path_template(clean)
+        if tpl in seen:
+            continue
+        seen.add(tpl)
+        out.append(clean)
+    if len(out) > cap:
+        log.warning("⚠ param_fuzz: capping endpoint set %d→%d", len(out), cap)
+        return out[:cap]
+    return out
+
+
+def parse_arjun(text: str) -> list[dict]:
+    """arjun -oJ ({<url>: {method, params:[names], headers}}) → common shape per discovered param."""
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError:
+        return []
+    out: list[dict] = []
+    for url, rec in (data.items() if isinstance(data, dict) else []):
+        if not isinstance(rec, dict):
+            continue
+        method = rec.get("method") or "GET"
+        out += [{"url": url, "param": str(p), "method": method, "sources": ["arjun"], "reason": None}
+                for p in (rec.get("params") or []) if p]
+    return out
+
+
+def parse_x8(text: str) -> list[dict]:
+    """x8 -O json ([{url, method, found_params:[{name, reason_kind, …}]}]) → common shape per param."""
+    try:
+        data = json.loads(text) if text.strip() else []
+    except json.JSONDecodeError:
+        return []
+    out: list[dict] = []
+    for rec in (data if isinstance(data, list) else []):
+        if not isinstance(rec, dict):
+            continue
+        url, method = rec.get("url"), rec.get("method") or "GET"
+        for p in rec.get("found_params") or []:
+            name = p.get("name") if isinstance(p, dict) else p
+            if url and name:
+                out.append({"url": url, "param": str(name), "method": method, "sources": ["x8"],
+                            "reason": p.get("reason_kind") if isinstance(p, dict) else None})
+    return out
+
+
+def merge_params(records: list[dict]) -> list[dict]:
+    """Dedup discovered params across arjun/x8 by (url, param): union `sources`, keep first method +
+    first non-null reason. Deterministic order (sorted), so the same input yields the same file. Pure."""
+    ordered = sorted(records, key=lambda r: (r.get("url") or "", r.get("param") or ""))
+    by_key: dict[tuple, dict] = {}
+    for r in ordered:
+        key = (r.get("url"), r.get("param"))
+        if key in by_key:
+            cur = by_key[key]
+            cur["sources"] = sorted(set(cur["sources"]) | set(r.get("sources", [])))
+            cur["reason"] = cur.get("reason") or r.get("reason")
+        else:
+            by_key[key] = {**r, "sources": sorted(set(r.get("sources", [])))}
+    return list(by_key.values())
+
+
+def _run_arjun(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: str) -> list[dict]:
+    """arjun over the targets file (best-effort). Writes JSON to -oJ (bypasses _run). Falls back to
+    arjun's builtin wordlist when the params role is unresolved."""
+    if shutil.which(ARJUN) is None:
+        log.debug("  · skip arjun (not installed) for %s", app_id)
+        return []
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    log.info("  → feroxbuster (%s) — %d host(s), %d term(s)%s", app_id, len(hosts), n_wl,
-             f", -x {','.join(exts)}" if exts else "")
-    cmd = [FEROX, "--stdin", "--silent", "--json", "-o", str(out_file), "--no-state", "-k",
-           "--smart", "-t", FEROX_THREADS, "-L", FEROX_SCAN_LIMIT, "--timeout", FEROX_TIMEOUT,
-           "--time-limit", FEROX_TIME_LIMIT, "-d", FEROX_DEPTH, "-w", str(wordlist), *ext_args]
-    tools.run(cmd, stdin="\n".join(hosts), stream_stderr=is_verbose())
-    records = parse_ferox(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
-    n = tools.write_jsonl(ws.canonical("content_discovery.jsonl"), records)
-    log.info("    feroxbuster (%s) → %d result(s) → content_discovery.jsonl", app_id, n)
+    cmd = [ARJUN, "-i", str(targets_file), "-oJ", str(out_file), "-t", ARJUN_THREADS,
+           "-T", ARJUN_TIMEOUT, "--rate-limit", ARJUN_RATE, "-q"]
+    if params_wl is not None:
+        cmd += ["-w", str(params_wl)]
+    try:
+        tools.run(cmd, timeout=PARAM_TOOL_TIMEOUT, stream_stderr=is_verbose())
+    except subprocess.TimeoutExpired:
+        log.warning("⚠ arjun hit the %ds cap for %s — keeping partial results", PARAM_TOOL_TIMEOUT, app_id)
+    return parse_arjun(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
+
+
+def _run_x8(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: str) -> list[dict]:
+    """x8 over the targets file (best-effort). Writes JSON to -o (bypasses _run). Needs a params
+    wordlist (skipped if the role is unresolved). --one-worker-per-host is the politeness lever."""
+    if shutil.which(X8) is None:
+        log.debug("  · skip x8 (not installed) for %s", app_id)
+        return []
+    if params_wl is None:
+        log.debug("  · skip x8 (no params wordlist) for %s", app_id)
+        return []
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [X8, "-u", str(targets_file), "-w", str(params_wl), "-O", "json", "-o", str(out_file),
+           "-W", X8_WORKERS, "-c", X8_CONCURRENCY, "--timeout", X8_TIMEOUT, "-d", X8_DELAY,
+           "--one-worker-per-host", "--disable-progress-bar"]
+    try:
+        tools.run(cmd, timeout=PARAM_TOOL_TIMEOUT, stream_stderr=is_verbose())
+    except subprocess.TimeoutExpired:
+        log.warning("⚠ x8 hit the %ds cap for %s — keeping partial results", PARAM_TOOL_TIMEOUT, app_id)
+    return parse_x8(out_file.read_text(encoding="utf-8") if out_file.exists() else "")
+
+
+def param_fuzz(activity: Activity, app_id: str) -> None:
+    """LOOP 3 — hidden-parameter discovery (arjun ∥ x8) over the app's enumerated endpoints.
+
+    Selects the endpoints to test (`select_param_endpoints`): the loop-1/2 endpoint artifacts
+    (endpoints.txt + endpoints_js/headless + 2xx content_discovery hits), scoped to the group's hosts,
+    deduped by path-template and capped (PARAM_MAX_ENDPOINTS) — one representative per endpoint shape,
+    since arjun/x8 are request-heavy. Runs arjun ∥ x8 (best-effort, like the secret fleet) with the
+    `params` role wordlist, merges their finds by (url, param) → params.jsonl (a deliverable + the
+    input the future DAST consumes). Reads loop-2 artifacts across the barrier — no `needs`.
+    """
+    ws = activity.app(app_id)
+    in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
+    urls = [
+        *tools.read_lines(ws.canonical("endpoints.txt")),
+        *tools.read_lines(ws.canonical("endpoints_js.txt")),
+        *tools.read_lines(ws.canonical("endpoints_headless.txt")),
+        *[r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
+          if r.get("url") and 200 <= (r.get("status") or 0) < 300],  # noqa: PLR2004
+    ]
+    targets = select_param_endpoints(urls, in_scope, cap=PARAM_MAX_ENDPOINTS)
+    if not targets:
+        log.debug("  · skip param_fuzz (no endpoints) for %s", app_id)
+        return
+    targets_file = ws.raw("param_fuzz") / "targets.txt"
+    tools.write_lines(targets_file, targets)
+    params_wl = wordlists.role_path(activity, "params")
+    log.info("  → param_fuzz (%s) — %d endpoint(s), arjun ∥ x8%s", app_id, len(targets),
+             "" if params_wl else " (no params wl → x8 skipped)")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(_run_arjun, targets_file, ws.raw("arjun") / "out.json", params_wl, app_id)
+        x = pool.submit(_run_x8, targets_file, ws.raw("x8") / "out.json", params_wl, app_id)
+        records = [*a.result(), *x.result()]
+    params = merge_params(records)
+    n = tools.write_jsonl(ws.canonical("params.jsonl"), params)
+    log.info("    param_fuzz (%s) → %d param(s) on %d endpoint(s) → params.jsonl",
+             app_id, n, len({p["url"] for p in params}))

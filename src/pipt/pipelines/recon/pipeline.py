@@ -22,11 +22,16 @@ class ReconPipeline:
         Stage("resolve", tasks.resolve, needs=("expand",)),
         Stage("portscan", tasks.portscan, needs=("resolve",)),
         Stage("httpx", tasks.httpx_fingerprint, needs=("portscan",)),
-        Stage("nerva", tasks.nerva_fingerprint, needs=("portscan",)),  # ∥ httpx
+        # full 65535-port scan + non-HTTP fingerprint — SPANNING: ∥ clustering + all per-app loops,
+        # joined at the fan-in. httpx only needs the fast top-1k web set (naabu_web.txt), so the
+        # expensive full scan no longer serializes in front of the breadth→cluster→loops path.
+        Stage("portscan_full", tasks.portscan_full, needs=("portscan",), spanning=True),
+        Stage("nerva", tasks.nerva_fingerprint, needs=("portscan_full",), spanning=True),
         # whole-scope nuclei — spanning: runs ∥ clustering + all per-app loops, joined at the fan-in
         Stage("nuclei_scope", tasks.nuclei_scope, needs=("httpx",), spanning=True),
+        # post-cluster spanning — ONE batched screenshot run (1 host/group) → unified gallery, ∥ loops
+        Stage("screenshot", tasks.screenshot_all, cluster_scope=True),
         # per-app LOOP 1 — enumeration (after cluster fan-out)
-        Stage("screenshot", tasks.screenshot, per_app=True, phase=1),  # root-page shot (∥ entry)
         Stage("passive_probe", tasks.passive_probe, per_app=True, phase=1),
         Stage("crawl", tasks.crawl, needs=("passive_probe",), per_app=True, phase=1),
         # gated TIER-1 headless crawl — runs only on the JS-rendered bucket (∥ takeover)
@@ -40,6 +45,9 @@ class ReconPipeline:
         Stage("tech_enum", tasks.tech_enum, needs=("wordlist",), per_app=True, phase=2),
         Stage("content_discovery", tasks.content_discovery,
               needs=("wordlist", "tech_enum", "mine_responses"), per_app=True, phase=2),
+        # per-app LOOP 3 — deep enumeration: hidden-parameter discovery (feeds the planned DAST).
+        # Reads loop-2 endpoint artifacts across the barrier (no cross-loop needs).
+        Stage("param_fuzz", tasks.param_fuzz, per_app=True, phase=3),
     )
 
     def cluster(self, activity: Activity) -> list[str]:

@@ -2,6 +2,38 @@ from pipt.core.scope import Target
 from pipt.pipelines.recon import tasks
 
 
+def test_select_web_ports_keeps_valid_ip_lines():
+    naabu = ["1.2.3.4:80", "1.2.3.4:8080", "9.9.9.9:443", "5.5.5.5:22"]
+    # only ip:port lines whose IP is in the valid (non-honeypot) set survive → httpx web input
+    assert tasks.select_web_ports(naabu, ["1.2.3.4", "5.5.5.5"]) == ["1.2.3.4:80", "1.2.3.4:8080", "5.5.5.5:22"]
+    assert tasks.select_web_ports([], ["1.2.3.4"]) == []
+    assert tasks.select_web_ports(["bad-line", "1.2.3.4:80"], ["1.2.3.4"]) == ["1.2.3.4:80"]
+
+
+def test_split_cdn_ip_records_drops_only_bare_ip_cdn():
+    records = [
+        {"url": "https://ginandjuice.shop", "host": "ginandjuice.shop", "cdn_name": "aws"},  # CDN-fronted hostname → keep
+        {"url": "https://34.249.203.140:443", "host": "34.249.203.140", "cdn_name": "aws"},  # bare IP + cdn → drop
+        {"url": "http://142.250.154.153", "host": "142.250.154.153", "cdn": True},           # bare IP + cdn(bool) → drop
+        {"url": "http://45.33.32.156", "host": "45.33.32.156"},                              # bare IP, not cdn → keep
+        {"url": "http://10.0.0.5", "host": "10.0.0.5", "cdn_name": "aws"},                   # bare IP + cdn but in scope → keep
+    ]
+    kept, dropped = tasks.split_cdn_ip_records(records, {"10.0.0.5"})
+    assert {r["host"] for r in dropped} == {"34.249.203.140", "142.250.154.153"}
+    assert {r["host"] for r in kept} == {"ginandjuice.shop", "45.33.32.156", "10.0.0.5"}
+
+
+def test_split_cdn_ip_records_falls_back_to_url_host():
+    records = [{"url": "https://8.8.8.8:443", "cdn_name": "google"}]  # no "host" field → derive from url
+    kept, dropped = tasks.split_cdn_ip_records(records, set())
+    assert kept == []
+    assert [r["url"] for r in dropped] == ["https://8.8.8.8:443"]
+
+
+def test_split_cdn_ip_records_empty():
+    assert tasks.split_cdn_ip_records([], set()) == ([], [])
+
+
 def test_split_scope_buckets_by_kind():
     targets = [
         Target(raw="https://app.example.com/x", kind="url", normalized="app.example.com", tid="t1"),
@@ -41,19 +73,28 @@ def test_pipeline_object_shape():
     from pipt.pipelines.recon.pipeline import PIPELINE
 
     assert PIPELINE.name == "recon"
-    activity = [s.name for s in PIPELINE.stages if not s.per_app and not s.spanning]
+    activity = [s.name for s in PIPELINE.stages
+                if not s.per_app and not s.spanning and not s.cluster_scope]
     spanning = [s.name for s in PIPELINE.stages if s.spanning]
+    cluster_scope = [s.name for s in PIPELINE.stages if s.cluster_scope]
     app = [s.name for s in PIPELINE.stages if s.per_app]
-    assert activity == ["provision_wl", "expand", "resolve", "portscan", "httpx", "nerva"]
-    assert spanning == ["nuclei_scope"]
+    # full-port scan + nerva are now SPANNING (off the breadth critical path); httpx needs only
+    # the fast top-1k web set, so the breadth chain stops at httpx.
+    assert activity == ["provision_wl", "expand", "resolve", "portscan", "httpx"]
+    assert spanning == ["portscan_full", "nerva", "nuclei_scope"]
+    assert cluster_scope == ["screenshot"]  # batched screenshot, post-cluster ∥ the loops
     assert app == [
-        "screenshot", "passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
+        "passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
         "wordlist", "fetch_delta", "mine_responses", "tech_enum", "content_discovery",
+        "param_fuzz",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
-    # httpx ∥ nerva (both depend only on portscan, not on each other)
+    # httpx is the breadth tail; the expensive full scan runs ∥ as a spanning chain → nerva
     assert by_name["httpx"].needs == ("portscan",)
-    assert by_name["nerva"].needs == ("portscan",)
+    assert by_name["portscan_full"].spanning is True
+    assert by_name["portscan_full"].needs == ("portscan",)
+    assert by_name["nerva"].spanning is True
+    assert by_name["nerva"].needs == ("portscan_full",)
     # whole-scope nuclei is spanning: starts after httpx, runs ∥ cluster + per-app, joins at fan-in
     assert by_name["nuclei_scope"].spanning is True
     assert by_name["nuclei_scope"].needs == ("httpx",)
@@ -62,19 +103,26 @@ def test_pipeline_object_shape():
     assert set(by_name["takeover"].needs) == {"crawl", "subenum"}
     # gated headless crawl is a loop-1 step that needs the cheap crawl (for the classification)
     assert by_name["crawl_headless"].needs == ("crawl",)
+    # screenshot is a post-cluster spanning step (cluster_scope), NOT a per-app loop-1 step
+    assert by_name["screenshot"].cluster_scope is True
+    assert by_name["screenshot"].per_app is False
     # loop 1 = enumeration; loop 2 = content discovery (separate per-app loop)
     assert {by_name[n].phase
-            for n in ("screenshot", "passive_probe", "crawl", "crawl_headless", "subenum", "takeover")} == {1}
-    assert by_name["screenshot"].needs == ()  # first loop-1 step, runs right after cluster
+            for n in ("passive_probe", "crawl", "crawl_headless", "subenum", "takeover")} == {1}
     # loop 2 stages cross the loop-1 barrier (no cross-loop `needs`)
     loop2 = ("wordlist", "fetch_delta", "mine_responses", "tech_enum", "content_discovery")
     assert {by_name[n].phase for n in loop2} == {2}
     assert by_name["wordlist"].needs == ()
     assert by_name["fetch_delta"].needs == ()
-    # within loop 2: tech_enum→seed; mine_responses→osint bodies; content_discovery folds both in
+    # within loop 2: tech_enum→seed; mine_responses→endpoints; content_discovery runs the
+    # fuzz→download→mine→fuzz fixpoint then the secret fleet (folds seed + tech + mined endpoints)
     assert by_name["tech_enum"].needs == ("wordlist",)
     assert by_name["mine_responses"].needs == ("fetch_delta",)
     assert set(by_name["content_discovery"].needs) == {"wordlist", "tech_enum", "mine_responses"}
+    # loop 3 (phase 3) — param discovery, reads loop-2 artifacts across the barrier (no cross-loop needs)
+    assert by_name["param_fuzz"].phase == 3
+    assert by_name["param_fuzz"].per_app is True
+    assert by_name["param_fuzz"].needs == ()
 
 
 def test_depth_pure_helpers():
@@ -182,6 +230,22 @@ def test_parse_shortscan_harvests_surface_words():
     assert len(words) == len(set(words))  # deduped, lowercased
 
 
+def test_parse_shortscan_findings():
+    out = (
+        '{"type":"status","url":"https://x/","server":"Microsoft-IIS/10.0","vulnerable":true}\n'
+        '{"type":"status","url":"https://y/","server":"Microsoft-IIS/7.5","vulnerable":false}\n'  # not vuln
+        '{"type":"result","fullname":"administrator.aspx","shortfile":"ADMINI"}\n'                  # surface
+        "garbage\n"
+    )
+    findings = tasks.parse_shortscan_findings(out)
+    assert len(findings) == 1                                   # only the vulnerable host
+    assert findings[0]["type"] == "iis-tilde-enumeration"
+    assert findings[0]["target"] == "https://x/"
+    assert findings[0]["server"] == "Microsoft-IIS/10.0"
+    assert findings[0]["source"] == "shortscan"
+    assert tasks.parse_shortscan_findings("") == []
+
+
 def test_build_wordlist_offline(tmp_path):
     """wordlist is pure offline: it tokenizes loop-1's endpoints.txt, never fetches."""
     from pipt.core import tools, workspace
@@ -232,6 +296,46 @@ def test_is_js_rendered_matches_benchmark_cases():
     assert tasks.is_js_rendered(raw_href=2, fx=0, crawley=1, marker=True)
     # ...but a healthy link surface wins over the marker (don't pay for a browser)
     assert not tasks.is_js_rendered(raw_href=0, fx=0, crawley=200, marker=True)
+
+
+def test_parse_gitleaks():
+    out = '[{"RuleID":"generic-api-key","Secret":"sk_live_X","File":"/b/abc.js","StartLine":2}]'
+    assert tasks.parse_gitleaks(out) == [
+        {"sources": ["gitleaks"], "type": "generic-api-key", "secret": "sk_live_X",
+         "file": "abc.js", "line": 2, "verified": False}]
+    assert tasks.parse_gitleaks("") == []
+    assert tasks.parse_gitleaks("not json") == []
+
+
+def test_parse_trufflehog():
+    nd = ('{"DetectorName":"AWS","Verified":true,"Raw":"AKIA_X","SourceMetadata":'
+          '{"Data":{"Filesystem":{"file":"/b/x.html","line":5}}}}\n')
+    assert tasks.parse_trufflehog(nd) == [
+        {"sources": ["trufflehog"], "type": "AWS", "secret": "AKIA_X",
+         "file": "x.html", "line": 5, "verified": True}]
+    assert tasks.parse_trufflehog("") == []
+
+
+def test_parse_detect_secrets():
+    out = ('{"results":{"/b/c.js":[{"type":"AWS Access Key","hashed_secret":"deadbeef",'
+           '"line_number":1,"is_verified":false}]}}')
+    assert tasks.parse_detect_secrets(out) == [
+        {"sources": ["detect-secrets"], "type": "AWS Access Key", "secret": None,
+         "hash": "deadbeef", "file": "c.js", "line": 1, "verified": False}]
+
+
+def test_merge_secrets_dedups_across_tools():
+    recs = [
+        {"sources": ["gitleaks"], "type": "aws", "secret": "AKIA_X", "file": "a.js", "verified": False},
+        {"sources": ["trufflehog"], "type": "AWS", "secret": "AKIA_X", "file": "a.js", "verified": True},
+        {"sources": ["detect-secrets"], "type": "Base64", "secret": None, "hash": "h1", "file": "a.js"},
+    ]
+    merged = tasks.merge_secrets(recs)
+    aws = [m for m in merged if m.get("secret") == "AKIA_X"]
+    assert len(aws) == 1                                  # same secret+file collapses
+    assert aws[0]["sources"] == ["gitleaks", "trufflehog"]  # sources unioned
+    assert aws[0]["verified"] is True                      # verified OR-ed
+    assert len(merged) == 2                                # + the detect-secrets hash lead
 
 
 def test_is_js_url():
@@ -380,3 +484,170 @@ def test_cluster_partition_demotes_generic_body(monkeypatch):
         {"url": "https://z.net", "title": "3", "content_length": 3, **body},
     ]
     assert tasks.cluster_partition(records) == [[0], [1], [2]]
+
+
+# --- content-discovery fixpoint (loop 2) ---
+def test_select_new_urls_keeps_new_2xx_3xx_then_caps():
+    recs = [
+        {"url": "https://x/a", "status": 200},
+        {"url": "https://x/b", "status": 301},   # 3xx kept
+        {"url": "https://x/c", "status": 404},   # dropped — not 2xx/3xx
+        {"url": "https://x/a", "status": 200},   # dropped — duplicate
+        {"url": "https://x/seen", "status": 200},  # dropped — already in the store
+        {"status": 200},                          # dropped — no url
+    ]
+    assert tasks.select_new_urls(recs, {"https://x/seen"}, cap=10) == ["https://x/a", "https://x/b"]
+    # cap bites: order preserved, truncated to the first `cap`
+    many = [{"url": f"https://x/{i}", "status": 200} for i in range(5)]
+    assert tasks.select_new_urls(many, set(), cap=2) == ["https://x/0", "https://x/1"]
+
+
+def test_merge_ferox_by_url_accumulates_first_wins():
+    acc = [{"url": "https://x/a", "status": 200}]
+    new = [
+        {"url": "https://x/a", "status": 500},   # dup url ⇒ acc's record kept, not overwritten
+        {"url": "https://x/b", "status": 200},   # new ⇒ appended
+        {"status": 200},                          # no url ⇒ skipped
+    ]
+    assert tasks.merge_ferox_by_url(acc, new) == [
+        {"url": "https://x/a", "status": 200},
+        {"url": "https://x/b", "status": 200},
+    ]
+
+
+def test_dur_seconds_parses_units():
+    assert tasks._dur_seconds("20m") == 1200
+    assert tasks._dur_seconds("300s") == 300
+    assert tasks._dur_seconds("1h") == 3600
+    assert tasks._dur_seconds("45") == 45  # bare number ⇒ seconds
+
+
+def test_ferox_time_limit_round0_full_feedback_capped():
+    assert tasks._ferox_time_limit(0, 10) == tasks.FEROX_TIME_LIMIT  # round 0 keeps the full cap
+    deep = tasks._dur_seconds(tasks.DEEP_FEROX_TIME_LIMIT)
+    assert tasks._ferox_time_limit(1, deep + 999) == f"{deep}s"      # budget ample ⇒ deep cap
+    assert tasks._ferox_time_limit(1, 30) == "30s"                   # budget tight ⇒ remaining
+    assert tasks._ferox_time_limit(1, 0.4) == "1s"                   # floored at 1s
+
+
+def test_all_store_indices_globs_every_store(tmp_path):
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    ws = act.app("app1").ensure()
+    for rel in ("index.txt", "headless/index.txt", "osint/response/index.txt",
+                "discovered/round0/response/index.txt"):
+        p = ws.responses / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("body.html https://x/a (200)\n", encoding="utf-8")
+    found = tasks._all_store_indices(ws)
+    assert len(found) == 4                              # cheap + headless + osint + discovered round
+    assert all(p.name == "index.txt" for p in found)
+    assert tasks._all_store_indices(act.app("absent")) == []  # no responses/ dir ⇒ []
+
+
+# --- param fuzzing (loop 3) ---
+def test_path_template_collapses_ids():
+    assert tasks.path_template("https://x/user/123/edit?a=1") == "https://x/user/*/edit"
+    assert tasks.path_template("https://x/p/deadbeefcafe/view") == "https://x/p/*/view"  # long hex
+    assert tasks.path_template("https://x/login") == "https://x/login"
+    assert tasks.path_template("https://x/") == "https://x/"
+    assert tasks.path_template("https://x/u/1") == tasks.path_template("https://x/u/2")  # same shape
+
+
+def test_select_param_endpoints_scopes_dedups_caps():
+    urls = [
+        "https://app.x/user/1", "https://app.x/user/2",   # same template ⇒ one
+        "https://app.x/login",
+        "https://evil.com/p",                              # out of scope ⇒ dropped
+        "https://app.x/search?q=1",                        # query stripped
+    ]
+    assert tasks.select_param_endpoints(urls, {"app.x"}, cap=10) == [
+        "https://app.x/user/1", "https://app.x/login", "https://app.x/search",
+    ]
+    many = [f"https://app.x/p{i}" for i in range(5)]
+    assert tasks.select_param_endpoints(many, {"app.x"}, cap=2) == ["https://app.x/p0", "https://app.x/p1"]
+
+
+def test_parse_arjun_normalizes():
+    # arjun -oJ shape: {<url>: {method, headers, params:[names]}}
+    text = ('{"https://x/catalog": {"method": "GET", "headers": {}, '
+            '"params": ["searchTerm", "category"]}, "https://x/none": {"method": "GET", "params": []}}')
+    assert sorted((r["url"], r["param"], r["sources"][0]) for r in tasks.parse_arjun(text)) == [
+        ("https://x/catalog", "category", "arjun"), ("https://x/catalog", "searchTerm", "arjun"),
+    ]
+    assert tasks.parse_arjun("nope") == []
+
+
+def test_parse_x8_normalizes():
+    # x8 -O json shape: [{url, method, found_params:[{name, reason_kind}]}]
+    text = ('[{"method":"GET","url":"https://x/catalog","status":200,'
+            '"found_params":[{"name":"searchTerm","reason_kind":"Reflected"},'
+            '{"name":"category","reason_kind":"Reflected"}]}]')
+    assert sorted((r["param"], r["sources"][0], r["reason"]) for r in tasks.parse_x8(text)) == [
+        ("category", "x8", "Reflected"), ("searchTerm", "x8", "Reflected"),
+    ]
+    assert tasks.parse_x8("not json") == []
+
+
+def test_merge_params_dedups_across_tools():
+    recs = [
+        {"url": "https://x/c", "param": "id", "method": "GET", "sources": ["arjun"], "reason": None},
+        {"url": "https://x/c", "param": "id", "method": "GET", "sources": ["x8"], "reason": "Reflected"},
+        {"url": "https://x/c", "param": "q", "method": "GET", "sources": ["x8"], "reason": "NotReflected"},
+    ]
+    merged = {m["param"]: m for m in tasks.merge_params(recs)}
+    assert len(merged) == 2
+    assert merged["id"]["sources"] == ["arjun", "x8"]   # union across tools
+    assert merged["id"]["reason"] == "Reflected"         # first non-null wins
+
+
+# --- wordlist strategy (custom vs traditional) ---
+def test_resolve_wl_mode():
+    assert tasks.resolve_wl_mode("auto", 5, rich_threshold=200) == "broad"       # thin corpus
+    assert tasks.resolve_wl_mode("auto", 500, rich_threshold=200) == "targeted"  # rich corpus
+    assert tasks.resolve_wl_mode("targeted", 5, rich_threshold=200) == "targeted"  # explicit wins
+    assert tasks.resolve_wl_mode("broad", 999, rich_threshold=200) == "broad"
+
+
+def test_combine_wordlist_custom_first_and_caps():
+    custom = ["app1", "app2"]
+    traditional = [["g1", "g2", "g3"], ["t1", "t2"]]   # global content + a tech list
+    broad = tasks.combine_wordlist(custom, traditional, mode="broad", cap=1)
+    assert broad[:2] == ["app1", "app2"]                                  # custom first
+    assert set(broad) == {"app1", "app2", "g1", "g2", "g3", "t1", "t2"}   # traditional in full
+    # targeted: each traditional list capped to its top-`cap`
+    assert tasks.combine_wordlist(custom, traditional, mode="targeted", cap=1) == [
+        "app1", "app2", "g1", "t1",
+    ]
+
+
+def test_build_wordlist_seed_excludes_tech_lists(tmp_path):
+    """The layer split: build_wordlist writes ONLY app tokens — tech CMS lists are added later by
+    content_discovery's combine, never folded into the custom seed."""
+    from pipt.core import tools, workspace
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    ws = act.app("app1").ensure()
+    workspace.write_meta(ws.meta, {"app_id": "app1", "tech": ["WordPress"]})
+    tools.write_lines(ws.canonical("endpoints.txt"), ["https://app1/wp-login.php"])
+    tools.write_lines(act.wl_global / "wordpress.txt", ["__WP_SENTINEL__"])  # a tech list exists
+
+    tasks.build_wordlist(act, "app1")
+    seed = set(tools.read_lines(ws.wl_custom / "seed.txt"))
+    assert "wp-login.php" in seed           # app token present
+    assert "__WP_SENTINEL__" not in seed    # tech list NOT folded into the custom seed
+
+
+# --- unified screenshot reconciliation ---
+def test_reconcile_by_url():
+    index = [                                   # (file, url) from the -srd index
+        ("a.com/h1.png", "https://a.com/"),     # index has trailing slash, our map doesn't
+        ("b.com/h2.png", "http://b.com"),       # index has none, our map does
+        ("c.com/h3.png", "https://c.com/"),     # url not in our candidate map → ignored
+    ]
+    url_to_app = {"https://a.com": "app_a", "http://b.com/": "app_b"}
+    assert tasks.reconcile_by_url(index, url_to_app) == {
+        "app_a": "a.com/h1.png", "app_b": "b.com/h2.png",
+    }

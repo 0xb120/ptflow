@@ -39,6 +39,10 @@ ROLE_CANDIDATES: dict[str, tuple[str, ...]] = {
         "Discovery/Web-Content/common.txt",
         "raft-medium-directories.txt", "common.txt", "directory-list-2.3-medium.txt",
     ),
+    "params": (  # hidden-parameter names for arjun/x8 (param_fuzz, loop 3)
+        "Discovery/Web-Content/burp-parameter-names.txt",
+        "burp-parameter-names.txt",
+    ),
     "wordpress": ("Discovery/Web-Content/CMS/wordpress.fuzz.txt",),
     "drupal": ("Discovery/Web-Content/CMS/Drupal.txt", "Discovery/Web-Content/CMS/drupal-themes.fuzz.txt"),
     "joomla": ("Discovery/Web-Content/CMS/joomla-plugins.fuzz.txt",),

@@ -22,14 +22,21 @@ def main(argv: list[str] | None = None) -> int:
         "-v", "--verbose", action="store_true",
         help="show the exact command and full output of every tool invoked",
     )
+    run.add_argument(
+        "--resume", action="store_true",
+        help="skip stages already completed in a prior run of this activity (same scope)",
+    )
 
     args = parser.parse_args(argv)
 
     if args.cmd == "run":
         setup_logging(verbose=args.verbose)
-        base = orchestrate(load_pipeline(args.pipeline), args.activity, args.scope, root=args.root)
+        base, failures = orchestrate(
+            load_pipeline(args.pipeline), args.activity, args.scope, root=args.root,
+            resume=args.resume,
+        )
         print(base)  # noqa: T201
-        return 0
+        return 1 if failures else 0  # non-zero exit when any stage failed (CI/automation signal)
 
     return 1
 

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pipt · pipeline recon</title>
+<style>
+:root{
+  --ground:#0b0f17; --ground-2:#111726; --inset:#0c111c;
+  --ink:#c7d2e1; --ink-dim:#8794ab; --ink-faint:#566179; --line:#22304a;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);line-height:1.5;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:48px 48px;background-position:center;}
+body::before{content:"";position:fixed;inset:0;background:var(--ground);opacity:.86;z-index:-1;}
+.wrap{max-width:1160px;margin:0 auto;padding:44px 22px 72px;}
+.masthead{border:1px solid var(--line);background:linear-gradient(180deg,#0e1422,#0b0f17);padding:28px 28px 24px;border-radius:4px;}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.32em;text-transform:uppercase;color:var(--ink-faint);margin:0 0 12px;}
+h1{font-family:var(--mono);font-weight:600;font-size:clamp(26px,5vw,46px);margin:0;letter-spacing:-.01em;line-height:1.04;}
+h1 .sep{color:#ff4d9d;}
+.thesis{max-width:74ch;color:var(--ink-dim);margin:14px 0 0;font-size:14.5px;}
+.thesis b{color:var(--ink);font-weight:600;}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:20px;padding-top:18px;border-top:1px dashed var(--line);font-family:var(--mono);font-size:11.5px;color:var(--ink-dim);}
+.legend .k{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;}
+.swatch{width:11px;height:11px;border-radius:2px;box-shadow:0 0 6px -1px currentColor;}
+.sym{color:var(--ink);font-weight:600;}
+.band{margin-top:36px;}
+.band-h{display:flex;align-items:baseline;gap:13px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.15em;font-size:13px;margin:0 0 18px;padding-bottom:9px;border-bottom:1px solid var(--line);}
+.band-h .n{font-size:21px;letter-spacing:0;color:var(--tone,var(--ink));font-weight:600;}
+.band-h .t{color:var(--tone,var(--ink));}
+.band-h .sub{color:var(--ink-faint);letter-spacing:.03em;text-transform:none;font-size:12px;margin-left:auto;}
+.lvl{display:flex;gap:16px;align-items:stretch;overflow-x:auto;padding-bottom:4px;}
+.lvl>.node{flex:1;min-width:248px;}
+.down{display:block;text-align:center;color:var(--ink-faint);font-size:15px;padding:6px 0;}
+.node{background:var(--ground-2);border:1px solid var(--line);border-left:3px solid var(--tone,var(--ink-faint));border-radius:4px;padding:12px 14px 13px;}
+.node .top{display:flex;align-items:baseline;gap:9px;margin-bottom:8px;}
+.node .idx{font-family:var(--mono);font-size:12px;color:var(--tone);font-weight:600;}
+.node h3{font-family:var(--mono);font-size:15px;margin:0;font-weight:600;letter-spacing:-.01em;}
+.node .tag{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-faint);border:1px solid var(--line);border-radius:3px;padding:2px 6px;white-space:nowrap;}
+.node .tag.par-tag{color:var(--tone);border-color:color-mix(in srgb,var(--tone) 45%,var(--line));}
+.node p{margin:0 0 9px;font-size:12.5px;color:var(--ink-dim);}
+.cmd{font-family:var(--mono);font-size:11.5px;background:var(--inset);border:1px solid var(--line);border-radius:3px;padding:8px 10px;margin:0 0 9px;color:var(--ink-dim);white-space:pre;overflow-x:auto;line-height:1.6;}
+.out{display:flex;flex-wrap:wrap;gap:6px;}
+.art{font-family:var(--mono);font-size:11px;color:var(--ink);background:#0e1626;border:1px solid var(--line);border-radius:3px;padding:3px 7px;white-space:nowrap;}
+.art::before{content:"→ ";color:var(--tone);}
+.notes{margin:9px 0 0;padding-left:16px;font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.55;}
+.notes li::marker{color:var(--tone);}
+.barrier{display:flex;align-items:center;gap:14px;margin:26px 0 4px;font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint);}
+.barrier::before,.barrier::after{content:"";flex:1;border-top:1px dashed var(--line);}
+.band[style*="8b8fa3"] .node{border-style:dashed;}
+footer{margin-top:44px;padding-top:16px;border-top:1px solid var(--line);font-family:var(--mono);font-size:11px;color:var(--ink-faint);}
+a:focus-visible{outline:2px solid var(--ink);outline-offset:2px;}
+@media (max-width:560px){.wrap{padding:28px 13px 52px;}.masthead{padding:20px 16px;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="masthead">
+<p class="eyebrow">pipt · pipeline recon</p>
+<h1>signal <span class="sep">/</span> flow</h1>
+<p class="thesis">Ogni stage comunica solo via file su disco. La breadth mappa l'intero scope, il cluster fa da pivot fan-out, poi i loop per-app vanno in profondità con una barriera globale tra loro — fino al fixpoint di content discovery: fuzz → download → mine → fuzz, finché converge.</p>
+<div class="legend" aria-label="legenda">
+<span class="k"><span class="swatch" style="color:#4fd6c8;background:#4fd6c8"></span>breadth</span>
+<span class="k"><span class="swatch" style="color:#f0b429;background:#f0b429"></span>spanning</span>
+<span class="k"><span class="swatch" style="color:#7bd88f;background:#7bd88f"></span>loop 1</span>
+<span class="k"><span class="swatch" style="color:#ff4d9d;background:#ff4d9d"></span>loop 2</span>
+<span class="k"><span class="swatch" style="color:#8b8fa3;background:#8b8fa3"></span>fan-in</span>
+<span class="k"><span class="sym">∥</span> parallelo</span>
+<span class="k"><span class="sym">▼</span> needs</span>
+<span class="k"><span class="sym">▭</span> barriera</span>
+</div>
+</header>
+<section class="band" style="--tone:#4fd6c8"><h2 class="band-h"><span class="n">01</span><span class="t">breadth</span><span class="sub">asset discovery · intero scope · DAG pre-cluster</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">00</span><h3>provision_wl</h3><span class="tag par-tag">∥ no needs</span></div><p>Risolve i ruoli di wordlist globale (content/wordpress/…) per env/discovery/BYO.</p><div class="cmd"># wordlists.provision() — symlink per ruolo</div><div class="out"><span class="art">wl_global/&lt;role&gt;.txt</span></div></div><div class="node"><div class="top"><span class="idx">01</span><h3>expand</h3><span class="tag par-tag">∥ no needs</span></div><p>Split per tipo, harvest TLS/PTR, enum wildcard.</p><div class="cmd">mapcidr -silent
+naabu -top-ports 1000 -exclude-cdn -rate 1000
+tlsx -san -cn -resp-only     dnsx -ptr -resp-only
+assetfinder -subs-only       subfinder -silent</div><div class="out"><span class="art">scope_urls.txt</span><span class="art">scope_ip.txt</span><span class="art">tls_names.txt</span><span class="art">scope_dns.txt</span></div></div></div><span class="down">▼</span><div class="lvl"><div class="node"><div class="top"><span class="idx">02</span><h3>resolve</h3><span class="tag">needs expand</span></div><p>Risolve i candidati a subdomini live; consolida gli IP.</p><div class="cmd">shuffledns -mode resolve -r resolvers-trusted   # fallback dnsx
+dnsx -a -resp-only -silent     dnsx -a -resp -nc</div><div class="out"><span class="art">subdomains.txt</span><span class="art">unique_ips.txt</span><span class="art">domain_ip_map.txt</span></div></div></div><span class="down">▼</span><div class="lvl"><div class="node"><div class="top"><span class="idx">03</span><h3>portscan</h3><span class="tag">needs resolve</span></div><p>Scan VELOCE: top-1k → filtro honeypot → naabu_web.txt (il set web che legge httpx). Il full-port è ora spanning (portscan_full), fuori dal percorso critico.</p><div class="cmd">naabu -top-ports 1000 -exclude-cdn   # → honeypot_split + select_web_ports</div><div class="out"><span class="art">honeypots.txt</span><span class="art">naabu_web.txt</span></div></div></div><span class="down">▼</span><div class="lvl"><div class="node"><div class="top"><span class="idx">04</span><h3>httpx</h3><span class="tag">needs portscan</span></div><p>Fingerprint HTTP + segnali per il cluster (favicon, body-hash, header). Scope hygiene: scarta le probe by-IP di infra CDN/cloud/WAF (tiene gli hostname).</p><div class="cmd">httpx -sc -cl -td -title -ip -hash sha256
+      -favicon -location -fr -irh -j
+split_cdn_ip_records → drop bare-IP CDN/cloud/WAF (excluded_cdn.jsonl)</div><div class="out"><span class="art">httpx_full_metadata.jsonl</span><span class="art">unique_webapps.txt</span><span class="art">excluded_cdn.jsonl</span></div></div></div></section><section class="band" style="--tone:#f0b429"><h2 class="band-h"><span class="t">spanning</span><span class="sub">parte dopo i suoi needs · gira ∥ a cluster + tutti i loop · join al fan-in</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">05</span><h3>portscan_full</h3><span class="tag">needs portscan</span></div><p>SPANNING — scan full 65535 porte sugli IP validi → naabu_full.txt (alimenta nerva). Gira ∥ cluster + loop, joinato al fan-in: il full-port non blocca più la breadth.</p><div class="cmd">naabu -top-ports full -exclude-cdn</div><div class="out"><span class="art">naabu_full.txt</span></div></div></div></section><section class="band" style="--tone:#f0b429"><h2 class="band-h"><span class="t">spanning</span><span class="sub">parte dopo i suoi needs · gira ∥ a cluster + tutti i loop · join al fan-in</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">06</span><h3>nerva</h3><span class="tag">needs portscan_full</span></div><p>Fingerprint dei servizi non-HTTP (SPANNING, dopo portscan_full, ∥ cluster + loop).</p><div class="cmd">nerva --json</div><div class="out"><span class="art">nerva_full_metadata.jsonl</span></div></div></div></section><section class="band" style="--tone:#f0b429"><h2 class="band-h"><span class="t">spanning</span><span class="sub">parte dopo i suoi needs · gira ∥ a cluster + tutti i loop · join al fan-in</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">07</span><h3>nuclei_scope</h3><span class="tag">needs httpx</span></div><p>Un processo full-template su tutto lo scope deduplicato, un solo rate-limit globale.</p><div class="cmd">nuclei -ut   # update templates, poi:
+nuclei -c 25 -bs 25 -rl 150 -timeout 10 -retries 2 -j -silent -duc</div><div class="out"><span class="art">findings/nuclei_scope.jsonl</span></div></div></div></section><section class="band" style="--tone:#cdd8e8"><h2 class="band-h"><span class="t">⬡ pivot</span><span class="sub">fan-out — raggruppa le vhost in application-group</span></h2><div class="lvl"><div class="node"><div class="top"><h3>scans/&lt;app_id&gt;/</h3><span class="tag par-tag">∥ no needs</span></div><p>Union-find su segnali di app-identity (redirect-final · body-hash · favicon/fingerprint apex-scoped), precision-first — un duplicato scansionato due volte è meglio di due app fuse.</p><div class="out"><span class="art">meta.json</span><span class="art">hosts.txt</span></div></div></div></section><section class="band" style="--tone:#f0b429"><h2 class="band-h"><span class="t">post-cluster ∥</span><span class="sub">una volta dopo il cluster (1 candidato/gruppo) · gira ∥ ai loop · join al fan-in</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">08</span><h3>screenshot</h3><span class="tag par-tag">∥ no needs</span></div><p>Post-cluster, UNA run su 1 candidato/gruppo → dashboard unica nativa (httpx ∥ EyeWitness).</p><div class="cmd">httpx -ss -system-chrome -srd &lt;activity&gt;/screenshots -svrc   # screenshot.html
+eyewitness --web -f &lt;tutti gli url&gt; --no-prompt   # report.html (opzionale)</div><div class="out"><span class="art">screenshots/screenshot/screenshot.html</span><span class="art">scans/&lt;app_id&gt;/screenshot.png</span><span class="art">default_creds.jsonl</span></div><ul class="notes"><li>riconciliazione per URL (index_screenshot.txt / Requests.csv) → ogni shot al suo gruppo</li><li>batch: 1 avvio EyeWitness invece di N (gira ∥ ai per-app loop)</li></ul></div></div></section><section class="band" style="--tone:#7bd88f"><h2 class="band-h"><span class="n">02</span><span class="t">loop 1 · enumeration</span><span class="sub">per-app · phase 1</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">09</span><h3>passive_probe</h3><span class="tag par-tag">∥ no needs</span></div><p>URL discovery passiva (OSINT).</p><div class="cmd">gau --threads 5     urlfinder -silent</div><div class="out"><span class="art">endpoints_passive.txt</span></div></div><div class="node"><div class="top"><span class="idx">12</span><h3>subenum</h3><span class="tag par-tag">∥ no needs</span></div><p>Enum passiva sugli apex scoperti del gruppo, filtrata live.</p><div class="cmd">subfinder -silent     dnsx -silent</div><div class="out"><span class="art">subs.txt</span></div></div></div><span class="down">▼</span><div class="lvl"><div class="node"><div class="top"><span class="idx">10</span><h3>crawl</h3><span class="tag">needs passive_probe</span></div><p>katana ∥ crawley (TIER 0). katana è il downloader (-srd) + classifica se l'app è JS-rendered.</p><div class="cmd">katana -jc -jsl -kf all -fx -pc -fs fqdn -d 3 -srd responses/
+crawley -depth 3 -all -js -robots crawl   # per host</div><div class="out"><span class="art">endpoints.txt</span><span class="art">endpoints_crawley.txt</span><span class="art">crawl_class.json</span><span class="art">responses/</span></div></div></div><span class="down">▼</span><div class="lvl"><div class="node"><div class="top"><span class="idx">11</span><h3>crawl_headless</h3><span class="tag par-tag">∥ needs crawl</span></div><p>TIER 1 headless — solo sul bucket JS-rendered. RAM-capped da semaforo process-wide.</p><div class="cmd">katana -hl -nos -jc -jsl -xhr -fx -iqp -ct 180 -srd responses/headless/</div><div class="out"><span class="art">endpoints_headless.txt</span><span class="art">responses/headless/</span></div></div><div class="node"><div class="top"><span class="idx">13</span><h3>takeover</h3><span class="tag par-tag">∥ needs crawl, subenum</span></div><p>Subdomain takeover su hosts + endpoint + subs.</p><div class="cmd">subjack -w &lt;candidates&gt; -t 100 -timeout 30 -ssl</div><div class="out"><span class="art">takeover.txt</span></div></div></div></section><div class="barrier">▭ barriera globale — ogni app finisce il loop 1 prima che inizi il loop 2</div><section class="band" style="--tone:#ff4d9d"><h2 class="band-h"><span class="n">03</span><span class="t">loop 2 · content discovery</span><span class="sub">per-app · phase 2</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">14</span><h3>wordlist</h3><span class="tag par-tag">∥ no needs</span></div><p>Tokenizza endpoints (+ headless) in segmenti/basename/param — SOLO token app (custom).</p><div class="cmd"># tokenize_urls → seed.txt (le liste tech/global le aggiunge content_discovery)</div><div class="out"><span class="art">wl_custom/seed.txt</span></div></div><div class="node"><div class="top"><span class="idx">15</span><h3>fetch_delta</h3><span class="tag par-tag">∥ no needs</span></div><p>Scarica solo il delta (passive + crawley) non già nello store.</p><div class="cmd">httpx -srd responses/osint/ -rl 50   # passive_delta</div><div class="out"><span class="art">responses/osint/</span></div></div></div><span class="down">▼</span><div class="lvl"><div class="node"><div class="top"><span class="idx">16</span><h3>mine_responses</h3><span class="tag par-tag">∥ needs fetch_delta</span></div><p>Estrae i body (idempotente) e mina SOLO endpoint col jsluice — alimenta il round 0.</p><div class="cmd">jsluice urls &lt;js&gt;   # → raw/extracted/ esteso</div><div class="out"><span class="art">endpoints_js.txt</span></div><ul class="notes"><li>il fleet segreti NON gira più qui — spostato in coda al fixpoint</li></ul></div><div class="node"><div class="top"><span class="idx">17</span><h3>tech_enum</h3><span class="tag par-tag">∥ needs wordlist</span></div><p>Scanner per-stack: superficie (oggi shortscan IIS 8.3) + finding se dual-role.</p><div class="cmd">shortutil wordlist &lt;rainbow&gt;
+shortscan -o json -a auto -w &lt;rainbow&gt; @hosts</div><div class="out"><span class="art">wl_custom/shortnames.txt</span><span class="art">findings/tilde_enum.jsonl</span></div><ul class="notes"><li>shortscan è dual-role: superficie (shortnames) + finding IIS tilde → findings/tilde_enum.jsonl</li></ul></div></div><span class="down">▼</span><div class="lvl"><div class="node"><div class="top"><span class="idx">18</span><h3>content_discovery</h3><span class="tag">needs wordlist, tech_enum, mine_responses</span></div><p>Forced browsing come FIXPOINT: fuzz → download → mine → fuzz il delta di token, poi il secret fleet una volta.</p><div class="cmd"># round 0:
+feroxbuster --smart -t 5 -L 2 --time-limit 20m -w round0.txt
+# feedback round (solo token nuovi):
+feroxbuster --smart --time-limit 5m -w round&lt;r&gt;.txt
+httpx -srd responses/discovered/round&lt;r&gt;/ -rl 50
+jsluice urls &lt;new-js&gt;   # → grow frontier
+# poi UNA volta, secret fleet:
+jsluice secrets ∥ gitleaks ∥ trufflehog --results=verified ∥ detect-secrets</div><div class="out"><span class="art">content_discovery.jsonl</span><span class="art">secrets.jsonl</span><span class="art">responses/discovered/round*/</span></div><ul class="notes"><li>wordlist = custom (seed+shortnames+js) + tradizionale (global+tech), per MODE</li><li>mode auto: corpus ricco → targeted (cappa la tradizionale) · povero → broad · PIPT_WL_MODE</li><li>round 0: --time-limit 20m · feedback: --time-limit 5m</li><li>stop: wordlist-fixpoint · url-fixpoint · deadline 900s · diminishing &lt;20 · round-cap 2</li><li>mai rifuzzare un token (fuzzed) · mai riscaricare un URL (seen dagli index -srd)</li><li>secret fleet UNA volta sul corpus completo → merge_secrets</li></ul></div></div></section><div class="barrier">▭ barriera globale — ogni app finisce il loop 2 prima che inizi il loop 3</div><section class="band" style="--tone:#f5a3c7"><h2 class="band-h"><span class="n">04</span><span class="t">loop 3 · param discovery</span><span class="sub">per-app · phase 3</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">19</span><h3>param_fuzz</h3><span class="tag par-tag">∥ no needs</span></div><p>Scoperta parametri nascosti (arjun ∥ x8) sugli endpoint enumerati → alimenta la DAST.</p><div class="cmd"># set endpoint deduplicato per path-template + cappato (PARAM_MAX_ENDPOINTS):
+arjun -i targets.txt -oJ out.json -w &lt;params&gt; -t 5 --rate-limit 20 -q
+x8 -u targets.txt -w &lt;params&gt; -O json -o out.json -W2 -c2 --one-worker-per-host
+# cap di wall-clock per-tool (PARAM_TOOL_TIMEOUT) → partial best-effort</div><div class="out"><span class="art">params.jsonl</span></div><ul class="notes"><li>arjun ∥ x8 (best-effort) → merge per (url, param) → params.jsonl</li><li>solo GET per ora · politeness: rate/worker bassi, --one-worker-per-host</li><li>x8 saltato se manca la wordlist ruolo `params`</li></ul></div></div></section><section class="band" style="--tone:#8b8fa3"><h2 class="band-h"><span class="t">fan-in</span><span class="sub">join dello spanning, poi l'agente terminale</span></h2><div class="lvl"><div class="node"><div class="top"><h3>agent</h3><span class="tag par-tag">∥ no needs</span></div><p>Fan-in terminale: oggi StubProvider deterministico; diventerà un consolidate.</p><div class="out"><span class="art">findings/hypotheses.jsonl</span></div></div></div></section>
+<footer>generato da <b>pipt.pipelines.recon.flowmeta</b> · non modificare a mano · struttura derivata dagli Stage objects</footer>
+</div>
+</body>
+</html>

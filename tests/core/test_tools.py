@@ -1,3 +1,5 @@
+import time
+
 from pipt.core import tools
 
 
@@ -79,3 +81,46 @@ def test_read_jsonl_missing_returns_empty(tmp_path):
 
 def test_run_stream_stderr_returns_stdout():
     assert tools.run(["printf", "hi"], stream_stderr=True) == "hi"
+
+
+def test_run_tolerates_non_utf8_output():
+    # a tool emitting a non-UTF-8 byte (0x93, a Windows-1252 smart quote — seen in urlfinder OSINT
+    # output) must NOT raise UnicodeDecodeError and kill the stage; the bad byte → U+FFFD
+    out = tools.run(["printf", r"a\x93b"])
+    assert out.startswith("a")
+    assert out.endswith("b")
+    assert "�" in out  # replaced, not raised
+
+
+def test_run_unregisters_after_completion():
+    # a finished tool leaves nothing in the live-subprocess registry
+    tools.run(["printf", "x"])
+    assert not [p for p in tools._live if p.poll() is None]
+
+
+def test_terminate_all_noop_when_idle():
+    assert tools.terminate_all() == 0
+
+
+def test_terminate_all_kills_running_process():
+    import threading
+
+    done = threading.Event()
+
+    def _long():
+        tools.run(["sleep", "30"])  # blocks until killed
+        done.set()
+
+    t = threading.Thread(target=_long, daemon=True)
+    t.start()
+    # wait until the sleep is registered as live
+    for _ in range(100):
+        if [p for p in tools._live if p.poll() is None]:
+            break
+        time.sleep(0.05)
+    assert [p for p in tools._live if p.poll() is None], "sleep never registered"
+
+    killed = tools.terminate_all()
+    assert killed >= 1
+    assert done.wait(timeout=10), "tools.run did not return after terminate_all"
+    assert not [p for p in tools._live if p.poll() is None]
