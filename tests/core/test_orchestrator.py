@@ -36,6 +36,36 @@ def test_await_isolates_and_records_failure():
     assert failures == ["bad"]  # the good stage didn't abort; the bad one is recorded, not raised
 
 
+def test_pool_size_adds_spanning_headroom():
+    stages = [
+        Stage("a", lambda *_: None),                      # breadth — not counted
+        Stage("b", lambda *_: None, spanning=True),
+        Stage("c", lambda *_: None, spanning=True),
+        Stage("d", lambda *_: None, cluster_scope=True),
+        Stage("e", lambda *_: None, per_app=True),        # fan-out — not counted
+    ]
+    assert orchestrator._pool_size(stages, 3) == 3 + 3     # 3 fan-out + (2 spanning + 1 cluster_scope)
+    assert orchestrator._pool_size([Stage("x", lambda *_: None)], 3) == 3  # no spanning → just fan-out
+
+
+def test_fanout_semaphore_bound_matches_config():
+    from pipt.core.config import CONFIG
+
+    # the per-app fan-out cap is enforced by this semaphore (pool is larger), so it must equal max_workers
+    assert orchestrator._FANOUT_SLOTS._initial_value == CONFIG.fanout.max_workers
+
+
+def test_stage_tags_by_band():
+    base = Stage("a", lambda *_: None)
+    span = Stage("b", lambda *_: None, spanning=True)
+    clus = Stage("c", lambda *_: None, cluster_scope=True)
+    loop2 = Stage("d", lambda *_: None, per_app=True, phase=2)
+    assert orchestrator._stage_tags(base) == ["net", "breadth"]      # UI band tags for the run graph
+    assert orchestrator._stage_tags(span) == ["net", "spanning"]
+    assert orchestrator._stage_tags(clus) == ["net", "post-cluster"]
+    assert orchestrator._stage_tags(loop2) == ["net", "loop:2"]
+
+
 def test_marker_path(tmp_path):
     from pipt.core.paths import Activity
 

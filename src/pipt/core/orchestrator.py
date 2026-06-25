@@ -9,10 +9,13 @@ reconstructs the Activity/Pipeline and runs a single stage by name.
 from __future__ import annotations
 
 import hashlib
+import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from prefect import flow, task
+from prefect.settings import PREFECT_API_URL, PREFECT_LOGGING_EXTRA_LOGGERS, temporary_settings
 from prefect.task_runners import ThreadPoolTaskRunner
 
 from pipt.core import tools
@@ -27,6 +30,13 @@ if TYPE_CHECKING:
     from prefect.futures import PrefectFuture
 
 log = get_logger()
+
+# Per-app fan-out cap. The flow pool is sized to fanout + spanning headroom (see _pool_size) so the
+# spanning/cluster_scope stages run ∥ the loops instead of stealing their workers; this process-wide
+# semaphore re-imposes the real fan-out limit on the per-app chains, so they never over-parallelize
+# once the spanning stages free the pool. (The ThreadPoolTaskRunner runs every stage in one process,
+# so a module semaphore caps them across all app groups — same pattern as the headless RAM cap.)
+_FANOUT_SLOTS = threading.BoundedSemaphore(CONFIG.fanout.max_workers)
 
 
 def topo_order(stages: list[Stage]) -> list[Stage]:
@@ -62,6 +72,30 @@ def per_app_loops(stages: list[Stage]) -> list[tuple[int, list[Stage]]]:
     ]
 
 
+def _pool_size(stages: Sequence[Stage], fanout: int) -> int:
+    """Flow pool size = fan-out cap + one slot per spanning/cluster_scope stage. Those background
+    stages (whole-scope nuclei, full-port scan, batched screenshot) then run ∥ the per-app loops
+    instead of starving the pool — while _FANOUT_SLOTS keeps the per-app fan-out itself at `fanout`.
+    Pure. Without this, 2 long spanning stages + a wait_for'd one saturate a 3-worker pool and the
+    loops never start until they finish (observed: 17.5 min of nothing-but-spanning)."""
+    n_span = sum(1 for s in stages if s.spanning or s.cluster_scope)
+    return fanout + n_span
+
+
+def _stage_tags(stage: Stage) -> list[str]:
+    """Band tag for the Prefect UI (so task runs group/filter by phase in the dashboard), plus the
+    shared `net` concurrency tag. Pure — derived from the Stage's own scope flags."""
+    if stage.spanning:
+        band = "spanning"
+    elif stage.cluster_scope:
+        band = "post-cluster"
+    elif stage.per_app:
+        band = f"loop:{stage.phase}"
+    else:
+        band = "breadth"
+    return ["net", band]
+
+
 def _submit_dag(  # noqa: PLR0913
     stages: list[Stage],
     pipeline_name: str,
@@ -72,11 +106,17 @@ def _submit_dag(  # noqa: PLR0913
     resume: bool,
 ) -> dict[str, PrefectFuture]:
     """Submit one scope's stages as a DAG, wiring `needs` → `wait_for`. Returns the
-    futures keyed by stage name so the caller can label failures."""
+    futures keyed by stage name so the caller can label failures.
+
+    Each task is given a per-stage `name` + `task_run_name` (`crawl[<app_id>]`) and a band tag via
+    with_options, so the Prefect UI renders the run graph as readable, phase-grouped nodes (instead
+    of one opaque `_run_stage` repeated). Cosmetic in ephemeral mode; the payoff is with `--observe`."""
     futs: dict[str, PrefectFuture] = {}
     for stage in topo_order(stages):
         deps = [futs[n] for n in stage.needs if n in futs]
-        futs[stage.name] = _run_stage.submit(  # ty: ignore[no-matching-overload]
+        label = f"{stage.name}[{app_id}]" if app_id else stage.name
+        task = _run_stage.with_options(name=stage.name, task_run_name=label, tags=_stage_tags(stage))
+        futs[stage.name] = task.submit(  # ty: ignore[no-matching-overload]
             pipeline_name, activity_name, root, stage.name, app_id, resume=resume, wait_for=deps
         )
     return futs
@@ -117,11 +157,15 @@ def _run_stage(  # noqa: PLR0913
         log.info("  ↺ skip %s%s (done)", stage_name, f" [{app_id}]" if app_id else "")
         return stage_name
     stage = next(s for s in pipeline.stages if s.name == stage_name)
-    log.info("  ▶ %s%s", stage_name, f" [{app_id}]" if app_id else "")
     if app_id is None:
+        log.info("  ▶ %s", stage_name)
         stage.run(activity)
     else:
-        stage.run(activity, app_id)
+        # cap concurrent per-app chains at fanout.max_workers — the pool is larger (sized to also fit
+        # the spanning stages) so spanning runs ∥ the loops instead of starving their workers
+        with _FANOUT_SLOTS:
+            log.info("  ▶ %s [%s]", stage_name, app_id)
+            stage.run(activity, app_id)
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("", encoding="utf-8")  # mark done only AFTER success → failed stages re-run
     return stage_name
@@ -230,25 +274,39 @@ def _resume_ok(activity: Activity, scope_text: str, *, resume: bool) -> bool:
     return resume
 
 
-def orchestrate(
+def orchestrate(  # noqa: PLR0913
     pipeline: Pipeline,
     activity_name: str,
     scope_file: str,
     *,
     root: str | None = None,
     resume: bool = False,
+    observe: str | None = None,
 ) -> tuple[Path, int]:
     """Run the full pipeline for one activity. Returns (activity base dir, stage-failure count);
     the count is 0 on a clean run and >0 when one or more stages failed (the CLI maps it to its
     exit code). With `resume`, stages that completed cleanly in a prior run of this activity are
-    skipped (only failed/incomplete ones rerun) — auto-invalidated if scope.txt changed."""
+    skipped (only failed/incomplete ones rerun) — auto-invalidated if scope.txt changed. With
+    `observe` (a Prefect API URL), the run streams to that server's UI (run graph, states, timings,
+    logs) instead of spinning a throwaway ephemeral server — pure telemetry, the pipeline is
+    unchanged. temporary_settings applies the redirect at runtime (env set post-import is too late)."""
     activity = Activity.named(activity_name, Path(root) if root else None).ensure()
     add_file_handler(activity.logs / "run.log")  # persist the full run log (every command + output)
     scope_text = Path(scope_file).read_text(encoding="utf-8")
     activity.scope.write_text(scope_text, encoding="utf-8")
     activity.scope_init.write_text(scope_text, encoding="utf-8")
     resume = _resume_ok(activity, scope_text, resume=resume)
-    log.info("▶ pipeline '%s' on '%s'%s → %s", pipeline.name, activity_name,
-             " [resume]" if resume else "", activity.base)
-    failures = _run_dag(pipeline.name, activity_name, root, resume=resume)
+    log.info("▶ pipeline '%s' on '%s'%s%s → %s", pipeline.name, activity_name,
+             " [resume]" if resume else "", f" [observe→{observe}]" if observe else "", activity.base)
+    # name the flow run after the activity (UI), and size the pool to fan-out + spanning headroom so
+    # the spanning stages run ∥ the loops instead of starving them (_FANOUT_SLOTS holds the fan-out cap)
+    pool = ThreadPoolTaskRunner(max_workers=_pool_size(pipeline.stages, CONFIG.fanout.max_workers))
+    run = _run_dag.with_options(flow_run_name=f"{pipeline.name}:{activity_name}", task_runner=pool)
+    if observe:
+        # redirect this run to the persistent server + let it capture the `pipt` logger, scoped to
+        # the run (no global profile/env mutation). temporary_settings overrides at runtime.
+        with temporary_settings({PREFECT_API_URL: observe, PREFECT_LOGGING_EXTRA_LOGGERS: ["pipt"]}):
+            failures = run(pipeline.name, activity_name, root, resume=resume)
+    else:
+        failures = run(pipeline.name, activity_name, root, resume=resume)
     return activity.base, failures

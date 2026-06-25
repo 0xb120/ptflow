@@ -80,3 +80,32 @@ def test_cli_run_returns_nonzero_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "orchestrate", lambda *_a, **_k: (tmp_path, 3))  # 3 stage failures
     scope_file = _scope(tmp_path)
     assert main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path)]) == 1
+
+
+def test_cli_observe_forwards_api_url_to_orchestrate(tmp_path, monkeypatch):
+    from pipt import cli
+
+    captured: dict = {}
+    monkeypatch.setattr(cli, "orchestrate", lambda *_a, **k: captured.update(k) or (tmp_path, 0))
+    scope_file = _scope(tmp_path)
+    rc = main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path), "--observe"])
+    assert rc == 0
+    assert captured["observe"] == "http://127.0.0.1:4200/api"  # default local server, forwarded through
+
+    captured.clear()
+    main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path)])
+    assert captured["observe"] is None  # no --observe → no redirect (plain ephemeral run)
+
+
+def test_cli_serve_starts_prefect_server(monkeypatch):
+    from pipt import cli
+
+    calls: dict = {}
+
+    class _Result:
+        returncode = 0
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **_k: calls.update(cmd=cmd) or _Result())
+    assert main(["serve"]) == 0
+    assert "server" in calls["cmd"]
+    assert "start" in calls["cmd"]

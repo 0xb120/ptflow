@@ -44,6 +44,32 @@ uv run pytest tests/core/test_scope.py::test_classify  # one test
 - Ruff runs with `select = ["ALL"]`; respect the `ignore`/`per-file-ignores` in `pyproject.toml`
   rather than adding blanket `# noqa`. `ty` is the type checker (not mypy).
 
+## Observability (Prefect UI)
+
+Observability uses the framework's own GUI — the Prefect server + dashboard — kept **optional** so the
+"files on disk are the only state" invariant holds: the server is pure telemetry (run graph, task
+states, per-stage timings, logs, history); the pipeline's state stays on disk and runs identically
+without it (ephemeral).
+
+```bash
+pipt serve                                             # start the Prefect server + UI → http://127.0.0.1:4200
+uv run pipt run recon <activity> <scope.txt> --observe # stream THIS run to that UI (run graph + states + logs)
+```
+
+- **`pipt serve`** wraps `prefect server start` (foreground; its own terminal). The UI reads the local
+  SQLite (`~/.prefect/prefect.db`), so even plain runs show up there — but `--observe` is preferred.
+- **`--observe [API_URL]`** (default the local server) redirects *this run* to the persistent server via
+  `temporary_settings` (env set post-import is too late — Prefect would still spin a throwaway ephemeral
+  server and contend on the SQLite). No global profile/config change; it also captures the `pipt` logger
+  so per-stage logs land on the run.
+- The run graph is **readable + phase-grouped** because `_submit_dag` gives each task a per-stage
+  `name`/`task_run_name` (`crawl[<app_id>]`) and a band tag (`breadth`/`spanning`/`post-cluster`/`loop:N`)
+  via `with_options`; the flow run is named `<pipeline>:<activity>`. Cosmetic in ephemeral mode; the
+  payoff is in the UI.
+- *Why not Prefect's native result-cache/retry for resume instead of the `.state` markers:* see
+  the resume design — our stages return nothing (they communicate via disk), and the cache store would
+  live outside the activity workspace, breaking the file-as-only-state invariant.
+
 ## Architecture
 
 **Orchestration is a dependency DAG** (`core/orchestrator.py`). The flow is:
