@@ -298,6 +298,34 @@ def test_parse_ferox_keeps_response_records():
     ]
 
 
+def test_https_to_http_rewrites_scheme_only():
+    assert tasks.https_to_http("https://zero.webappsecurity.com") == "http://zero.webappsecurity.com"
+    assert tasks.https_to_http("https://x:8443/a?b=1") == "http://x:8443/a?b=1"
+    assert tasks.https_to_http("http://x") == "http://x"          # already http — unchanged
+    assert tasks.https_to_http("ftp://x") == "ftp://x"            # other scheme — unchanged
+
+
+def test_ferox_transport_failed_only_on_total_transport_failure():
+    # legacy-TLS handshake refused: every request errored, nothing connected → True
+    assert tasks.ferox_transport_failed(
+        '{"type":"statistics","requests":1,"errors":1,"successes":0,"certificate_errors":1}')
+    # connected but found nothing (successes > 0) → False (no fallback)
+    assert not tasks.ferox_transport_failed(
+        '{"type":"statistics","requests":500,"errors":2,"successes":498}')
+    # healthy scan killed by --time-limit emits NO statistics record, only responses → False
+    assert not tasks.ferox_transport_failed(
+        '{"type":"response","url":"https://x/a","status":200}\n')
+    assert not tasks.ferox_transport_failed("")
+
+
+def test_force_scheme_rewrites_only_mapped_hosts():
+    pins = {"zero.webappsecurity.com": "http", "shop.x.com": "https"}
+    assert tasks.force_scheme("https://zero.webappsecurity.com/a", pins) == "http://zero.webappsecurity.com/a"
+    assert tasks.force_scheme("http://shop.x.com/b?q=1", pins) == "https://shop.x.com/b?q=1"
+    assert tasks.force_scheme("https://other.com", pins) == "https://other.com"  # unmapped → unchanged
+    assert tasks.force_scheme("https://x", {}) == "https://x"                    # empty map → unchanged
+
+
 def test_parse_eyewitness_csv_keeps_default_cred_leads():
     csv_text = (
         "Protocol,Port,Domain,URL,Resolved,Request Status,Title,Category,Default Creds,Screenshot Path, Source Path\n"
@@ -514,6 +542,39 @@ def test_cluster_groups_by_signature(tmp_path):
     }
     assert by_sig["Home|100|nginx"] == ["https://a.example.com", "https://b.example.com"]
     assert by_sig["Login|50|nginx"] == ["https://c.example.com"]
+
+
+def test_cluster_honors_explicit_scope_scheme(tmp_path):
+    from pipt.core import tools
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    act.scope.write_text("http://zero.example.com\nhttps://shop.example.org\n", encoding="utf-8")
+    tools.write_jsonl(
+        act.asset_discovery_canonical("httpx_full_metadata.jsonl"),
+        [
+            {"url": "https://zero.example.com", "title": "Z", "content_length": 1, "webserver": "x"},
+            {"url": "https://shop.example.org", "title": "S", "content_length": 2, "webserver": "x"},
+            {"url": "https://api.example.net", "title": "A", "content_length": 3, "webserver": "x"},
+        ],
+    )
+    tasks.cluster(act)
+    hosts = sorted(h for a in act.list_apps() for h in tools.read_lines(a.hosts))
+    # explicit http:// honored, explicit https:// kept; a host with NO scope scheme stays httpx's https
+    assert hosts == ["http://zero.example.com", "https://api.example.net", "https://shop.example.org"]
+
+
+def test_working_schemes_prefers_content_discovery_over_hosts(tmp_path):
+    from pipt.core import tools
+    from pipt.core.paths import AppWorkspace
+
+    ws = AppWorkspace(tmp_path / "app").ensure()
+    tools.write_lines(ws.hosts, ["https://a.x.com", "http://b.x.com"])
+    tools.write_jsonl(ws.canonical("content_discovery.jsonl"),
+                      [{"url": "http://a.x.com/found", "status": 200}])  # feroxbuster reached a over http
+    s = tasks._working_schemes(ws)
+    assert s["a.x.com"] == "http"   # content_discovery evidence (post http-fallback) overrides hosts.txt
+    assert s["b.x.com"] == "http"   # from hosts.txt (no content_discovery hit)
 
 
 def test_header_signals():
