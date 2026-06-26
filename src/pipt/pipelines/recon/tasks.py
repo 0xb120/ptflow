@@ -409,6 +409,25 @@ def dedup_by_body(hosts: list[str], body_by_host: dict[str, str | None]) -> list
     return [*[r for r in reps if r], *unknown]
 
 
+def https_to_http(url: str) -> str:
+    """Rewrite the scheme of an https:// URL to http:// (scheme only — host/port/path kept); any
+    other string is returned unchanged. Pure. Used to retry a scan over http when the https endpoint
+    refuses a modern TLS handshake (see ferox_transport_failed)."""
+    return "http://" + url[len("https://"):] if url.startswith("https://") else url
+
+
+def force_scheme(url: str, by_host: dict[str, str]) -> str:
+    """Rewrite `url`'s scheme to by_host[bare-host] when that host has an entry; else unchanged. Pure.
+    The one primitive behind both scheme decisions: honoring an explicit scope scheme (cluster) and
+    routing param_fuzz to the scheme the scanners actually reached. Keyed by port-stripped host."""
+    if not by_host:
+        return url
+    scheme = by_host.get(url_host(url))
+    if not scheme:
+        return url
+    return f"{scheme}://{url.split('://', 1)[1] if '://' in url else url}"
+
+
 def denoise(urls: list[str]) -> list[str]:
     """Drop URLs to static assets (extensions in NOISE_EXTENSIONS)."""
     out: list[str] = []
@@ -551,6 +570,28 @@ def parse_ferox(out: str) -> list[dict]:
             "lines": r.get("line_count"),
         })
     return records
+
+
+def ferox_transport_failed(out: str) -> bool:
+    """True iff feroxbuster's statistics record proves it reached NOTHING — every request failed at
+    the transport layer (successes 0, errors > 0). That's the signature of an https endpoint a modern
+    TLS client refuses to handshake (legacy renegotiation / weak DH — e.g. zero.webappsecurity.com:
+    `-k` only skips cert *verification*, not these). Pure.
+
+    Deliberately narrow so the http fallback never fires spuriously: it returns False for a scan that
+    'connected but found nothing' (successes > 0), and for a healthy scan killed by --time-limit
+    (feroxbuster emits NO statistics record when interrupted, only `response` lines)."""
+    for ln in out.splitlines():
+        text = ln.strip()
+        if not text:
+            continue
+        try:
+            r = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if r.get("type") == "statistics":
+            return (r.get("successes") or 0) == 0 and (r.get("errors") or 0) > 0
+    return False
 
 
 def select_new_urls(records: list[dict], seen: set[str], *, cap: int) -> list[str]:
@@ -1069,6 +1110,19 @@ def _cluster_anchor(members: list[dict]) -> tuple[str, str]:
     return "host", max(hosts, key=lambda v: (hosts[v], v))
 
 
+def _scheme_pins(activity: Activity) -> dict[str, str]:
+    """Bare host → explicit scheme for every scope entry the operator wrote WITH a scheme
+    (http://h / https://h). httpx defaults to https and ignores the input scheme, so an explicit
+    `http://` is lost by the time cluster builds hosts.txt; this re-applies it on the scan hosts."""
+    if not activity.scope.exists():
+        return {}
+    pins: dict[str, str] = {}
+    for t in scope.parse_scope(activity.scope.read_text(encoding="utf-8", errors="replace")):
+        if t.kind == "url":
+            pins[url_host(t.raw)] = t.raw.split("://", 1)[0].lower()
+    return pins
+
+
 def cluster(activity: Activity) -> list[str]:
     """Group httpx vhosts into scans/<app_id>/ via union-find over APP-IDENTITY signals.
 
@@ -1081,6 +1135,7 @@ def cluster(activity: Activity) -> list[str]:
     """
     canon = activity.asset_discovery_canonical
     records = [r for r in tools.read_jsonl(canon("httpx_full_metadata.jsonl")) if r.get("url")]
+    pins = _scheme_pins(activity)  # honor an explicit scope scheme on the scan hosts (see _scheme_pins)
 
     app_ids: list[str] = []
     for idxs in cluster_partition(records):
@@ -1088,13 +1143,15 @@ def cluster(activity: Activity) -> list[str]:
         key, value = _cluster_anchor(members)
         app_id = _app_id(key, value)
         rep = min(members, key=lambda r: r["url"])
-        urls = tools.dedupe(r["url"] for r in members)
+        # scheme is honored at OUTPUT only — clustering keys on scheme-independent signals
+        # (favicon/body/redirect) and the id anchor on url_host, so pinning never shifts a group/id.
+        urls = tools.dedupe(force_scheme(r["url"], pins) for r in members)
         # per-host response-body hash → lets per-app stages dedup same-backend hosts (domain+IP,
         # http+https) while keeping distinct environments (staging vs test). See dedup_by_body.
-        body_by_host = {r["url"]: (r.get("hash") or {}).get("body_sha256") for r in members}
+        body_by_host = {force_scheme(r["url"], pins): (r.get("hash") or {}).get("body_sha256") for r in members}
         # raw response headers (httpx -irh) kept per host for later reasoning; header_signals is the
         # curated, gate-on-able view (cache/cdn/backend/stack/waf), unioned over the group's hosts.
-        headers_by_host = {r["url"]: (r.get("header") or {}) for r in members}
+        headers_by_host = {force_scheme(r["url"], pins): (r.get("header") or {}) for r in members}
         signals = sorted({s for hdrs in headers_by_host.values() for s in header_signals(hdrs)})
         if len(urls) > CLUSTER_MAX_HOSTS:
             log.warning("⚠ cluster %s has %d hosts — possible residual collision (id_anchor=%s)",
@@ -1805,7 +1862,20 @@ def _run_ferox(ws: AppWorkspace, hosts: list[str], words: list[str], round_idx: 
            "--smart", "-t", FEROX_THREADS, "-L", FEROX_SCAN_LIMIT, "--timeout", FEROX_TIMEOUT,
            "--time-limit", tl, "-d", FEROX_DEPTH, "-w", str(wordlist), *ext_args]
     tools.run(cmd, stdin="\n".join(hosts), stream_stderr=is_verbose())
-    return parse_ferox(out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else "")
+    raw = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
+    recs = parse_ferox(raw)
+    # An https endpoint a modern TLS client can't handshake (legacy renegotiation / weak DH) makes
+    # feroxbuster reach nothing — `-k` doesn't help (cert-only). httpx/katana (Go TLS) connect, so
+    # the host looks live; only the rustls scanner fails. Retry the same round over http (the same
+    # app on the other scheme) instead of leaving the group's content discovery empty.
+    if not recs and ferox_transport_failed(raw) and any(h.startswith("https://") for h in hosts):
+        http_hosts = tools.dedupe([https_to_http(h) for h in hosts])
+        log.warning("  ⚠ feroxbuster (%s) r%d — https unreachable (legacy-TLS handshake refused); "
+                    "retrying over http", app_id, round_idx)
+        tools.run(cmd, stdin="\n".join(http_hosts), stream_stderr=is_verbose())
+        raw = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
+        recs = parse_ferox(raw)
+    return recs
 
 
 def _download_and_mine(ws: AppWorkspace, urls: list[str], round_idx: int) -> list[str]:
@@ -2069,25 +2139,47 @@ def _run_x8(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: 
     return parse_x8(out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else "")
 
 
+def _working_schemes(ws: AppWorkspace) -> dict[str, str]:
+    """Bare host → the scheme the scanners actually reached this app on: the cluster hosts.txt scheme
+    (which already honors an explicit scope scheme), overridden by the scheme of content_discovery's
+    hit URLs — empirical proof of the reachable scheme, including feroxbuster's http fallback for an
+    https endpoint a strict-TLS client refuses (legacy renegotiation / weak DH). Lets param_fuzz route
+    arjun/x8 to that scheme instead of httpx's https guess: both fail the same handshake SILENTLY (no
+    error, no params — indistinguishable from a clean 0-param result), so there's no signal to retry
+    on reactively the way feroxbuster's statistics record allows."""
+    schemes: dict[str, str] = {}
+    for h in tools.read_lines(ws.hosts):
+        if "://" in h:
+            schemes.setdefault(url_host(h), h.split("://", 1)[0])
+    for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl")):
+        u = r.get("url")
+        if u and "://" in u:
+            schemes[url_host(u)] = u.split("://", 1)[0]
+    return schemes
+
+
 def param_fuzz(activity: Activity, app_id: str) -> None:
     """LOOP 3 — hidden-parameter discovery (arjun ∥ x8) over the app's enumerated endpoints.
 
     Selects the endpoints to test (`select_param_endpoints`): the loop-1/2 endpoint artifacts
     (endpoints.txt + endpoints_js/headless + 2xx content_discovery hits), scoped to the group's hosts,
     deduped by path-template and capped (PARAM_MAX_ENDPOINTS) — one representative per endpoint shape,
-    since arjun/x8 are request-heavy. Runs arjun ∥ x8 (best-effort, like the secret fleet) with the
-    `params` role wordlist, merges their finds by (url, param) → params.jsonl (a deliverable + the
-    input the future DAST consumes). Reads loop-2 artifacts across the barrier — no `needs`.
+    since arjun/x8 are request-heavy. Target schemes are normalized to the reachable scheme first
+    (`_working_schemes`) so the cap isn't spent on https URLs a strict-TLS client can't handshake.
+    Runs arjun ∥ x8 (best-effort, like the secret fleet) with the `params` role wordlist, merges their
+    finds by (url, param) → params.jsonl (a deliverable + the input the future DAST consumes). Reads
+    loop-2 artifacts across the barrier — no `needs`.
     """
     ws = activity.app(app_id)
     in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
-    urls = [
+    schemes = _working_schemes(ws)  # route arjun/x8 to the scheme the scanners reached (http fallback)
+    urls = [force_scheme(u, schemes) for u in [
         *tools.read_lines(ws.canonical("endpoints.txt")),
         *tools.read_lines(ws.canonical("endpoints_js.txt")),
         *tools.read_lines(ws.canonical("endpoints_headless.txt")),
         *[r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
           if r.get("url") and 200 <= (r.get("status") or 0) < 300],  # noqa: PLR2004
-    ]
+    ]]
     targets = select_param_endpoints(urls, in_scope, cap=PARAM_MAX_ENDPOINTS)
     if not targets:
         log.debug("  · skip param_fuzz (no endpoints) for %s", app_id)

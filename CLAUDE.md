@@ -470,6 +470,29 @@ its centerpiece. Open it locally in a browser; a git diff of it shows exactly ho
 The architecture sections above say *what* the recon pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
 
+- **Scan scheme = the one that WORKS for the scanners, not httpx's https guess.** httpx (breadth) is
+  fed bare hosts, defaults to https, and *ignores the input scheme* — and its Go TLS happily
+  handshakes a legacy endpoint (unsafe renegotiation / weak DH) that rustls/OpenSSL scanners refuse,
+  so `hosts.txt` came out `https://` and feroxbuster/arjun/x8 then reached **nothing** (`-k` is
+  cert-only; no flag fixes it). Two complementary mechanisms fix this. **(1) Honor an explicit scope
+  scheme:** `cluster` re-applies the operator's `http://`/`https://` onto the group's hosts
+  (`_scheme_pins` + `force_scheme`), at OUTPUT only — clustering keys on scheme-independent signals
+  and the id anchor on `url_host`, so pinning never shifts a group/`app_id`. **(2) Reach the working
+  scheme automatically** where no scheme was given (discovered subdomains): feroxbuster detects a
+  total transport failure from its `statistics` record (`ferox_transport_failed`: successes 0 &
+  errors > 0 — distinct from "found nothing" and from a `--time-limit` kill, which emits no stats)
+  and retries the round over http; param_fuzz can't do the same reactively (arjun/x8 fail the
+  handshake **silently** — no signal, indistinguishable from a clean 0-param result), so it instead
+  routes targets to the empirically-reached scheme (`_working_schemes`: `hosts.txt` scheme overridden
+  by `content_discovery.jsonl` hit URLs, which already carry feroxbuster's http fallback). *Why not
+  `-nfs`/`-nf` on httpx:* `-nfs` (honor input scheme) flips *every* schemeless discovered host to
+  http (kills the https default) and `-nf` (probe both) doubles breadth records yet still can't tell
+  the scheme that works for the *scanners* (httpx's https probe succeeds regardless). *Why not a
+  curl/openssl preflight probe:* extra per-host network cost on the healthy path; the reactive
+  detect-and-fallback pays only on actual failure. *Rejected:* leaving it to `-k` (cert-only, no
+  effect); `OPENSSL_CONF` legacy-renegotiation (feroxbuster is rustls, unaffected; the server also
+  has a weak DH key — two strikes).
+
 - **Content discovery is a bounded cross-tool FIXPOINT, not a single feroxbuster pass.** Round 0 is
   the classic `--smart` forced-browse; then `_content_rounds` feeds feroxbuster's NEW 2xx/3xx hits
   back through download → mine (jsluice + tokenize) → fuzz the new token delta, until convergence.
