@@ -2,7 +2,10 @@
 
 A reusable framework (`core/`) hosting pluggable `pipelines/<name>/`. **Files on
 disk are the only state — no database.** A breadth asset-discovery phase feeds a
-clustering step that fans out into per-app depth loops.
+clustering step that fans out into per-app depth loops. The recon pipeline runs
+those loops **surface-first, DAST-first**: map the explorable surface (OSINT/crawl)
+and DAST *that* for low-hanging fruit, then guess/fuzz, then DAST the guessed surface
+— each phase separated by a global barrier.
 
 ## Quickstart
 

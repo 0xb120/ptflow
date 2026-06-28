@@ -31,24 +31,44 @@ class ReconPipeline:
         Stage("nuclei_scope", tasks.nuclei_scope, needs=("httpx",), spanning=True),
         # post-cluster spanning — ONE batched screenshot run (1 host/group) → unified gallery, ∥ loops
         Stage("screenshot", tasks.screenshot_all, cluster_scope=True),
-        # per-app LOOP 1 — enumeration (after cluster fan-out)
+        # ── per-app PHASE 1 — EXPLORABLE SURFACE (OSINT + crawl, NO guessing) ────────────────────────
+        # Map only what's really there: passive/crawl/headless + API specs, mine the corpus offline, and
+        # assemble the surface request catalog (requests.jsonl). No fuzzing/guessing in this phase.
         Stage("passive_probe", tasks.passive_probe, per_app=True, phase=1),
         Stage("crawl", tasks.crawl, needs=("passive_probe",), per_app=True, phase=1),
         # gated TIER-1 headless crawl — runs only on the JS-rendered bucket (∥ takeover)
         Stage("crawl_headless", tasks.crawl_headless, needs=("crawl",), per_app=True, phase=1),
         Stage("subenum", tasks.subenum, per_app=True, phase=1),  # ∥ passive_probe/crawl
         Stage("takeover", tasks.takeover, needs=("crawl", "subenum"), per_app=True, phase=1),
-        # per-app LOOP 2 — content discovery (reads loop-1 artifacts across the barrier)
-        Stage("wordlist", tasks.build_wordlist, per_app=True, phase=2, net=False),  # offline tokenise
-        Stage("fetch_delta", tasks.fetch_delta, per_app=True, phase=2),  # ∥ wordlist
-        Stage("mine_responses", tasks.mine_responses, needs=("fetch_delta",), per_app=True, phase=2,
+        # download the OSINT/crawley delta, then mine the corpus offline (extract + jsluice endpoints)
+        Stage("fetch_delta", tasks.fetch_delta, needs=("crawl_headless",), per_app=True, phase=1),
+        # API spec discovery (OpenAPI/Swagger/GraphQL) → requests_api.jsonl (∥; reads hosts only)
+        Stage("api_spec", tasks.api_spec, per_app=True, phase=1),
+        Stage("mine_responses", tasks.mine_responses, needs=("fetch_delta",), per_app=True, phase=1,
               net=False),  # offline: extract + jsluice the stored corpus, no network
-        Stage("tech_enum", tasks.tech_enum, needs=("wordlist",), per_app=True, phase=2),
-        Stage("content_discovery", tasks.content_discovery,
-              needs=("wordlist", "tech_enum", "mine_responses"), per_app=True, phase=2),
-        # per-app LOOP 3 — deep enumeration: hidden-parameter discovery (feeds the planned DAST).
-        # Reads loop-2 endpoint artifacts across the barrier (no cross-loop needs).
-        Stage("param_fuzz", tasks.param_fuzz, per_app=True, phase=3),
+        # surface request catalog — crawl/headless/API + shapes mined from the crawl corpus, NO guessed
+        # surface (content_discovery/recrawl run later). The full-request DAST input for phase 2.
+        Stage("request_catalog", tasks.request_catalog,
+              needs=("crawl_headless", "mine_responses", "api_spec"), per_app=True, phase=1, net=False),
+        # ── per-app PHASE 2 — DAST the explorable surface (low-hanging fruit) ────────────────────────
+        # nuclei -dast over the surface catalog (observed params) — fast, high-signal findings on the
+        # real attack surface BEFORE sinking hours into fuzzing. Reads requests.jsonl across the barrier.
+        Stage("dast", tasks.dast, per_app=True, phase=2),
+        # ── per-app PHASE 3 — guessing / surface expansion ──────────────────────────────────────────
+        # build the fuzzing seed offline (JS/body/seed parsing), run the per-stack surface scanners, then
+        # the content-discovery fixpoint; recrawl re-seeds katana on new-territory entry points it found.
+        Stage("wordlist", tasks.build_wordlist, per_app=True, phase=3, net=False),
+        Stage("tech_enum", tasks.tech_enum, needs=("wordlist",), per_app=True, phase=3),
+        Stage("content_discovery", tasks.content_discovery, needs=("wordlist", "tech_enum"),
+              per_app=True, phase=3),
+        Stage("recrawl", tasks.recrawl, needs=("content_discovery",), per_app=True, phase=3),
+        # ── per-app PHASE 4 — DAST the guessed surface (detailed) ───────────────────────────────────
+        # rebuild the catalog INCLUDING the guessed surface (requests_full.jsonl), discover hidden params,
+        # then DAST only the DELTA vs phase 2 + the param-injection requests (no re-DAST of the surface).
+        Stage("request_catalog_full", tasks.request_catalog_full, per_app=True, phase=4, net=False),
+        Stage("param_fuzz", tasks.param_fuzz, needs=("request_catalog_full",), per_app=True, phase=4),
+        Stage("dast_full", tasks.dast_full, needs=("request_catalog_full", "param_fuzz"),
+              per_app=True, phase=4),
     )
 
     def cluster(self, activity: Activity) -> list[str]:
