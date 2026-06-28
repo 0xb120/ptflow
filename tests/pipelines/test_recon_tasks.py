@@ -1,3 +1,5 @@
+import json
+
 from pipt.core.scope import Target
 from pipt.pipelines.recon import tasks
 
@@ -193,9 +195,9 @@ def test_pipeline_object_shape():
     assert app == [
         "passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
         "fetch_delta", "api_spec", "mine_responses", "request_catalog",
-        "dast",
+        "dast", "cve_lookup",
         "wordlist", "tech_enum", "content_discovery", "recrawl",
-        "request_catalog_full", "param_fuzz", "dast_full",
+        "request_catalog_full", "param_fuzz", "dast_full", "cve_lookup_full",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
     # httpx is the breadth tail; the expensive full scan runs ∥ as a spanning chain → nerva
@@ -215,6 +217,14 @@ def test_pipeline_object_shape():
     # screenshot is a post-cluster spanning step (cluster_scope), NOT a per-app loop-1 step
     assert by_name["screenshot"].cluster_scope is True
     assert by_name["screenshot"].per_app is False
+
+
+def test_pipeline_phase_wiring():
+    """The 4-phase surface-first/DAST-first per-app model: phase numbers + intra-phase `needs`
+    (cross-phase ordering is the barrier, never `needs`)."""
+    from pipt.pipelines.recon.pipeline import PIPELINE
+
+    by_name = {s.name: s for s in PIPELINE.stages}
     # PHASE 1 = explorable surface (OSINT + crawl, NO guessing): crawl/headless + delta fetch + offline
     # mine + the SURFACE request catalog (requests.jsonl). fetch_delta needs the full crawl store; the
     # surface catalog needs the records + extracted corpus.
@@ -226,10 +236,15 @@ def test_pipeline_object_shape():
     assert by_name["mine_responses"].needs == ("fetch_delta",)
     assert by_name["request_catalog"].net is False    # offline merge → requests.jsonl (surface only)
     assert set(by_name["request_catalog"].needs) == {"crawl_headless", "mine_responses", "api_spec"}
-    # PHASE 2 = DAST the explorable surface (low-hanging fruit): reads requests.jsonl across the barrier
+    # PHASE 2 = DAST the explorable surface (low-hanging fruit): reads requests.jsonl across the barrier.
+    # cve_lookup runs ∥ dast (same phase, no needs) — OFFLINE CVE correlation (net=False).
     assert by_name["dast"].phase == 2
     assert by_name["dast"].per_app is True
     assert by_name["dast"].needs == ()
+    assert by_name["cve_lookup"].phase == 2
+    assert by_name["cve_lookup"].per_app is True
+    assert by_name["cve_lookup"].net is False
+    assert by_name["cve_lookup"].needs == ()
     # PHASE 3 = guessing / surface expansion: wordlist seed → tech_enum → content_discovery fixpoint →
     # recrawl. wordlist reads the PHASE-1 corpus across the barrier (no needs); content_discovery no
     # longer needs mine_responses (cross-barrier now).
@@ -242,12 +257,15 @@ def test_pipeline_object_shape():
     assert by_name["recrawl"].needs == ("content_discovery",)
     # PHASE 4 = DAST the guessed surface (detailed): full catalog (requests_full.jsonl) → param_fuzz →
     # dast_full (delta vs the surface catalog + param-injection requests).
-    phase4 = ("request_catalog_full", "param_fuzz", "dast_full")
+    # cve_lookup_full runs ∥ dast_full (same phase, no needs) over the EXPANDED enumeration, OFFLINE.
+    phase4 = ("request_catalog_full", "param_fuzz", "dast_full", "cve_lookup_full")
     assert {by_name[n].phase for n in phase4} == {4}
     assert by_name["request_catalog_full"].net is False
     assert by_name["request_catalog_full"].needs == ()   # reads PHASE-1 + PHASE-3 across barriers
     assert by_name["param_fuzz"].needs == ("request_catalog_full",)
     assert set(by_name["dast_full"].needs) == {"request_catalog_full", "param_fuzz"}
+    assert by_name["cve_lookup_full"].net is False
+    assert by_name["cve_lookup_full"].needs == ()
 
 
 def test_depth_pure_helpers():
@@ -1297,3 +1315,92 @@ def test_select_recrawl_seeds_first_segment_is_conservative_for_subdirs():
 def test_select_recrawl_seeds_caps():
     discovered = [f"https://app.test/new{i}/x" for i in range(20)]
     assert len(tasks.select_recrawl_seeds(discovered, [], {"app.test"}, cap=5)) == 5
+
+
+# --- CVE lookup (phase 2 surface + phase 4 deep) — pure helpers ---
+def test_norm_version_strips_patch_and_requires_minor():
+    assert tasks._norm_version("6.6.1p1") == "6.6.1"            # SSH patch suffix dropped
+    assert tasks._norm_version("Apache/2.4.7 (Ubuntu)") == "2.4.7"
+    assert tasks._norm_version("v1.11.0") == "1.11.0"
+    assert tasks._norm_version("9") is None                     # bare major is too vague → version-pinned
+    assert tasks._norm_version("") is None
+
+
+def test_tech_software_keeps_only_versioned():
+    out = tasks._tech_software(["Apache HTTP Server:2.4.7", "WordPress", "jQuery:1.11.0"])
+    assert ("Apache HTTP Server", "2.4.7") in out
+    assert ("jQuery", "1.11.0") in out
+    assert all(name != "WordPress" for name, _ in out)          # version-less dropped
+
+
+def test_header_software_parses_server_header():
+    assert tasks._header_software("Apache/2.4.7 (Ubuntu)") == ("Apache", "2.4.7")
+    assert tasks._header_software("nginx/1.18.0") == ("nginx", "1.18.0")
+    assert tasks._header_software("nginx") is None              # no version → skip
+    assert tasks._header_software("") is None
+
+
+def test_banner_software_known_services():
+    assert tasks._banner_software("SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2.13") == ("OpenSSH", "6.6.1")
+    assert tasks._banner_software("220 (vsFTPd 3.0.2)") == ("vsftpd", "3.0.2")
+    assert tasks._banner_software("something unrecognized") is None
+
+
+def test_corpus_software_mines_lib_and_generator():
+    texts = ["/*! jQuery v1.11.0 | (c) jQuery Foundation */",
+             '<meta name="generator" content="WordPress 5.2">']
+    out = dict(tasks._corpus_software(texts))
+    assert out.get("jQuery") == "1.11.0"
+    assert out.get("WordPress") == "5.2"
+
+
+def test_collect_software_dedups_and_attributes_sources():
+    sw = tasks.collect_software(
+        tech=["jQuery:1.11.0"], server="Apache/2.4.7",
+        services=[("scanme.test:22", "SSH-2.0-OpenSSH_6.6.1p1")],
+        corpus_texts=["Bootstrap v3.3.7"], app_hosts=["app.test"])
+    by_prod = {r["product"]: r for r in sw}
+    assert by_prod["Apache"]["version"] == "2.4.7"
+    assert by_prod["Apache"]["sources"] == ["server"]
+    assert by_prod["OpenSSH"]["where"] == ["scanme.test:22"]   # service attributed to its host:port
+    assert by_prod["jQuery"]["where"] == ["app.test"]          # app-level sources → the group's hosts
+    assert by_prod["Bootstrap"]["sources"] == ["corpus"]
+
+
+def test_parse_search_vulns_no_match_returns_none():
+    out = '{"OpenSSH 6.6.1": "Warning: Could not find matching software for query"}'
+    assert tasks.parse_search_vulns(out, "OpenSSH", "6.6.1") is None
+    assert tasks.parse_search_vulns("not json", "x", "1.0") is None
+
+
+def test_parse_search_vulns_extracts_finding_fields():
+    out = json.dumps({"vsftpd 3.0.2": {"product_ids": {"cpe": ["cpe:2.3:a:vsftpd_project:vsftpd:3.0.2"]},
+        "vulns": {"CVE-2021-3618": {"id": "CVE-2021-3618", "match_reason": "version_in_range",
+            "description": "ALPACA", "published": "2022-03-23", "cisa_kev": False, "exploits": [],
+            "cwe_ids": ["CWE-295"],
+            "severity": {"CVSS": {"score": "7.4", "version": "3.1"}, "EPSS": {"score": "0.00615"}}}}}})
+    recs = tasks.parse_search_vulns(out, "vsftpd", "3.0.2")
+    assert len(recs) == 1
+    r = recs[0]
+    assert r["cve"] == "CVE-2021-3618"
+    assert r["cvss"] == "7.4"
+    assert r["epss"] == "0.00615"
+    assert r["kev"] is False
+    assert r["exploited"] is False
+    assert r["product"] == "vsftpd"
+    assert r["cpe"].startswith("cpe:2.3:a:vsftpd")
+
+
+def test_parse_search_vulns_exploited_when_kev_or_exploits():
+    out = json.dumps({"q": {"product_ids": {"cpe": []}, "vulns": {"CVE-2000-0001": {
+        "id": "CVE-2000-0001", "cisa_kev": True, "exploits": [], "severity": {}}}}})
+    assert tasks.parse_search_vulns(out, "p", "1.0")[0]["exploited"] is True   # KEV ⇒ exploited
+
+
+def test_cve_sort_key_prioritizes_exploited_then_cvss():
+    rows = [
+        {"cve": "CVE-A", "exploited": False, "kev": False, "cvss": "9.8"},
+        {"cve": "CVE-B", "exploited": True, "kev": False, "cvss": "5.0"},
+        {"cve": "CVE-C", "exploited": False, "kev": False, "cvss": None},
+    ]
+    assert [r["cve"] for r in sorted(rows, key=tasks._cve_sort_key)] == ["CVE-B", "CVE-A", "CVE-C"]

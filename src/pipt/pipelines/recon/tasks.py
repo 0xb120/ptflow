@@ -335,6 +335,17 @@ X8 = str(_X8_BIN) if _X8_BIN.exists() else "x8"
 _NUCLEI_DAST_TEMPLATES = Path.home() / "nuclei-templates" / "dast"
 NUCLEI_DAST_TEMPLATES = os.environ.get("PIPT_NUCLEI_DAST_TEMPLATES") or str(_NUCLEI_DAST_TEMPLATES)
 
+# CVE lookup (PHASE 2 surface + PHASE 4 deep) — search_vulns correlates the ENUMERATED software
+# (web server + app tech + non-HTTP service banners + corpus-mined libs) against its LOCAL vuln DB
+# (NVD+GHSA+ExploitDB+EPSS), fully OFFLINE (net=False — no target traffic). The DB is built/refreshed
+# out-of-band (`search_vulns -u`); the stage skips best-effort if the binary or DB is absent. Override
+# the binary path with PIPT_SEARCH_VULNS.
+_SEARCH_VULNS_BIN = Path.home() / ".local" / "bin" / "search_vulns"
+SEARCH_VULNS = os.environ.get("PIPT_SEARCH_VULNS") or (
+    str(_SEARCH_VULNS_BIN) if _SEARCH_VULNS_BIN.exists() else "search_vulns")
+CVE_TOOL_TIMEOUT = 90   # per-query wall-clock cap (offline, but a runaway query must not hang the loop)
+CVE_FANOUT = 4          # concurrent search_vulns queries per app (offline → modest)
+
 # EyeWitness (optional, screenshot step) — known venv install (own .venv + Python/EyeWitness.py);
 # resolved by _eyewitness_cmd (overridable via PIPT_EYEWITNESS / `eyewitness` on PATH).
 _EYEWITNESS_DIR = Path("/opt/EyeWitness")
@@ -370,7 +381,7 @@ _CORE_TOOLS = {
 _OPTIONAL_TOOLS = {
     "crawley": CRAWLEY, "jsluice": JSLUICE, "shortscan": SHORTSCAN, "shortutil": SHORTUTIL,
     "gitleaks": GITLEAKS, "trufflehog": TRUFFLEHOG, "detect-secrets": DETECT_SECRETS,
-    "arjun": ARJUN, "x8": X8,
+    "arjun": ARJUN, "x8": X8, "search_vulns": SEARCH_VULNS,
 }
 
 
@@ -3442,3 +3453,311 @@ def dast_full(activity: Activity, app_id: str) -> None:
     requests_ = dast_requests(delta, tools.read_jsonl(ws.canonical("params.jsonl")),
                               cap=DAST_MAX_REQUESTS)
     _run_dast(ws, requests_, input_name="input_full.jsonl", out_name="dast_full.jsonl", label=app_id)
+
+
+# --- CVE lookup (PHASE 2 surface + PHASE 4 deep) — search_vulns over the ENUMERATED software --------
+# OFFLINE correlation (net=False): no target traffic, just the enumerated software (web server + app
+# tech + non-HTTP service banners + libs mined from the crawl corpus) against search_vulns' local DB.
+_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")          # dotted version, ≥ X.Y (single major is too vague)
+_CVE_BODY_HEAD = 4096                               # bytes/body to scan — lib banners live at the head
+_CVE_DESC_MAX = 500                                 # trim CVE descriptions in the finding record
+# service banners (nerva metadata.banner) → (product, version). Precision-first: only known patterns.
+_BANNER_PATTERNS = (
+    (re.compile(r"OpenSSH[_/ ]?([\w.]+)", re.IGNORECASE), "OpenSSH"),
+    (re.compile(r"vsFTPd[_/ ]?([\w.]+)", re.IGNORECASE), "vsftpd"),
+    (re.compile(r"ProFTPD[_/ ]?([\w.]+)", re.IGNORECASE), "ProFTPD"),
+    (re.compile(r"Exim[_/ ]?([\w.]+)", re.IGNORECASE), "Exim"),
+    (re.compile(r"Sendmail[_/ ]?([\w.]+)", re.IGNORECASE), "Sendmail"),
+    (re.compile(r"MariaDB[_/ -]?([\w.]+)", re.IGNORECASE), "MariaDB"),
+    (re.compile(r"MySQL[_/ ]?([\w.]+)", re.IGNORECASE), "MySQL"),
+    (re.compile(r"PostgreSQL[_/ ]?([\w.]+)", re.IGNORECASE), "PostgreSQL"),
+    (re.compile(r"Redis(?:[_/ ]?server)?[_/ ]?v?([\w.]+)", re.IGNORECASE), "Redis"),
+)
+# crawl-corpus library banners (JS file heads / HTML) → (product, version). Precision-first.
+_CORPUS_PATTERNS = (
+    (re.compile(r"jQuery(?: JavaScript Library)? v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "jQuery"),
+    (re.compile(r"jQuery UI[ -]?(?:v)?(\d+\.\d+[\d.]*)", re.IGNORECASE), "jQuery UI"),
+    (re.compile(r"Bootstrap v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Bootstrap"),
+    (re.compile(r"AngularJS v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "AngularJS"),
+    (re.compile(r"Vue(?:\.js)? v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Vue.js"),
+    (re.compile(r"Lodash v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Lodash"),
+    (re.compile(r"Moment\.js v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Moment.js"),
+    (re.compile(r"\bReact v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "React"),
+    (re.compile(r"\bD3(?:\.js)? v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "D3"),
+)
+_GENERATOR_RE = re.compile(r'name=["\']generator["\'][^>]*content=["\']([^"\']+)["\']', re.IGNORECASE)
+
+_CVE_CACHE: dict[tuple[str, str], list[dict]] = {}   # (product.lower, version) → CVE records
+_CVE_CACHE_LOCK = threading.Lock()                   # the fan-out runs in one process → dedup across apps
+
+
+def _norm_version(raw: object) -> str | None:
+    """First dotted version (≥ X.Y) in `raw`, patch/build suffix dropped: '6.6.1p1'→'6.6.1',
+    'Apache/2.4.7 (Ubuntu)'→'2.4.7'. None if no usable version (precision-first: version-pinned only).
+    Pure."""
+    m = _VERSION_RE.search(str(raw or ""))
+    return m.group(0) if m else None
+
+
+def _split_name_version(s: str) -> tuple[str, str] | None:
+    """A 'Name X.Y.Z' / 'Name:X.Y.Z' string → (name, normalized version). None if no version. Pure."""
+    name, _, rest = s.partition(":")
+    ver = _norm_version(rest) if rest else None
+    if ver:
+        return name.strip(), ver
+    m = _VERSION_RE.search(s)                        # fall back to a trailing 'Name 1.2.3' form
+    if m:
+        name = s[:m.start()].strip(" /_-:")
+        if name:
+            return name, m.group(0)
+    return None
+
+
+def _tech_software(tech: Iterable[str]) -> list[tuple[str, str]]:
+    """wappalyzer tech entries ('Apache HTTP Server:2.4.7', 'jQuery:1.11.0') → version-pinned
+    (product, version) pairs (version-less entries dropped). Pure."""
+    return [pv for raw in tech if (pv := _split_name_version(str(raw).strip()))]
+
+
+def _header_software(server: object) -> tuple[str, str] | None:
+    """A Server header ('Apache/2.4.7 (Ubuntu)', 'nginx/1.18.0', 'Microsoft-IIS/10.0') →
+    (product, version). None if no version. Pure."""
+    s = str(server or "").strip()
+    if not s:
+        return None
+    name, sep, rest = s.partition("/")
+    ver = _norm_version(rest) if sep else _norm_version(s)
+    name = name.strip()
+    return (name, ver) if (name and ver) else None
+
+
+def _banner_software(banner: object) -> tuple[str, str] | None:
+    """A non-HTTP service banner (nerva metadata.banner, e.g. 'SSH-2.0-OpenSSH_6.6.1p1 Ubuntu…') →
+    (product, version) via the known _BANNER_PATTERNS. None if unrecognized / no version. Pure."""
+    text = str(banner or "")
+    for rx, product in _BANNER_PATTERNS:
+        m = rx.search(text)
+        if m and m.groups() and (ver := _norm_version(m.group(1))):
+            return product, ver
+    return None
+
+
+def _corpus_software(texts: Iterable[str]) -> list[tuple[str, str]]:
+    """Library/CMS versions mined from crawl-corpus body heads — JS lib banners (_CORPUS_PATTERNS) +
+    the HTML <meta generator> tag. version-pinned, deduped. Pure (offline mining)."""
+    out: set[tuple[str, str]] = set()
+    for text in texts:
+        for rx, product in _CORPUS_PATTERNS:
+            m = rx.search(text)
+            if m and (ver := _norm_version(m.group(1))):
+                out.add((product, ver))
+        gm = _GENERATOR_RE.search(text)
+        if gm and (pv := _split_name_version(gm.group(1))):
+            out.add(pv)
+    return sorted(out)
+
+
+def collect_software(*, tech: Iterable[str], server: object, services: Iterable[tuple[str, str]],
+                     corpus_texts: Iterable[str], app_hosts: Iterable[str]) -> list[dict]:
+    """Deduped ENUMERATED software → [{product, version, sources, where}], version-pinned. Sources:
+    web server (Server header), app tech (wappalyzer), non-HTTP service banners ((host:port, banner)),
+    libs mined from the crawl corpus. tech/server/corpus are attributed to the app's hosts; a service
+    banner to its own host:port. Pure — the query/attribution set for search_vulns."""
+    grp = sorted(set(app_hosts))
+    by_pv: dict[tuple[str, str], dict[str, set]] = {}
+
+    def add(product: str, version: str, source: str, where: Iterable[str]) -> None:
+        e = by_pv.setdefault((product, version), {"sources": set(), "where": set()})
+        e["sources"].add(source)
+        e["where"].update(where)
+
+    for product, version in _tech_software(tech):
+        add(product, version, "tech", grp)
+    if (hh := _header_software(server)):
+        add(hh[0], hh[1], "server", grp)
+    for hostport, banner in services:
+        if (sw := _banner_software(banner)):
+            add(sw[0], sw[1], "service", [hostport])
+    for product, version in _corpus_software(corpus_texts):
+        add(product, version, "corpus", grp)
+    return [{"product": p, "version": v, "sources": sorted(e["sources"]), "where": sorted(e["where"])}
+            for (p, v), e in sorted(by_pv.items())]
+
+
+def parse_search_vulns(out: str, product: str, version: str) -> list[dict] | None:
+    """Parse `search_vulns -f json` for ONE query into CVE finding records, or None when the query
+    matched NO product (so the caller can retry a coarser version). A match with zero vulns → []. Pure."""
+    try:
+        data = json.loads(out)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+    entry = next(iter(data.values()))
+    if not isinstance(entry, dict):          # "Warning: Could not find matching software for query"
+        return None
+    product_ids = entry.get("product_ids")
+    cpes = product_ids.get("cpe") if isinstance(product_ids, dict) else None
+    cpes = cpes if isinstance(cpes, list) else []
+    vulns = entry.get("vulns")
+    if not isinstance(vulns, dict):          # matched a product but no vulns → empty (not a no-match)
+        return []
+    recs: list[dict] = []
+    for cve_id, v in vulns.items():
+        if not isinstance(v, dict):
+            continue
+        sev = v.get("severity")
+        sev = sev if isinstance(sev, dict) else {}
+        cvss = sev.get("CVSS")
+        cvss = cvss if isinstance(cvss, dict) else {}
+        epss = sev.get("EPSS")
+        epss = epss if isinstance(epss, dict) else {}
+        exploits = v.get("exploits") or []
+        kev = bool(v.get("cisa_kev"))
+        desc = v.get("description")
+        recs.append({
+            "cve": cve_id, "product": product, "version": version,
+            "cvss": cvss.get("score"), "cvss_version": cvss.get("version"),
+            "epss": epss.get("score"), "kev": kev, "exploited": bool(exploits) or kev,
+            "exploits": exploits, "cwe": v.get("cwe_ids") or [], "match_reason": v.get("match_reason"),
+            "published": v.get("published"), "cpe": cpes[0] if cpes else None,
+            "description": (desc if isinstance(desc, str) else "")[:_CVE_DESC_MAX],
+        })
+    return recs
+
+
+def _search_vulns_query(product: str, version: str) -> list[dict]:
+    """Query search_vulns for the EXACT (product, version), version-pinned, memoized process-wide.
+
+    `--use-created-product-ids`: when cpe_search can't find a product ID for the exact version (e.g.
+    'OpenSSH 6.6.1', whose CPE isn't indexed under that string), search_vulns SYNTHESIZES one at that
+    exact version and still does the CPE version-range ('between') check correctly — so we never query a
+    DIFFERENT version (a coarser one would falsely add/drop the exact-version-pinned CVEs). It's a no-op
+    for products that already match, and never fabricates a match for an unknown product (→ 0 CVEs).
+    Best-effort: [] on timeout/error/no-match. Offline (reads the local DB; no target traffic)."""
+    key = (product.lower(), version)
+    with _CVE_CACHE_LOCK:
+        if key in _CVE_CACHE:
+            return _CVE_CACHE[key]
+    result: list[dict] = []
+    try:
+        out = tools.run([SEARCH_VULNS, "-q", f"{product} {version}", "-f", "json",
+                         "--ignore-general-product-vulns", "--use-created-product-ids"],
+                        timeout=CVE_TOOL_TIMEOUT)
+        result = parse_search_vulns(out, product, version) or []   # None (no match) / [] (no vulns) → []
+    except subprocess.TimeoutExpired:
+        log.warning("⚠ search_vulns hit the %ds cap for '%s %s'", CVE_TOOL_TIMEOUT, product, version)
+    except OSError:
+        pass
+    with _CVE_CACHE_LOCK:
+        _CVE_CACHE[key] = result
+    return result
+
+
+def _corpus_texts(ws: AppWorkspace) -> list[str]:
+    """Head of each extracted body (JS lib / HTML generator banners live at the top) for offline
+    version mining. Reuses the corpus _extract_bodies already wrote (idempotent), reading at most
+    _CVE_BODY_HEAD bytes/file."""
+    bodies, _ = _extract_bodies(ws)
+    if bodies is None:
+        return []
+    texts: list[str] = []
+    for p in sorted([*bodies.glob("*.js"), *bodies.glob("*.html")]):
+        try:
+            texts.append(p.read_text(encoding="utf-8", errors="replace")[:_CVE_BODY_HEAD])
+        except OSError:
+            continue
+    return texts
+
+
+def _app_service_banners(activity: Activity, meta: dict) -> list[tuple[str, str]]:
+    """Non-HTTP service banners (nerva) on THIS app's hosts → [(host:port, banner)]. Maps a nerva record
+    to the app by hostname, or by IP via domain_ip_map.txt. Best-effort: [] if nerva output is absent."""
+    canon = activity.asset_discovery_canonical
+    nerva = canon("nerva_full_metadata.jsonl")
+    recs = tools.read_jsonl(nerva) if nerva.exists() else []
+    if not recs:
+        return []
+    app_hosts = {url_host(h) for h in (meta.get("hosts") or [])}
+    app_ips: set[str] = set()
+    dim = canon("domain_ip_map.txt")
+    if dim.exists():
+        for line in tools.read_lines(dim):
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in app_hosts:  # noqa: PLR2004
+                app_ips.add(parts[1])
+    out: list[tuple[str, str]] = []
+    for r in recs:
+        host, ip, port = r.get("host"), r.get("ip"), r.get("port")
+        banner = (r.get("metadata") or {}).get("banner") or ""
+        if banner and (host in app_hosts or (ip and ip in app_ips)):
+            out.append((f"{host or ip}:{port}", banner))
+    return out
+
+
+def _app_software(activity: Activity, ws: AppWorkspace) -> list[dict]:
+    """Gather the app's ENUMERATED software (web server + tech + service banners + corpus libs) →
+    collect_software records. Reads meta.json + breadth nerva + the extracted corpus (current state)."""
+    meta = workspace.read_meta(ws.meta)
+    servers = [h.get("Server") or h.get("server") for h in (meta.get("headers_by_host") or {}).values()]
+    server = next((s for s in servers if s), None) or meta.get("webserver")
+    return collect_software(
+        tech=meta.get("tech") or [], server=server,
+        services=_app_service_banners(activity, meta), corpus_texts=_corpus_texts(ws),
+        app_hosts=[url_host(h) for h in (meta.get("hosts") or [])])
+
+
+def _cve_sort_key(f: dict) -> tuple:
+    """Triage order: known-exploited/KEV first, then by CVSS desc, then CVE id. Pure."""
+    try:
+        cvss = float(f.get("cvss") or 0)
+    except (TypeError, ValueError):
+        cvss = 0.0
+    return (not f.get("exploited"), not f.get("kev"), -cvss, f.get("cve") or "")
+
+
+def _run_cve(ws: AppWorkspace, software: list[dict], *, out_name: str,
+             seen_path: Path | None, label: str) -> None:
+    """Query search_vulns for each enumerated (product, version) in a bounded pool (memoized), attach
+    sources/hosts, sort for triage → findings/<out_name>. Best-effort: skips if search_vulns/its DB is
+    absent. When seen_path is set (phase-2 pass), records the covered (product, version) set so the
+    phase-4 pass reports only the delta."""
+    stage = out_name.removesuffix(".jsonl")
+    if shutil.which(SEARCH_VULNS) is None:
+        log.debug("  · skip %s (search_vulns not installed) for %s", stage, label)
+        return
+    if seen_path is not None:   # record what this pass covers (read by the phase-4 delta), even if empty
+        tools.write_lines(seen_path, [f"{s['product']}\t{s['version']}" for s in software])
+    findings: list[dict] = []
+    if software:
+        with ThreadPoolExecutor(max_workers=CVE_FANOUT) as pool:
+            futs = [(s, pool.submit(_search_vulns_query, s["product"], s["version"])) for s in software]
+            for s, fut in futs:
+                findings += [{**cve, "sources": s["sources"], "hosts": s["where"]} for cve in fut.result()]
+    findings.sort(key=_cve_sort_key)
+    n = tools.write_jsonl(ws.findings / out_name, findings)
+    hot = sum(1 for f in findings if f.get("exploited"))
+    log.info("  → %s (%s) — %d software → %d CVE(s)%s → findings/%s", stage, label, len(software), n,
+             f" ({hot} known-exploited/KEV)" if hot else "", out_name)
+
+
+def cve_lookup(activity: Activity, app_id: str) -> None:
+    """PHASE 2 — known-CVE lookup over the EXPLORABLE-surface enumerated software, ∥ the surface DAST.
+    OFFLINE correlation (net=False, no target traffic): web server + app tech + non-HTTP service banners
+    + libs mined from the phase-1 crawl corpus → search_vulns' local DB, version-pinned. Output
+    findings/cve.jsonl + the covered (product,version) set (raw/cve/seen.txt) so the phase-4 pass reports
+    only the delta. Best-effort: skips if search_vulns / its DB is absent."""
+    ws = activity.app(app_id)
+    _run_cve(ws, _app_software(activity, ws), out_name="cve.jsonl",
+             seen_path=ws.raw("cve") / "seen.txt", label=app_id)
+
+
+def cve_lookup_full(activity: Activity, app_id: str) -> None:
+    """PHASE 4 — CVE lookup over the EXPANDED enumeration, ∥ the deep DAST. The phase-3 content_discovery
+    /recrawl downloads grow the corpus, so this re-mines it and reports only the DELTA: software not
+    already covered by the phase-2 pass (raw/cve/seen.txt). Output findings/cve_full.jsonl."""
+    ws = activity.app(app_id)
+    seen = {tuple(line.split("\t", 1)) for line in tools.read_lines(ws.raw("cve") / "seen.txt")
+            if "\t" in line}
+    delta = [s for s in _app_software(activity, ws) if (s["product"], s["version"]) not in seen]
+    _run_cve(ws, delta, out_name="cve_full.jsonl", seen_path=None, label=app_id)

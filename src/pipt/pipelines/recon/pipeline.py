@@ -54,6 +54,10 @@ class ReconPipeline:
         # nuclei -dast over the surface catalog (observed params) — fast, high-signal findings on the
         # real attack surface BEFORE sinking hours into fuzzing. Reads requests.jsonl across the barrier.
         Stage("dast", tasks.dast, per_app=True, phase=2),
+        # CVE lookup over the explorable-surface enumerated software (web server + tech + service banners
+        # + corpus libs) — OFFLINE correlation (net=False, no target traffic), runs ∥ dast (same phase,
+        # no needs). Records the covered (product,version) set so the phase-4 pass reports only the delta.
+        Stage("cve_lookup", tasks.cve_lookup, per_app=True, phase=2, net=False),
         # ── per-app PHASE 3 — guessing / surface expansion ──────────────────────────────────────────
         # build the fuzzing seed offline (JS/body/seed parsing), run the per-stack surface scanners, then
         # the content-discovery fixpoint; recrawl re-seeds katana on new-territory entry points it found.
@@ -69,6 +73,9 @@ class ReconPipeline:
         Stage("param_fuzz", tasks.param_fuzz, needs=("request_catalog_full",), per_app=True, phase=4),
         Stage("dast_full", tasks.dast_full, needs=("request_catalog_full", "param_fuzz"),
               per_app=True, phase=4),
+        # CVE lookup over the EXPANDED enumeration (the phase-3 crawl grew the corpus) — OFFLINE, runs ∥
+        # dast_full; reports only the delta vs the phase-2 pass (raw/cve/seen.txt).
+        Stage("cve_lookup_full", tasks.cve_lookup_full, per_app=True, phase=4, net=False),
     )
 
     def cluster(self, activity: Activity) -> list[str]:
