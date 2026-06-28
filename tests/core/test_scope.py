@@ -16,6 +16,15 @@ def test_normalize_url_and_wildcard():
     assert scope.normalize("Example.COM", "domain") == "example.com"
 
 
+def test_normalize_url_drops_explicit_port():
+    # a host:port is not a resolvable DNS name — the port must not leak into scope_dns
+    assert scope.normalize("https://example.com:8443/admin", "url") == "example.com"
+    assert scope.normalize("http://10.0.0.1:8080", "url") == "10.0.0.1"
+    # two ports on one host collapse to one resolution target (one Target after dedup)
+    text = "https://example.com:8443/\nhttps://example.com:9000/x\n"
+    assert sorted(t.normalized for t in scope.parse_scope(text)) == ["example.com"]
+
+
 def test_target_id_stable_and_prefixed():
     tid = scope.target_id("example.com")
     assert tid.startswith("t_")

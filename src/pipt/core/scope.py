@@ -31,12 +31,15 @@ def classify(token: str) -> str:
     return "domain"
 
 
-# TODO(domain): normalize() keeps :port in URL hosts; _IP/_CIDR don't validate  # noqa: TD003,FIX002
-# octet ranges. Acceptable for the stub scaffolding; tighten when wiring a real toolset.
+# TODO(domain): _IP/_CIDR don't validate octet ranges. Acceptable for the stub  # noqa: TD003,FIX002
+# scaffolding; tighten when wiring a real toolset.
 def normalize(token: str, kind: str) -> str:
     t = token.strip().lower()
     if kind == "url":
-        return t.split("://", 1)[1].split("/", 1)[0]
+        # bare host only: drop scheme, path AND any :port — a host:port (https://h:8443/x → h) is not a
+        # resolvable DNS name, so the port must not leak into scope_dns (it would fail to resolve). The
+        # specific port isn't honored for scanning anyway (portscan covers the curated WEB_PORTS).
+        return t.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
     if kind == "wildcard":
         return t[2:]
     return t
