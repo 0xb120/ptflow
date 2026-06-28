@@ -19,6 +19,108 @@ uv run pipt run example <activity-name> ./scope.txt --root /path/to/parent
 uv run ruff check . && uv run ty check src/ && uv run pytest   # dev gate
 ```
 
+## Commands
+
+The CLI (`pipt`) has two subcommands: **`run`** (run a pipeline) and **`serve`**
+(start the observability UI). Run via `uv run pipt …`.
+
+### `pipt run` — run a pipeline over a scope
+
+```bash
+uv run pipt run <pipeline> <activity> <scope.txt> [--root DIR] [-v] [--resume] [--observe [API_URL]]
+```
+
+Positional arguments:
+
+| Arg          | What it is |
+|--------------|------------|
+| `<pipeline>` | Which pipeline to run: **`example`** (dependency-free stub tasks — fake IPs/services, no external binaries; what the test suite and CI exercise) or **`recon`** (the real ProjectDiscovery toolchain). |
+| `<activity>` | Name of the workspace directory created for this run. **All state lives on disk under it** — there is no database. |
+| `<scope.txt>`| Input scope file (domains / URLs / IPs, one per line). |
+
+Options:
+
+| Flag | What it does |
+|------|--------------|
+| `--root DIR` | Parent directory for the activity. Output goes to `<root>/<activity>/`. Default: the current directory. |
+| `-v`, `--verbose` | Surface the exact command and full stdout/stderr of every tool on the console. The complete run log is **always** persisted to `<activity>/logs/run.log` regardless of this flag. |
+| `--resume` | Skip stages that a prior run of this activity already finished (`.state/<stage>.done` markers). Markers are invalidated automatically if the scope changes. |
+| `--observe [API_URL]` | Stream this run to the Prefect UI (run graph + task states + per-stage logs). `API_URL` defaults to the local server (`http://127.0.0.1:4200/api`); start it first with `pipt serve`. |
+
+Exit codes: **`0`** all stages OK · **`1`** one or more stages failed (CI/automation signal) · **`130`** interrupted with Ctrl-C — partial results are saved; resume with `--resume`.
+
+```bash
+# dry run with no external tools — exercises the scaffolding end to end
+uv run pipt run example demo ./scope.txt -v
+
+# the real recon toolchain against an authorized scope
+echo "https://ginandjuice.shop/" > scope.txt
+uv run pipt run recon ginandjuice ./scope.txt -v
+```
+
+### `pipt serve` — Prefect server + UI (observability)
+
+```bash
+pipt serve
+```
+
+Starts the Prefect server (UI + API) in the **foreground** at <http://127.0.0.1:4200> — run it
+in its own terminal. It is **pure telemetry** (run graph, task states, per-stage timings, logs);
+the pipeline's state stays on disk and runs identically without it. To see a run in the UI, add
+`--observe` to a `pipt run` in another terminal:
+
+```bash
+pipt serve                                                  # terminal 1
+uv run pipt run recon ginandjuice ./scope.txt --observe     # terminal 2
+```
+
+### Install & dev gate
+
+```bash
+uv sync --all-groups                                          # install (incl. dev/lint/test groups)
+uv run ruff check . && uv run ty check src/ && uv run pytest  # the full dev gate
+uv run pytest tests/core/test_orchestrator.py                 # run one test file
+```
+
+## Environment variables
+
+All tunables are environment variables, read by the **`recon`** pipeline (the `example` pipeline
+ignores them). Set them **before** launching the run — `PIPT_PROFILE` / `PIPT_NET_LIMIT` are
+resolved at import time, so exporting them mid-run has no effect.
+
+### Load & rate
+
+| Variable | Values / default | What it does |
+|----------|------------------|--------------|
+| `PIPT_PROFILE` | `wide` (default) · `home` | Rate profile. `wide` = full bandwidth; `home` throttles the heavy hitters (naabu `-rate` 300 vs 1000, nuclei `-rl` 50 vs 150, feroxbuster `-t`/`-L`) to spare a domestic line/router. The active profile is logged at run start. |
+| `PIPT_NET_LIMIT` | integer · default `10` (or `4` when `PIPT_PROFILE=home`) | Global cap on concurrent **network** stages (per-app *and* spanning), so the aggregate uplink load stays bounded. In-process, no Prefect server needed. |
+
+### Auth & crawl behavior
+
+| Variable | Values / default | What it does |
+|----------|------------------|--------------|
+| `PIPT_HTTP_HEADER` | `Name: value` headers, multiple separated by newlines or `;;` | Operator session headers/cookies threaded into katana/httpx/nuclei (`-H`), arjun (`--headers`) and x8 (`-H`) so the crawl/fetch/fuzz/DAST reach the **authenticated** surface. |
+| `PIPT_RECRAWL` | `on` (default) · `preview` · `off` | The `recrawl` stage: `on` crawls fuzzing-discovered entry points into new territory; `preview` writes/logs the seeds (`raw/recrawl/seeds.txt`) **without** crawling; `off` skips it. |
+| `PIPT_DEEP_DIVE` | truthy to enable · default off | Opt-in stage-3 content-discovery **deep dive** (huge Assetnote *manual* lists at full depth, on a few high-value hosts only). Off by default — it costs hours/host. |
+
+### Tool & path overrides
+
+| Variable | Default | What it does |
+|----------|---------|--------------|
+| `PIPT_NUCLEI_DAST_TEMPLATES` | `~/nuclei-templates/dast` | Directory of nuclei `-dast` fuzzing templates. The DAST steps skip (best-effort) if it (or nuclei) is absent. |
+| `PIPT_SEARCH_VULNS` | `~/.local/bin/search_vulns` | Path to the `search_vulns` binary used by the CVE-lookup steps (offline, local DB). Build/refresh the DB out-of-band: `search_vulns -u`. |
+| `PIPT_EYEWITNESS` | auto (`eyewitness` on PATH › `/opt/EyeWitness` venv) | Full EyeWitness launch command override for the optional `screenshot` EyeWitness pass. |
+
+### Wordlists (resolved by ROLE, nothing hardcoded)
+
+| Variable | What it does |
+|----------|--------------|
+| `PIPT_WORDLISTS` | `:`-separated search directories for global wordlists, prepended to the common locations (e.g. `/usr/share/seclists`). |
+| `PIPT_WL_<ROLE>` | Absolute path that pins a specific role's list, overriding discovery. Resolution order per role: BYO (`wl_global/<role>.txt`) › `PIPT_WL_<ROLE>` › discovery under `PIPT_WORDLISTS`/SecLists › unresolved (the step degrades gracefully). Roles include `content`, `params`, the staged `an_*`/`mn_*` Assetnote lists, and the CMS lists `wordpress`/`drupal`/`joomla`. |
+
+> For the *why* behind these knobs (rate-profile rationale, the deep-dive gating, the staged
+> wordlist strategy, …) see **[CLAUDE.md](CLAUDE.md)** — the single source of truth.
+
 ## Documentation
 
 Architecture, the workspace contract, conventions, and project notes live in
