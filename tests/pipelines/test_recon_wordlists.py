@@ -58,3 +58,17 @@ def test_tech_role_paths_matches_detected_tech(tmp_path):
         act.wl_global / "wordpress.txt"
     ]
     assert wordlists.tech_role_paths(["Apache"], act.wl_global) == []
+
+
+def test_staged_roles_resolve_from_search_dir(tmp_path, monkeypatch):
+    coll = tmp_path / "coll"
+    coll.mkdir()
+    (coll / "an_directories_1m.txt").write_text("/\n/admin\n")
+    (coll / "an_php.txt").write_text("index.php\n")
+    monkeypatch.setattr(wordlists, "_DEFAULT_DIRS", ())
+    monkeypatch.setenv("PIPT_WORDLISTS", str(coll))
+    act = Activity.named("demo", root=tmp_path).ensure()
+    wordlists.provision(act)
+    assert wordlists.role_path(act, "an_directories").read_text(encoding="utf-8") == "/\n/admin\n"
+    assert wordlists.role_path(act, "an_php").read_text(encoding="utf-8") == "index.php\n"
+    assert wordlists.role_path(act, "mn_php") is None  # not installed → degrade

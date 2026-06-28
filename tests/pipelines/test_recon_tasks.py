@@ -192,8 +192,10 @@ def test_pipeline_object_shape():
     assert cluster_scope == ["screenshot"]  # batched screenshot, post-cluster ∥ the loops
     assert app == [
         "passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
-        "wordlist", "fetch_delta", "mine_responses", "tech_enum", "content_discovery",
-        "param_fuzz",
+        "fetch_delta", "api_spec", "mine_responses", "request_catalog",
+        "dast",
+        "wordlist", "tech_enum", "content_discovery", "recrawl",
+        "request_catalog_full", "param_fuzz", "dast_full",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
     # httpx is the breadth tail; the expensive full scan runs ∥ as a spanning chain → nerva
@@ -213,23 +215,39 @@ def test_pipeline_object_shape():
     # screenshot is a post-cluster spanning step (cluster_scope), NOT a per-app loop-1 step
     assert by_name["screenshot"].cluster_scope is True
     assert by_name["screenshot"].per_app is False
-    # loop 1 = enumeration; loop 2 = content discovery (separate per-app loop)
-    assert {by_name[n].phase
-            for n in ("passive_probe", "crawl", "crawl_headless", "subenum", "takeover")} == {1}
-    # loop 2 stages cross the loop-1 barrier (no cross-loop `needs`)
-    loop2 = ("wordlist", "fetch_delta", "mine_responses", "tech_enum", "content_discovery")
-    assert {by_name[n].phase for n in loop2} == {2}
-    assert by_name["wordlist"].needs == ()
-    assert by_name["fetch_delta"].needs == ()
-    # within loop 2: tech_enum→seed; mine_responses→endpoints; content_discovery runs the
-    # fuzz→download→mine→fuzz fixpoint then the secret fleet (folds seed + tech + mined endpoints)
-    assert by_name["tech_enum"].needs == ("wordlist",)
+    # PHASE 1 = explorable surface (OSINT + crawl, NO guessing): crawl/headless + delta fetch + offline
+    # mine + the SURFACE request catalog (requests.jsonl). fetch_delta needs the full crawl store; the
+    # surface catalog needs the records + extracted corpus.
+    phase1 = ("passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
+              "fetch_delta", "api_spec", "mine_responses", "request_catalog")
+    assert {by_name[n].phase for n in phase1} == {1}
+    assert by_name["fetch_delta"].needs == ("crawl_headless",)
+    assert by_name["api_spec"].needs == ()            # ∥; reads hosts only
     assert by_name["mine_responses"].needs == ("fetch_delta",)
-    assert set(by_name["content_discovery"].needs) == {"wordlist", "tech_enum", "mine_responses"}
-    # loop 3 (phase 3) — param discovery, reads loop-2 artifacts across the barrier (no cross-loop needs)
-    assert by_name["param_fuzz"].phase == 3
-    assert by_name["param_fuzz"].per_app is True
-    assert by_name["param_fuzz"].needs == ()
+    assert by_name["request_catalog"].net is False    # offline merge → requests.jsonl (surface only)
+    assert set(by_name["request_catalog"].needs) == {"crawl_headless", "mine_responses", "api_spec"}
+    # PHASE 2 = DAST the explorable surface (low-hanging fruit): reads requests.jsonl across the barrier
+    assert by_name["dast"].phase == 2
+    assert by_name["dast"].per_app is True
+    assert by_name["dast"].needs == ()
+    # PHASE 3 = guessing / surface expansion: wordlist seed → tech_enum → content_discovery fixpoint →
+    # recrawl. wordlist reads the PHASE-1 corpus across the barrier (no needs); content_discovery no
+    # longer needs mine_responses (cross-barrier now).
+    phase3 = ("wordlist", "tech_enum", "content_discovery", "recrawl")
+    assert {by_name[n].phase for n in phase3} == {3}
+    assert by_name["wordlist"].needs == ()            # reads PHASE-1 raw/extracted + endpoints across barrier
+    assert by_name["wordlist"].net is False
+    assert by_name["tech_enum"].needs == ("wordlist",)
+    assert set(by_name["content_discovery"].needs) == {"wordlist", "tech_enum"}
+    assert by_name["recrawl"].needs == ("content_discovery",)
+    # PHASE 4 = DAST the guessed surface (detailed): full catalog (requests_full.jsonl) → param_fuzz →
+    # dast_full (delta vs the surface catalog + param-injection requests).
+    phase4 = ("request_catalog_full", "param_fuzz", "dast_full")
+    assert {by_name[n].phase for n in phase4} == {4}
+    assert by_name["request_catalog_full"].net is False
+    assert by_name["request_catalog_full"].needs == ()   # reads PHASE-1 + PHASE-3 across barriers
+    assert by_name["param_fuzz"].needs == ("request_catalog_full",)
+    assert set(by_name["dast_full"].needs) == {"request_catalog_full", "param_fuzz"}
 
 
 def test_depth_pure_helpers():
@@ -261,6 +279,88 @@ def test_tokenize_urls_mines_segments_keys_and_basenames():
     assert "12345" not in words                    # numeric id dropped
     assert "home" not in words                     # param value, not a key
     assert words == sorted(set(words))             # sorted + deduped
+
+
+def test_query_param_names_and_values():
+    urls = ["https://x/a?role=admin&page=2&utm_source=mail&token=deadbeefdeadbeef&q=login"]
+    assert tasks.query_param_names(urls) == ["page", "q", "role", "token", "utm_source"]
+    vals = tasks.query_param_values(urls)
+    assert {"admin", "login"} <= set(vals)           # real value words kept
+    assert "2" not in vals                           # numeric dropped
+    assert "deadbeefdeadbeef" not in vals            # opaque hex token dropped
+    # utm_source is a tracking key → its value isn't mined (here 'mail' would be), and stays out
+    assert "mail" not in vals
+
+
+def test_jsluice_param_names_uses_verified_camelcase_fields():
+    """Guards the jsluice contract: queryParams/bodyParams are the field names build_wordlist reads."""
+    recs = [{"url": "/a", "queryParams": ["page", "sort"], "bodyParams": ["csrf"]},
+            {"url": "/a", "queryParams": ["page"]},          # duplicate record per url collapses
+            {"url": "/b"}]                                    # no params
+    assert tasks.jsluice_param_names(recs) == ["csrf", "page", "sort"]
+
+
+def test_html_field_names_and_app_name():
+    html = ('<title>Acme Shop | Login</title>'
+            '<form><input name="user" id="uid"><select name="country"></select></form>')
+    assert {"user", "uid", "country"} <= set(tasks.html_field_names(html))
+    app = tasks.html_app_name(html)
+    assert {"acme", "shop"} <= set(app)
+    assert "login" not in app                         # boilerplate dropped
+
+
+def test_json_keys_depth_bounded():
+    obj = {"username": "a", "nested": {"apiKey": "x", "items": [{"deep": 1}]}}
+    keys = tasks.json_keys(obj)
+    assert {"username", "nested", "apiKey", "items", "deep"} <= set(keys)
+
+
+def test_stack_terms_strips_signal_prefix():
+    assert tasks.stack_terms(["WordPress", "PHP"], ["cdn:cloudflare", "stack:php", "hsts"]) == [
+        "cloudflare", "hsts", "php", "wordpress",
+    ]
+
+
+def test_extract_emails_rejects_false_positives():
+    text = "reach a@b.example and admin@example.com but not logo@2x.png or x@y.svg"
+    emails = tasks.extract_emails(text)
+    assert "a@b.example" in emails
+    assert "admin@example.com" not in emails         # example.com denied
+    assert all("@2x.png" not in e and ".svg" not in e for e in emails)  # asset TLDs denied
+
+
+def test_extract_identities_collects_emails_and_usernames():
+    ids = tasks.extract_identities(
+        links=["mailto:owner@acme.example"],
+        html_bodies=["contact bob@acme.example"],
+        json_objs=[{"username": "alice", "id": 7}])
+    assert set(ids["emails"]) == {"owner@acme.example", "bob@acme.example"}
+    assert {"alice", "bob", "owner"} <= set(ids["usernames"])   # field value + email local-parts
+
+
+def test_merge_params_wordlist_custom_first_dedup():
+    assert tasks.merge_params_wordlist(["id", "role"], ["role", "page"]) == ["id", "role", "page"]
+
+
+def test_effective_params_wl_merges_custom_first(tmp_path):
+    """param_fuzz uses wl_custom/params.txt custom-first; falls back to the global role when empty."""
+    from pipt.core import tools
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    ws = act.app("app1").ensure()
+    glob = act.wl_global / "params.txt"
+    tools.write_lines(glob, ["page", "id"])
+
+    # no custom params → return the global path unchanged (byte-identical to today)
+    assert tasks._effective_params_wl(ws, glob) == glob
+    assert tasks._effective_params_wl(ws, None) is None
+
+    # custom params present → merged file under raw/, custom-first
+    tools.write_lines(ws.wl_custom / "params.txt", ["role", "id"])
+    dest = tasks._effective_params_wl(ws, glob)
+    assert dest == ws.raw("param_fuzz") / "params.txt"
+    assert tools.read_lines(dest) == ["role", "id", "page"]
 
 
 
@@ -394,6 +494,51 @@ def test_build_wordlist_offline(tmp_path):
     tasks.build_wordlist(act, "app1")
     words = tools.read_lines(ws.wl_custom / "seed.txt")
     assert {"admin", "index.php", "index", "id"} <= set(words)
+
+
+def test_build_wordlist_mines_links_and_bodies(tmp_path, monkeypatch):
+    """The lexicon extractor mines BOTH the link surface AND the extracted bodies into four products:
+    seed (endpoints), params (names), values (semantic words), identities (users/emails)."""
+    from pipt.core import tools, workspace
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    ws = act.app("app1").ensure()
+    workspace.write_meta(ws.meta, {"app_id": "app1", "tech": ["WordPress"],
+                                   "header_signals": ["cdn:cloudflare"],
+                                   "hosts": ["https://app1.example.com"]})
+    tools.write_lines(ws.canonical("endpoints.txt"),
+                      ["https://app1.example.com/admin/index.php?id=2&role=admin"])
+    # bodies mine_responses already extracted to raw/extracted/ (wordlist reads, never re-extracts)
+    extracted = ws.raw("extracted")
+    extracted.mkdir(parents=True, exist_ok=True)
+    (extracted / "app.js").write_text("// js", encoding="utf-8")
+    (extracted / "page.html").write_text(
+        '<html><head><title>Acme Shop | Login</title></head><body>'
+        '<form><input name="username" id="login"><textarea name="comment"></textarea></form>'
+        '<a href="mailto:admin@acme.example">mail</a> contact bob@acme.example</body></html>',
+        encoding="utf-8")
+    (extracted / "data.html").write_text(  # a JSON API response saved as .html by _extract_bodies
+        '{"username":"alice","apiKey":"x","items":[{"id":1}]}', encoding="utf-8")
+    # hermetic: stand in for the jsluice binary (queryParams/bodyParams are the verified field names)
+    monkeypatch.setattr(tasks, "_jsluice_records",
+                        lambda _files: [{"url": "/api/v2/users",
+                                         "queryParams": ["page", "sort"], "bodyParams": ["csrf"]}])
+
+    tasks.build_wordlist(act, "app1")
+    seed = set(tools.read_lines(ws.wl_custom / "seed.txt"))
+    params = set(tools.read_lines(ws.wl_custom / "params.txt"))
+    values = set(tools.read_lines(ws.wl_custom / "values.txt"))
+    identities = set(tools.read_lines(ws.wl_custom / "identities.txt"))
+
+    assert {"admin", "index.php", "index"} <= seed
+    # params: query keys + jsluice query/body params + HTML form fields + JSON keys
+    assert {"role", "page", "sort", "csrf", "username", "comment", "login", "apiKey"} <= params
+    # values: query value + stack/header terms + app-name from <title>
+    assert {"admin", "wordpress", "cloudflare", "acme", "shop"} <= values
+    assert "login" not in values            # title boilerplate dropped
+    # identities: emails + mailto + local-parts + identity-field value
+    assert {"admin@acme.example", "bob@acme.example", "bob", "alice"} <= identities
 
 
 def test_parse_katana_extracts_request_endpoints():
@@ -654,7 +799,7 @@ def test_cluster_partition_demotes_generic_body(monkeypatch):
     assert tasks.cluster_partition(records) == [[0], [1], [2]]
 
 
-# --- content-discovery fixpoint (loop 2) ---
+# --- content-discovery fixpoint (phase 3) ---
 def test_select_new_urls_keeps_new_2xx_3xx_then_caps():
     recs = [
         {"url": "https://x/a", "status": 200},
@@ -714,7 +859,7 @@ def test_all_store_indices_globs_every_store(tmp_path):
     assert tasks._all_store_indices(act.app("absent")) == []  # no responses/ dir ⇒ []
 
 
-# --- param fuzzing (loop 3) ---
+# --- param fuzzing (phase 4) ---
 def test_path_template_collapses_ids():
     assert tasks.path_template("https://x/user/123/edit?a=1") == "https://x/user/*/edit"
     assert tasks.path_template("https://x/p/deadbeefcafe/view") == "https://x/p/*/view"  # long hex
@@ -770,24 +915,47 @@ def test_merge_params_dedups_across_tools():
     assert merged["id"]["reason"] == "Reflected"         # first non-null wins
 
 
-# --- wordlist strategy (custom vs traditional) ---
-def test_resolve_wl_mode():
-    assert tasks.resolve_wl_mode("auto", 5, rich_threshold=200) == "broad"       # thin corpus
-    assert tasks.resolve_wl_mode("auto", 500, rich_threshold=200) == "targeted"  # rich corpus
-    assert tasks.resolve_wl_mode("targeted", 5, rich_threshold=200) == "targeted"  # explicit wins
-    assert tasks.resolve_wl_mode("broad", 999, rich_threshold=200) == "broad"
+# --- wordlist strategy (staged combine) ---
+def test_roles_for_tech_matches_and_dedupes():
+    mapping = {"php": "an_php", "asp.net": "an_aspx", "iis": "an_aspx",
+               "java": ("mn_jsp", "mn_do")}
+    assert tasks.roles_for_tech(["PHP 8.2", "Nginx"], mapping) == ["an_php"]    # case-insensitive
+    assert tasks.roles_for_tech(["ASP.NET", "Microsoft-IIS"], mapping) == ["an_aspx"]  # 2 keys, 1 role, deduped
+    assert tasks.roles_for_tech(["Apache Tomcat (Java)"], mapping) == ["mn_jsp", "mn_do"]  # tuple expands
+    assert tasks.roles_for_tech(["Go"], mapping) == []                         # no match
 
 
-def test_combine_wordlist_custom_first_and_caps():
+def test_stage2_and_deepdive_roles_per_stack():
+    s2, dd = tasks.STAGE2_TECH_ROLES, tasks.DEEPDIVE_TECH_ROLES
+    assert tasks.roles_for_tech(["PHP", "WordPress"], s2) == ["an_php"]
+    assert tasks.roles_for_tech(["ASP.NET", "Microsoft-IIS"], s2) == ["an_aspx"]
+    assert tasks.roles_for_tech(["Java", "Apache Tomcat"], s2) == ["an_jsp"]
+    assert tasks.roles_for_tech(["Express", "Next.js"], s2) == ["an_apiroutes"]      # node/next → apiroutes
+    assert tasks.roles_for_tech(["Python", "Django"], s2) == ["an_apiroutes"]        # python → apiroutes
+    assert tasks.roles_for_tech(["React"], s2) == []                                 # client-side → no backend list
+    # deep-dive: per-stack manual lists, gated
+    assert tasks.roles_for_tech(["PHP"], dd) == ["mn_php", "mn_phpmillion"]
+    assert tasks.roles_for_tech(["ASP.NET"], dd) == ["mn_aspx", "mn_asp", "mn_cfm"]
+    assert tasks.roles_for_tech(["Java"], dd) == ["mn_jsp", "mn_do"]
+    assert tasks.roles_for_tech(["Python"], dd) == []                                # no dedicated deep list
+
+
+def test_assemble_wordlist_custom_first_and_per_layer_caps():
     custom = ["app1", "app2"]
-    traditional = [["g1", "g2", "g3"], ["t1", "t2"]]   # global content + a tech list
-    broad = tasks.combine_wordlist(custom, traditional, mode="broad", cap=1)
-    assert broad[:2] == ["app1", "app2"]                                  # custom first
-    assert set(broad) == {"app1", "app2", "g1", "g2", "g3", "t1", "t2"}   # traditional in full
-    # targeted: each traditional list capped to its top-`cap`
-    assert tasks.combine_wordlist(custom, traditional, mode="targeted", cap=1) == [
-        "app1", "app2", "g1", "t1",
-    ]
+    layers = [(["g1", "g2", "g3"], None), (["d1", "d2", "d3", "d4"], 2)]  # full layer, then capped head
+    wl = tasks.assemble_wordlist(custom, layers)
+    assert wl[:2] == ["app1", "app2"]                                # custom first
+    assert wl == ["app1", "app2", "g1", "g2", "g3", "d1", "d2"]      # full layer whole, capped layer top-2
+    assert "d3" not in wl                                            # cap drops the tail
+    # dedup keeps first occurrence across layers
+    assert tasks.assemble_wordlist(["x"], [(["x", "y"], None)]) == ["x", "y"]
+
+
+def test_richest_hosts_ranks_by_hit_count_and_caps():
+    hits = [{"url": "https://a.test/1"}, {"url": "https://a.test/2"}, {"url": "https://a.test/3"},
+            {"url": "https://b.test/1"}, {"url": "https://c.test/1"}, {"url": "https://off.test/x"}]
+    hosts = ["https://a.test", "https://b.test", "https://c.test"]  # off.test not scanned → ignored
+    assert tasks._richest_hosts(hits, hosts, cap=2) == ["https://a.test", "https://b.test"]
 
 
 def test_build_wordlist_seed_excludes_tech_lists(tmp_path):
@@ -819,3 +987,313 @@ def test_reconcile_by_url():
     assert tasks.reconcile_by_url(index, url_to_app) == {
         "app_a": "a.com/h1.png", "app_b": "b.com/h2.png",
     }
+
+
+# --- request catalog (full-request DAST input — POST/JSON/body, not just GET) ---
+def test_build_raw_request_get_has_request_line_host_and_blank_terminator():
+    raw = tasks.build_raw_request("get", "https://app.test/search?q=1&p=2")
+    assert raw.startswith("GET /search?q=1&p=2 HTTP/1.1\r\n")
+    assert "Host: app.test\r\n" in raw
+    assert raw.endswith("\r\n\r\n")          # no body → terminated by the blank line
+
+
+def test_build_raw_request_post_guesses_content_type_and_length():
+    form = tasks.build_raw_request("POST", "https://app.test/login", body="u=a&p=b")
+    assert "Content-Type: application/x-www-form-urlencoded\r\n" in form
+    assert "Content-Length: 7\r\n" in form
+    assert form.endswith("\r\n\r\nu=a&p=b")
+    js = tasks.build_raw_request("POST", "https://app.test/api", body='{"x":1}')
+    assert "Content-Type: application/json\r\n" in js
+
+
+def test_build_raw_request_does_not_duplicate_caller_host():
+    raw = tasks.build_raw_request("GET", "https://app.test/", headers={"Host": "evil", "X-A": "1"})
+    assert raw.count("Host:") == 1
+    assert "Host: app.test\r\n" in raw
+    assert "X-A: 1\r\n" in raw
+
+
+def test_request_params_by_location():
+    assert {("id", "query"), ("q", "query")} == {
+        (p["name"], p["loc"]) for p in tasks.request_params("https://a/x?id=1&q=2")}
+    assert {("user", "body"), ("pw", "body")} == {
+        (p["name"], p["loc"]) for p in tasks.request_params("https://a/x", body="user=a&pw=b")}
+    assert {("a", "json"), ("b", "json")} == {
+        (p["name"], p["loc"]) for p in
+        tasks.request_params("https://a/x", body='{"a":1,"b":2}', content_type="application/json")}
+
+
+def test_parse_katana_requests_reuses_raw_and_records_method_and_body_params():
+    import json
+    line = json.dumps({"request": {"endpoint": "https://a/api", "method": "POST",
+                                   "body": "x=1", "raw": "POST /api HTTP/1.1\r\nHost: a\r\n\r\nx=1"}})
+    [rec] = tasks.parse_katana_requests(line)
+    assert rec["method"] == "POST"
+    assert rec["url"] == "https://a/api"
+    assert rec["raw"].startswith("POST /api HTTP/1.1")    # katana's own raw reused verbatim
+    assert {("x", "body")} == {(p["name"], p["loc"]) for p in rec["params"]}
+
+
+def test_parse_katana_requests_builds_raw_when_absent():
+    import json
+    [rec] = tasks.parse_katana_requests(json.dumps({"request": {"endpoint": "https://a/p?id=1"}}))
+    assert rec["method"] == "GET"
+    assert rec["raw"].startswith("GET /p?id=1 HTTP/1.1\r\n")    # synthesized
+
+
+def test_parse_katana_requests_synthesizes_form_requests():
+    import json
+    rec = {"request": {"endpoint": "https://a/page"},
+           "forms": [{"action": "/login", "method": "post", "parameters": ["username", "password"]},
+                     {"action": "search", "method": "get", "fields": [{"name": "q"}]}]}
+    out = tasks.parse_katana_requests(json.dumps(rec))
+    post = next(r for r in out if r["method"] == "POST")
+    assert post["url"] == "https://a/login"
+    assert post["body"] == "username=&password="
+    assert {("username", "body"), ("password", "body")} == {(p["name"], p["loc"]) for p in post["params"]}
+    get = next(r for r in out if r["method"] == "GET" and "search" in r["url"])
+    assert get["url"] == "https://a/search?q="    # relative action resolved against the page URL
+
+
+def test_request_key_collapses_ids_keeps_method():
+    a = {"method": "GET", "url": "https://a/user/123"}
+    b = {"method": "GET", "url": "https://a/user/456"}
+    c = {"method": "POST", "url": "https://a/user/123"}
+    assert tasks.request_key(a) == tasks.request_key(b)    # /123 vs /456 collapse to one shape
+    assert tasks.request_key(a) != tasks.request_key(c)    # GET vs POST stay distinct
+
+
+def test_merge_requests_dedups_by_shape_and_unions_sources_and_params():
+    a = {"method": "GET", "url": "https://a/user/1", "params": [{"name": "id", "loc": "query"}],
+         "sources": ["katana"]}
+    b = {"method": "GET", "url": "https://a/user/2", "params": [{"name": "ref", "loc": "query"}],
+         "sources": ["katana-headless"]}
+    [merged] = tasks.merge_requests([a, b])                # same (GET, /user/*) shape → one record
+    assert merged["sources"] == ["katana", "katana-headless"]
+    assert {("id", "query"), ("ref", "query")} == {(p["name"], p["loc"]) for p in merged["params"]}
+
+
+def test_auth_headers_parses_env(monkeypatch):
+    monkeypatch.setenv("PIPT_HTTP_HEADER", "Cookie: s=1;;Authorization: Bearer x\nBad")
+    assert tasks._auth_headers() == ["Cookie: s=1", "Authorization: Bearer x"]    # 'Bad' (no ':') dropped
+    assert tasks._header_flags("-H") == ["-H", "Cookie: s=1", "-H", "Authorization: Bearer x"]
+    monkeypatch.delenv("PIPT_HTTP_HEADER")
+    assert tasks._auth_headers() == []
+    assert tasks._header_flags() == []
+
+
+def test_url_to_get_request_shape():
+    r = tasks._url_to_get_request("https://a/x?id=1", "passive")
+    assert r["method"] == "GET"
+    assert r["sources"] == ["passive"]
+    assert {("id", "query")} == {(p["name"], p["loc"]) for p in r["params"]}
+    assert r["raw"].startswith("GET /x?id=1 HTTP/1.1")
+
+
+def test_catalog_records_folds_urls_reschemes_and_filters_scope():
+    reqs = [{"method": "POST", "url": "https://a/login", "headers": {}, "body": "u=1",
+             "params": [{"name": "u", "loc": "body"}],
+             "raw": "POST /login HTTP/1.1\r\nHost: a\r\n\r\nu=1", "sources": ["katana"]}]
+    get_urls = ["https://a/page?q=1", "https://evil/x"]      # evil host out of scope
+    out = tasks.catalog_records(reqs, get_urls, in_scope={"a"}, schemes={"a": "http"})
+    urls = {r["url"] for r in out}
+    assert "http://a/login" in urls          # full request re-schemed https→http (reachable scheme)
+    assert "http://a/page?q=1" in urls       # url-only source folded in as GET, re-schemed
+    assert all("evil" not in u for u in urls)  # out-of-scope dropped
+
+
+def test_select_body_targets_splits_json_and_urlencoded_and_dedups():
+    catalog = [
+        {"method": "POST", "url": "https://a/login",
+         "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "body": "u="},
+        {"method": "POST", "url": "https://a/api",
+         "headers": {"Content-Type": "application/json"}, "body": '{"q":1}'},
+        {"method": "GET", "url": "https://a/page?x=1"},          # no body / GET → excluded
+        {"method": "POST", "url": "https://a/login", "body": ""},  # same (POST,/login) shape → deduped
+    ]
+    body, js = tasks.select_body_targets(catalog, in_scope={"a"}, cap=10)
+    assert body == ["https://a/login"]
+    assert js == ["https://a/api"]
+
+
+def test_parse_arjun_and_x8_stamp_location():
+    import json
+    [p] = tasks.parse_arjun(json.dumps({"https://a/x": {"method": "POST", "params": ["user"]}}), loc="body")
+    assert p["loc"] == "body"
+    x = json.dumps([{"url": "https://a/x", "method": "GET", "found_params": [{"name": "q"}]}])
+    [p2] = tasks.parse_x8(x, loc="header")
+    assert p2["loc"] == "header"
+
+
+def test_merge_params_keeps_locations_distinct():
+    recs = [
+        {"url": "https://a/x", "param": "id", "loc": "query", "method": "GET", "sources": ["arjun"], "reason": None},
+        {"url": "https://a/x", "param": "id", "loc": "query", "method": "GET", "sources": ["x8"], "reason": "refl"},
+        {"url": "https://a/x", "param": "id", "loc": "body", "method": "POST", "sources": ["x8"], "reason": None},
+    ]
+    merged = tasks.merge_params(recs)
+    assert len(merged) == 2                  # (id,query) merged across arjun+x8; (id,body) stays distinct
+    q = next(m for m in merged if m["loc"] == "query")
+    assert q["sources"] == ["arjun", "x8"]
+    assert q["reason"] == "refl"
+
+
+# --- DAST (nuclei -dast over the request catalog) ---
+def test_build_fuzz_requests_injects_params_per_location():
+    params = [
+        {"url": "https://a/x", "param": "id", "loc": "query"},
+        {"url": "https://a/x", "param": "q", "loc": "query"},
+        {"url": "https://a/login", "param": "user", "loc": "body"},
+        {"url": "https://a/api", "param": "token", "loc": "json"},
+        {"url": "https://a/p", "param": "X-Debug", "loc": "header"},
+    ]
+    out = {(r["method"], r["url"].split("?")[0]): r for r in tasks.build_fuzz_requests(params)}
+    q = out[("GET", "https://a/x")]
+    assert "id=" in q["url"]
+    assert "q=" in q["url"]
+    assert q["raw"].startswith("GET /x?")
+    body = out[("POST", "https://a/login")]
+    assert body["body"] == "user="
+    assert "application/x-www-form-urlencoded" in body["raw"]
+    js = out[("POST", "https://a/api")]
+    assert '"token"' in js["body"]
+    assert "application/json" in js["raw"]
+    assert "X-Debug: x\r\n" in out[("GET", "https://a/p")]["raw"]   # header param present in the raw
+
+
+def test_dast_requests_merges_catalog_and_synth_then_caps():
+    catalog = [{"method": "GET", "url": "https://a/known?p=1", "headers": {}, "body": "",
+                "params": [{"name": "p", "loc": "query"}],
+                "raw": "GET /known?p=1 HTTP/1.1\r\nHost: a\r\n\r\n", "sources": ["katana"]}]
+    params = [{"url": "https://a/hidden", "param": "secret", "loc": "query"}]
+    urls = {r["url"] for r in tasks.dast_requests(catalog, params, cap=10)}
+    assert any("known" in u for u in urls)
+    assert any("hidden" in u and "secret=" in u for u in urls)   # discovered hidden param injected
+    many = [{"url": f"https://a/p{i}", "param": "x", "loc": "query"} for i in range(20)]
+    assert len(tasks.dast_requests([], many, cap=5)) == 5         # cap bites
+
+
+# --- API spec discovery (OpenAPI/Swagger expansion) ---
+def test_is_openapi_detects_spec():
+    assert tasks.is_openapi({"openapi": "3.0.0", "paths": {}})
+    assert tasks.is_openapi({"swagger": "2.0", "paths": {}})
+    assert not tasks.is_openapi({"paths": {}})            # no version marker
+    assert not tasks.is_openapi({"openapi": "3.0.0"})     # no paths
+    assert not tasks.is_openapi("nope")
+
+
+def test_expand_openapi_v3_operations_to_full_requests():
+    spec = {
+        "openapi": "3.0.0",
+        "servers": [{"url": "/api/v1"}],                  # relative → origin(spec_url) + this
+        "paths": {
+            "/users/{id}": {
+                "parameters": [{"name": "id", "in": "path"}],   # shared path-item param
+                "get": {"parameters": [{"name": "verbose", "in": "query"},
+                                       {"name": "X-Tenant", "in": "header"}]},
+                "post": {"requestBody": {"content": {"application/json": {
+                    "schema": {"properties": {"name": {}, "email": {}}}}}}},
+            },
+        },
+    }
+    by_method = {r["method"]: r for r in tasks.expand_openapi(spec, "https://api.example.com/openapi.json", cap=10)}
+    get = by_method["GET"]
+    assert get["url"] == "https://api.example.com/api/v1/users/1?verbose="   # base+path('1')+query
+    assert "X-Tenant: x\r\n" in get["raw"]
+    post = by_method["POST"]
+    assert post["url"] == "https://api.example.com/api/v1/users/1"
+    assert "application/json" in post["raw"]
+    assert '"name"' in post["body"]
+    assert '"email"' in post["body"]
+
+
+def test_expand_openapi_swagger_v2_body_and_basepath():
+    import json
+    spec = {"swagger": "2.0", "basePath": "/v2",
+            "paths": {"/login": {"post": {"parameters": [
+                {"name": "creds", "in": "body", "schema": {"properties": {"user": {}, "pass": {}}}}]}}}}
+    [req] = tasks.expand_openapi(spec, "https://h/swagger.json", cap=10)
+    assert req["method"] == "POST"
+    assert req["url"] == "https://h/v2/login"             # origin + basePath
+    assert "application/json" in req["raw"]
+    assert {"user", "pass"} <= set(json.loads(req["body"]).keys())
+
+
+def test_expand_openapi_caps_operations():
+    spec = {"openapi": "3.0.0", "paths": {f"/p{i}": {"get": {}} for i in range(20)}}
+    assert len(tasks.expand_openapi(spec, "https://h/openapi.json", cap=5)) == 5
+
+
+# --- shape mining from the downloaded corpus (jsluice records + HTML forms → catalog requests) ---
+def test_jsluice_requests_recovers_method_body_and_resolves_relative():
+    records = [
+        {"url": "/api/v2/users", "method": "POST", "contentType": "application/json",
+         "headers": {"Content-Type": "application/json"}, "bodyParams": ["name", "email"],
+         "filename": "/x/raw/extracted/abc.js"},
+        {"url": "/api/search?q=1", "method": "GET", "queryParams": ["q"], "filename": "/x/raw/extracted/abc.js"},
+        {"url": "/relative/no-source", "method": "GET", "filename": "/x/raw/extracted/zzz.js"},  # no src → skip
+    ]
+    out = {(r["method"], r["url"].split("?")[0]): r
+           for r in tasks.jsluice_requests(records, {"abc": "https://app.test/static/app.js"})}
+    post = out[("POST", "https://app.test/api/v2/users")]      # relative resolved against the JS source
+    assert "application/json" in post["raw"]
+    assert '"name"' in post["body"]
+    assert '"email"' in post["body"]
+    assert ("GET", "https://app.test/api/search") in out
+    assert all("no-source" not in u for (_, u) in out)         # unresolved relative dropped (no host)
+
+
+def test_parse_forms_extracts_method_action_fields():
+    html = ('<form method="post" action="/login"><input name="user"><input name="pw" type="password">'
+            '</form><form action="/search"><input name="q"></form>')
+    forms = tasks.parse_forms(html)
+    assert {"user", "pw"} == set(forms[0]["fields"])
+    assert forms[0]["method"] == "post"
+    assert forms[0]["action"] == "/login"
+    assert forms[1]["method"] == "GET"                          # default when omitted
+
+
+def test_html_form_requests_resolves_action_and_builds_requests(tmp_path):
+    bodies = tmp_path / "extracted"
+    bodies.mkdir()
+    (bodies / "page.html").write_text(
+        '<form method="post" action="/login"><input name="user"><input name="pw"></form>'
+        '<form action="search"><input name="q"></form>')
+    out = {(r["method"], r["url"].split("?")[0]): r
+           for r in tasks.html_form_requests(bodies, {"page": "https://app.test/account/"})}
+    assert out[("POST", "https://app.test/login")]["body"] == "user=&pw="    # absolute action
+    assert "q=" in out[("GET", "https://app.test/account/search")]["url"]    # relative action vs page dir
+
+
+# --- re-seed crawl: seed selection (the bit reviewed before launching a live crawl) ---
+def test_first_segment():
+    assert tasks._first_segment("/a/b/c") == "a"
+    assert tasks._first_segment("/x") == "x"
+    assert tasks._first_segment("/") == ""
+    assert tasks._first_segment("") == ""
+
+
+def test_select_recrawl_seeds_picks_uncrawled_territory_only():
+    crawled = ["https://app.test/shop/item", "https://app.test/blog/"]
+    discovered = [
+        "https://app.test/debugging/console",    # /debugging/ never crawled → SEED
+        "https://app.test/debugging/logs",        # same new dir → deduped out
+        "https://app.test/shop/item?x=1",          # /shop/ crawled → NOT a seed
+        "https://app.test/debugging/app.js",       # JS file → dropped (not a page)
+        "https://app.test/assets/logo.png",        # static asset → dropped
+        "https://evil.test/admin/",                # out of scope → dropped
+    ]
+    assert tasks.select_recrawl_seeds(discovered, crawled, {"app.test"}, cap=10) == \
+        ["https://app.test/debugging/console"]     # one seed per new dir; static/js/scope filtered
+
+
+def test_select_recrawl_seeds_first_segment_is_conservative_for_subdirs():
+    crawled = ["https://app.test/app/page"]        # top-level segment 'app' already crawled
+    discovered = ["https://app.test/app/admin/panel"]
+    # first-segment selection is conservative: a new sub-dir UNDER an already-crawled top-level → NO seed
+    assert tasks.select_recrawl_seeds(discovered, crawled, {"app.test"}, cap=10) == []
+
+
+def test_select_recrawl_seeds_caps():
+    discovered = [f"https://app.test/new{i}/x" for i in range(20)]
+    assert len(tasks.select_recrawl_seeds(discovered, [], {"app.test"}, cap=5)) == 5

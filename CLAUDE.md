@@ -154,12 +154,18 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       endpoints_js.txt                   #   mine_responses (jsluice endpoints, round-0 seed)
       content_discovery.jsonl            #   feroxbuster forced-browse results (merge of all fixpoint rounds)
       secrets.jsonl                      #   secret fleet, run ONCE at content_discovery's tail (full corpus)
-      findings/tilde_enum.jsonl          #   per-app findings dir — IIS 8.3 short-name (shortscan); #4 consolidates up
+      requests_crawl.jsonl  requests_headless.jsonl  requests_api.jsonl  requests_recrawl.jsonl  #   FULL requests
+      requests.jsonl                     #   request_catalog (PHASE 1): EXPLORABLE-surface catalog (phase-2 DAST input)
+      requests_full.jsonl                #   request_catalog_full (PHASE 4): + guessed surface (param_fuzz/dast_full input)
+      raw/recrawl/seeds.txt              #   recrawl: new-territory seeds (PIPT_RECRAWL on=crawl [default] · preview=list only)
+      params.jsonl                       #   param_fuzz: hidden params, ALL locations {url,param,loc:query|body|json|header}
+      findings/tilde_enum.jsonl  findings/dast.jsonl  findings/dast_full.jsonl  #   per-app findings (shortscan; DAST surface/deep); #4 consolidates up
       wl_custom/seed.txt  wl_custom/round*.txt   #   per-app GENERATED wordlists (seed offline; round N = fuzzed delta)
       responses/  responses/headless/  responses/discovered/round*/   # downloaded corpus (katana/httpx -srd) — mined offline
       raw/<tool>/  # provenance + tool scratch: raw/extracted/ (mined bodies),
                    #   raw/httpx/{screenshot,osint,discovered}, raw/katana/{crawl,headless},
-                   #   raw/subjack/candidates.txt, raw/shortscan/rainbow*.txt
+                   #   raw/subjack/candidates.txt, raw/shortscan/rainbow*.txt,
+                   #   raw/api_spec/ (spec probe+store), raw/dast/{input,input_full}.jsonl (nuclei -im jsonl input)
   findings/hypotheses.jsonl              # dormant agent fan-in output
   screenshots/screenshot/screenshot.html # UNIFIED gallery — one batched httpx run, 1 host/group (+ eyewitness/report.html)
   poc/  tmp/  logs/
@@ -263,20 +269,37 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     a single best-host candidate per group → the unified gallery `screenshots/screenshot/screenshot.html`
     (+ OPTIONAL one EyeWitness run → `report.html` + default-cred leads). Reconciled per group by URL.
     Runs ∥ the loops (no longer a loop-1 step). See "Unified screenshot" below.
-  - **Loop 1 — enumeration** (`phase=1`):
-    `passive_probe` → `crawl` (katana ∥ crawley + JS-render classification, see below) →
-    `crawl_headless` (gated TIER-1 headless, ∥ takeover) ; `subenum` ; `takeover` (← crawl + subenum).
-  - **Loop 2 — content discovery** (`phase=2`): `wordlist` (offline) → `tech_enum` (surface-generating
-    per-stack scanners) ; `fetch_delta` (OSINT delta) → `mine_responses` (offline JS endpoint mining) ;
-    both feed `content_discovery` — feroxbuster forced browsing run as a bounded **fixpoint**
-    (fuzz → download → mine → fuzz the new token delta), which also runs the secret fleet ONCE at the
-    end over the complete corpus. See below.
-  - **Loop 3 — deep enumeration** (`phase=3`): `param_fuzz` — hidden-parameter discovery
-    (**arjun ∥ x8**, merged) over the enumerated endpoints → `params.jsonl`, feeding the planned DAST.
-    Reads loop-2 endpoint artifacts across the barrier (no `needs`). See below.
-  - **Loop 3 — vuln scan** (gated, planned): `tech_vulnscan` — finding-only per-stack scanners
+    The per-app loops are a **surface-first, DAST-first** escalation in four phases: map only what's
+    really there and DAST *that* (fast, high-signal findings) BEFORE sinking hours into guessing; then
+    fuzz, then DAST the guessed surface. The clean split (explorable vs guessed) also keeps each DAST
+    pass scoped — phase 4 fuzzes only the delta, never re-DASTing the surface phase 2 already covered.
+  - **Loop 1 — explorable surface** (`phase=1`, NO guessing): `passive_probe` → `crawl` (katana ∥
+    crawley + JS-render classification, see below) → `crawl_headless` (gated TIER-1 headless, ∥
+    takeover) ; `subenum` ; `takeover` (← crawl + subenum) ; `fetch_delta` (OSINT delta) →
+    `mine_responses` (offline: extract the corpus + jsluice endpoints) ; `api_spec` (∥, well-known
+    OpenAPI/Swagger/GraphQL → `requests_api.jsonl`). The tail `request_catalog` (offline) assembles the
+    **EXPLORABLE-surface** request catalog `requests.jsonl` — crawl/headless **full requests**
+    (`requests_crawl/headless.jsonl` — method/body/form/xhr, not bare URLs) + `requests_api.jsonl` +
+    shapes mined from the **crawl** corpus + URL-only sources as GET. No guessed surface yet.
+  - **Loop 2 — DAST the explorable surface** (`phase=2`, low-hanging fruit): `dast` runs **nuclei
+    `-dast -im jsonl`** over `requests.jsonl`, fuzzing the **observed** params (query/path/header/
+    cookie/**body**) → `findings/dast.jsonl`. Fast, high-signal findings on the real attack surface
+    before any fuzzing; no hidden-param discovery (that's guessing → phase 4).
+  - **Loop 3 — guessing / surface expansion** (`phase=3`): `wordlist` (offline seed from JS/body/seed)
+    → `tech_enum` (surface-generating per-stack scanners) → `content_discovery` — feroxbuster forced
+    browsing run as a bounded **fixpoint** (fuzz → download → mine → fuzz the new token delta), which
+    also runs the secret fleet ONCE at the end over the complete corpus → `recrawl` (re-seeds katana on
+    fuzzing-discovered entry points into un-crawled territory).
+  - **Loop 4 — DAST the guessed surface** (`phase=4`, detailed): `request_catalog_full` (offline)
+    rebuilds the catalog INCLUDING the guessed surface (`requests_full.jsonl` — + recrawl +
+    content_discovery hits + shapes from the fuzz-downloaded corpus) ; `param_fuzz` discovers hidden
+    params across **all locations** (query · body · json · header — arjun `-m` ∥ x8
+    `-X`/`--data-type`/`--headers`), not GET-only, over the full catalog → `params.jsonl` ; `dast_full`
+    runs nuclei `-dast` over the **delta** (full catalog minus the surface catalog) + synthesized
+    requests for the discovered params → `findings/dast_full.jsonl`. See "Request catalog & DAST" below.
+  - **Loop 4 — vuln scan** (gated, planned): `tech_vulnscan` — finding-only per-stack scanners
     (`wpprobe`, nuclei tech-tags, `nikto`, …). Specialized scanners are split between loops by output
-    role: **surface → `tech_enum`** (loop 2, feeds enum); **findings → `tech_vulnscan`** (loop 3).
+    role: **surface → `tech_enum`** (loop 3, feeds enum); **findings → `tech_vulnscan`** (loop 4).
 
 ### Fetch once, mine offline
 
@@ -305,7 +328,7 @@ JS-rendered bucket. It renders the SPA and extracts JS-built routes + XHR/fetch 
 can't reach, storing bodies under `responses/headless/` (mined offline like the rest). Browser RAM
 (1-5 GB/host) is the scale constraint, so concurrent headless processes are capped **process-wide** by
 a module `BoundedSemaphore` (`HEADLESS_PARALLELISM`, since the `ThreadPoolTaskRunner` runs every stage
-in one process), and `-ct` bounds each host. Its `endpoints_headless.txt` is folded into the loop-2
+in one process), and `-ct` bounds each host. Its `endpoints_headless.txt` is folded into the phase-3
 `build_wordlist` (like `endpoints_js.txt`), and its `-srd` store joins the "already have" set so
 `fetch_delta` doesn't re-download it.
 
@@ -323,32 +346,62 @@ off — no re-fetching.
 `build_wordlist` (`wordlist` step) is therefore **pure offline** and emits the **CUSTOM layer only**:
 it tokenizes `endpoints.txt` (+ `endpoints_headless.txt` when the headless pass ran) into path
 segments, filename basenames and parameter names (`tokenize_urls`) → `scans/<app_id>/wl_custom/seed.txt`.
-**App-derived tokens only** — the traditional layer (global content + tech CMS lists) is NOT folded
-into the seed; it's added later by `content_discovery`'s combine, so "custom" stays genuinely custom.
+**App-derived tokens only** — the global staged lists (OLFA + Assetnote) are NOT folded into the seed;
+they're added later by `content_discovery`'s staged combine, so "custom" stays genuinely custom.
 
-### Wordlist strategy — custom vs traditional (`content_discovery` combine)
+### Wordlist strategy — a STAGED escalation (`content_discovery`)
 
-The combined feroxbuster wordlist is two layers: a **custom layer** (`wl_custom/seed.txt` app tokens +
-`tech_enum` shortnames + `mine_responses` JS tokens — always in full, first) and a **traditional layer**
-(the global `content` role list + the detected-tech CMS lists via `wordlists.tech_role_paths`). How much
-of the traditional layer rides along is a **mode** (`resolve_wl_mode`/`combine_wordlist`, both pure):
-- **`auto`** (default; override via env **`PIPT_WL_MODE`** ∈ `auto|targeted|broad`) resolves by corpus
-  richness — a rich custom corpus (≥ `WL_RICH_TOKENS` app tokens) ⇒ `targeted`; a thin/opaque app ⇒ `broad`.
-- **`targeted`**: custom + each traditional list **capped to its top-`WL_TARGETED_CAP`** (SecLists are
-  ~frequency-ordered, so top-N is the high-value head) — lean, high-signal, gentle on live infra.
-- **`broad`**: custom + the traditional lists **in full** (the legacy behaviour) — for opaque apps / max
-  coverage. *Why:* the custom seed is tiny (tens–hundreds) vs a 30k–220k global list, so without a mode
-  the traditional layer dominates cost regardless; `targeted` lets a well-enumerated app lean on its own
-  high-signal surface. The chosen mode + layer sizes are logged.
+Content discovery fuzzes a **staged** wordlist, not one flat list. The split is in two passes; lists
+resolve by ROLE (`wordlists.py` / `wl_global/`), and a missing role just drops its stage.
 
-`content_discovery` is the one Loop 2 step that *must* make new requests — forced browsing finds
+**Pass A** (every scanned host) — `build_content_wordlist` reads roles and hands `(lines, cap)` layers
+to the pure `assemble_wordlist` (custom full+first, then each layer truncated to its top-`cap`):
+- **stage 0 custom** — `wl_custom/seed.txt` + `tech_enum` shortnames + `mine_responses` JS tokens. Full.
+- **stage 0 `content`** = **`onelistforallmicro.txt`** (OLFA grab-bag — ranks juicy/anomalous paths like
+  `old/wp-login.php`, backups high). Full (~37k).
+- **stage 1 `an_directories`** = Assetnote `httparchive_directories_1m` — real web paths, frequency-ordered,
+  fresh monthly, ~97% additive over OLFA. Top-**`STAGE1_CAP`** (30k) head.
+- **stage 2** — the per-stack language list(s) matched by detected tech (`roles_for_tech` +
+  `STAGE2_TECH_ROLES`), top-**`STAGE2_CAP`** (30k). Gated on the fingerprint — never php on a .NET site;
+  a tech that matches nothing skips stage 2. Mapping: php→`an_php` · asp.net/iis/coldfusion→`an_aspx` ·
+  java/jsp/tomcat/jboss/spring→`an_jsp` · server-side JS (node/express/next/nuxt) **and** python
+  (django/flask/fastapi)→`an_apiroutes` (their surface is API routes, not a server-page extension).
+  Client-side react/vue/angular are deliberately NOT mapped (they say nothing about the backend), and
+  python has no dedicated Assetnote list so it leans on `an_apiroutes` + the `.py` extension + the
+  generic stages.
+- **stage 2b `STAGE2B_ROLES`** = `an_txt` + `an_xml` (robots/security.txt; sitemap/opensearch). Small → full.
+
+**Stage 3 — the deep dive** (`_deep_dive`) is a SEPARATE pass, **OPT-IN via env `PIPT_DEEP_DIVE`**
+(off by default — these lists cost hours/host). It runs the huge Assetnote *manual* lists at full depth
+(`DEEP_DIVE_DEPTH`=3) on the few **high-value** hosts, gated per stack (`DEEPDIVE_TECH_ROLES`): php→`mn_php`
+(3M)+`mn_phpmillion` (1M) · asp.net→`mn_aspx`/`mn_asp`/`mn_cfm` · java→`mn_jsp`/`mn_do` · plus the generic
+`mn_html` (4M) on every qualifying host (js/python have no dedicated manual list → generic only). These are
+nearly disjoint from the `an_*` heads (≈1% overlap), so it's a complete rake. Gated tight: a host qualifies
+only if Pass A already found ≥ `DEEP_DIVE_MIN_HITS`
+(50) results on it, at most `DEEP_DIVE_MAX_HOSTS` (2) richest hosts per app, under a `DEEP_DIVE_DEADLINE_S`
+(3600s) budget + per-host `DEEP_DIVE_TIME_LIMIT` (30m). Its hits merge into `content_discovery.jsonl`; it
+does **not** download bodies (the secret fleet already scans the Pass-A corpus).
+
+*Why staged, not one list / not mode-based:* the lists are ~frequency-ordered, so a top-N cap keeps the
+high-signal head and drops the blow-up tail (`an_directories` is 684k, `mn_*` are 1–4M). Per-stack gating
+puts the right language list in front instead of fuzzing all of them; the deep dive's huge near-disjoint
+lists only pay off on a genuinely content-rich host, so they're opt-in + tight-gated. This replaced the
+earlier `auto/targeted/broad` mode (`resolve_wl_mode`/`combine_wordlist`) — the staged caps + fingerprint
+gating subsume it. *(Detected-tech CMS `wordpress`/`drupal`/`joomla` roles + `tech_role_paths` remain as
+resolution infra, currently unwired into the fuzz wordlist.)*
+
+New roles are resolved exactly like the others (BYO › `PIPT_WL_<ROLE>` › discovery under
+`PIPT_WORDLISTS`/SecLists), so the lists live wherever you point `PIPT_WORDLISTS` — nothing hardcoded.
+
+`content_discovery` is the one phase-3 step that *must* make new requests — forced browsing finds
 UNLINKED paths, which by definition aren't in any downloaded body. It runs `feroxbuster --smart`
 (auto-tune soft-404 calibration + collect-words/backups + link extraction/recursion) over the group's
 hosts **deduped by response body** (`_scan_hosts` → `dedup_by_body`): same-backend aliases (domain+IP,
 http+https) collapse to one (no re-fuzz; the scanme.nmap.org hang), but distinct environments
 (staging vs test — different body) are each fuzzed, since env-specific files differ. `crawl` and
-`crawl_headless` use the same `_scan_hosts` selection. The round-0 wordlist is the custom+traditional
-combine described above (mode-driven) plus tech-derived extensions (`tech_extensions`).
+`crawl_headless` use the same `_scan_hosts` selection. The round-0 wordlist is the **staged combine**
+described above (`build_content_wordlist`) plus tech-derived extensions (`tech_extensions`); the
+opt-in stage-3 deep dive (`_deep_dive`) escalates on high-value hosts.
 `--smart` means feroxbuster's *intra-run* wordlist-feedback is built in — don't
 hand-roll it. **But that recursion is link-only**: it never parses a discovered JS file for API
 routes, nor tokenizes new params. So `content_discovery` wraps it in a bounded **cross-tool fixpoint**
@@ -372,7 +425,7 @@ gracefully, keeping partial results).
 
 **Specialized per-stack scanners are split by output role** (so they land in the right loop) — but a
 scanner can be **DUAL-ROLE** and emit both; the role just decides which loop its *surface* drives:
-- `tech_enum` (loop 2, before content_discovery) runs scanners whose output is **surface that feeds
+- `tech_enum` (phase 3, before content_discovery) runs scanners whose output is **surface that feeds
   enum**. Today: `shortscan` (IIS/ASP.NET 8.3 short-name enumeration). It builds a `shortutil` rainbow
   table from the seed + global list so shortscan resolves leaked 8.3 names to real filenames, then
   `parse_shortscan` harvests those as fuzz words → `wl_custom/shortnames.txt`, merged into the combined
@@ -382,29 +435,89 @@ scanner can be **DUAL-ROLE** and emit both; the role just decides which loop its
   race-free). The general findings model + the `consolidate` that lifts per-app `findings/` into the
   activity-level `<activity>/findings/` are backlog #4. Best-effort dispatch keyed on detected tech
   (no-op if tech unmatched / binary absent).
-- `tech_vulnscan` (loop 3, gated, planned) runs scanners whose output is **findings-only** (`wpprobe`,
+- `tech_vulnscan` (loop 4, gated, planned) runs scanners whose output is **findings-only** (`wpprobe`,
   nuclei tech-tags, `nikto`, …).
 
-### Loop 3 — parameter discovery (`param_fuzz`)
+### Request catalog & DAST — full requests, not bare URLs (the GET-only fix)
 
-`param_fuzz` finds the **hidden HTTP parameters** the enumerated endpoints accept — the surface the
-planned DAST needs. `arjun` (`~/.local/bin/arjun`) and `x8` (`~/.cargo/bin/x8`, prebuilt binary — the
-system cargo is too old to compile it) are **both hidden-parameter discovery tools** with different,
-overlapping heuristics, so they run **∥ and are merged** (the secret-fleet / dual-crawler pattern):
-`parse_arjun`/`parse_x8` → common `{url, param, method, sources, reason}` shape; `merge_params` dedups
-by `(url, param)` → `params.jsonl`. Both are best-effort (skip if the binary is absent; **x8 is also
-skipped without a `params` wordlist**, which it requires). arjun/x8 write JSON to `-oJ`/`-o` (not
-stdout), so they bypass `_run` like feroxbuster/shortscan.
+A bare URL can only describe a GET query, so a URL-list-driven fuzzer (reconftw, and the old
+`param_fuzz`) can never reach **POST/JSON/body/header** params. The DAST passes fix this with a
+**request catalog**: per-request records `{method, url, headers, body, params:[{name,loc}], raw, sources}`
+where `raw` is the full HTTP/1.1 request **nuclei `-im jsonl` fuzzes on every part**. `raw` mirrors
+katana's own request object (`{request:{endpoint, raw, header, body}}`), so nuclei ingests it natively;
+`build_raw_request` (pure) constructs `raw` for synthesized requests.
 
-They're **per-endpoint and request-heavy** (a ~6.5k-name wordlist × N endpoints × 2 tools), so
-`select_param_endpoints` first picks the endpoints to test: the loop-1/2 artifacts (`endpoints.txt` +
-`endpoints_js`/`endpoints_headless` + 2xx `content_discovery` hits), scoped to the group's hosts,
-**deduped by `path_template`** (query dropped, numeric/long-hex segments → `*`, so `/user/123` and
-`/user/456` collapse to one shape) and **capped** at `PARAM_MAX_ENDPOINTS` (logged). Politeness on live
-infra: low `-t`/`-W`/`-c`, `--rate-limit`/`-d`, and x8's `--one-worker-per-host`; **GET-only** for now
-(POST/JSON a future extension). The wordlist is the `params` role
-(`Discovery/Web-Content/burp-parameter-names.txt`). Output `params.jsonl` is a deliverable + the DAST's
-input; provenance in `raw/arjun/`, `raw/x8/`, `raw/param_fuzz/targets.txt`.
+**The catalog is built TWICE** (`_assemble_catalog(include_guessed=…)`, one shared core): the phase-1
+`request_catalog` writes the **EXPLORABLE-surface** catalog `requests.jsonl` (crawl/headless/API +
+crawl-corpus shapes + URL-only GETs — no guessed surface); the phase-4 `request_catalog_full` writes the
+**full** catalog `requests_full.jsonl` (additionally folds in `requests_recrawl.jsonl`, the
+content_discovery 2xx hits, and the shapes mined from the now-extended fuzz corpus). Two distinct
+artifacts so write-once holds and each DAST pass reads exactly its scope.
+
+- **The data was already crawled, just discarded.** katana (`-fx` forms, `-xhr`) and headless katana
+  emit method/body/form/xhr in their JSONL; `parse_katana` kept only the URL. Now `crawl`/`crawl_headless`
+  drop `-omit-raw` (keep `-omit-body`) and `parse_katana_requests` writes `requests_crawl/headless.jsonl`.
+- **`request_catalog`** (phase 1, offline, net=False) merges those + `requests_api.jsonl` (from `api_spec`)
+  + **shapes mined from the crawl corpus** + the URL-only sources (passive/crawley/jsluice, as GET) →
+  `requests.jsonl`, scheme-normalized (`_working_schemes`, incl. the http fallback) + in-scope-filtered,
+  deduped by request shape (`request_key` = method + `path_template`; `merge_requests` unions
+  params/sources). The `raw` is scheme-agnostic (path + Host), so only the `url` field is re-schemed.
+- **`request_catalog_full`** (phase 4, offline, net=False) re-runs that assembly with the guessed surface
+  folded in (`requests_recrawl.jsonl` + content_discovery 2xx + the re-extracted fuzz corpus, incl.
+  feroxbuster-found shapes) → `requests_full.jsonl`. It reads phase-1 + phase-3 artifacts across the
+  barriers, so it sees the COMPLETE corpus. Feeds `param_fuzz` + `dast_full`.
+- **Closing the fuzzing→DAST gap (shapes are mostly on disk already).** A feroxbuster/jsluice discovery
+  entered the catalog as a bare GET — losing its real method/body. So `request_catalog` MINES request
+  shapes from the already-downloaded corpus (no re-fetch — "fetch once"): `jsluice_requests` recovers the
+  method/contentType/bodyParams jsluice already extracts from fetch/XHR calls (we kept only the URL,
+  same mistake as katana); `html_form_requests` (`_FormParser`, stdlib) turns `<form>` elements in the
+  stored HTML bodies into POST/GET requests — **including the unlinked pages feroxbuster found**, whose
+  forms katana `-fx` never saw. Relative URLs resolve against each body's source URL (a `stem→url` map
+  from the `-srd` indices; `_extract_bodies` names files `<stored-stem>.{js,html}`).
+- **`recrawl`** (phase 3, after `content_discovery`) handles the residual: a discovered entry point into
+  **un-crawled territory** (e.g. an unlinked `/debugging` that opens a sub-app) needs a real crawl, not
+  just body-mining. `select_recrawl_seeds` picks a **2xx** discovered URL whose **top-level path segment**
+  no crawled URL uses — conservative: a new sub-dir UNDER an already-crawled region does NOT seed (one
+  shallow seed per new top-level segment, static/JS/out-of-scope dropped, capped). It re-seeds katana
+  there (one pass, depth-bounded) and stores the bodies into the corpus so `request_catalog_full` mines
+  them. `PIPT_RECRAWL` ∈ `off|preview|on`, **default `on`**; `preview` writes/logs the seeds
+  (`raw/recrawl/seeds.txt`) WITHOUT crawling (to review them). Bounded even when on (few shallow seeds,
+  depth 2, `-ct` cap), one pass — never a crawl⇄fuzz loop.
+- **`api_spec`** (phase 1, ∥) probes well-known OpenAPI/Swagger JSON paths + GraphQL endpoints on the
+  group's hosts; `expand_openapi` (pure; OpenAPI v3 `servers`/`requestBody` + Swagger v2 `basePath`/
+  `in:body`) turns each operation into a full request (path param → `1`, query/header recorded, body
+  skeleton) → `requests_api.jsonl`. The richest method+body+param source a crawler/GET-fuzzer can't see.
+
+`param_fuzz` (phase 4) finds the **hidden parameters across ALL locations** (query · body · json ·
+header), not GET-only, over the FULL catalog (`requests_full.jsonl`) so it probes the fuzzing-discovered
+endpoints too. `arjun` (`~/.local/bin/arjun`, `-m GET/POST/JSON`) and `x8` (`~/.cargo/bin/x8`, prebuilt —
+system cargo too old to compile it; `-X` method · `--data-type json` · `--headers` mode) run **∥ and are
+merged** by `(url, param, loc)` → `params.jsonl` (query≠body are distinct injection points). It reads the
+catalog: QUERY discovery over every endpoint shape (`select_param_endpoints`, deduped by `path_template`,
+cap `PARAM_MAX_ENDPOINTS`); BODY+JSON over the endpoints the crawl saw with a body (`select_body_targets`)
+topped up from the query set (cap `PARAM_MAX_BODY_ENDPOINTS`); HEADER over a small subset (`x8` only —
+arjun has no header mode; cap `PARAM_MAX_HEADER_ENDPOINTS`). The flat `(tool, location)` matrix runs in a
+bounded pool (`PARAM_FANOUT`), each best-effort under the per-tool wall-clock cap. Politeness: low
+`-t`/`-W`/`-c`, `--rate-limit`/`-d`, `--one-worker-per-host`. Wordlist = `params` role, custom-first.
+
+**DAST runs in two passes** (shared `_run_dast`), both **`nuclei -dast -im jsonl`** fuzzing
+query/path/header/cookie/**body** per template `part`, `-fa low` for live-infra politeness, best-effort
+(skip if nuclei or the dast templates dir — `PIPT_NUCLEI_DAST_TEMPLATES`, default `~/nuclei-templates/dast`
+— is absent), capped at `DAST_MAX_REQUESTS` (reconftw DEEP_LIMIT analog):
+- **`dast`** (phase 2) over the explorable-surface catalog `requests.jsonl` with its **observed** params
+  → `findings/dast.jsonl` (input `raw/dast/input.jsonl`). The fast low-hanging-fruit pass.
+- **`dast_full`** (phase 4) over the **delta** (`requests_full.jsonl` shapes NOT already in
+  `requests.jsonl`, keyed by `request_key`) + `build_fuzz_requests` (the discovered hidden params
+  injected into concrete requests per location) → `findings/dast_full.jsonl` (input
+  `raw/dast/input_full.jsonl`). It does NOT re-DAST the surface phase 2 already covered.
+
+Whole-scope full-template nuclei stays `nuclei_scope` (breadth, ∥ everything); these are the per-app
+fuzzing passes. Per-app findings → `consolidate` (backlog #4) lifts them. arjun/x8/api_spec provenance in
+their `raw/` dirs.
+
+**Auth passthrough** (`PIPT_HTTP_HEADER`, `_header_flags`/`_auth_headers`) threads operator session
+headers/cookies into katana/httpx/nuclei (`-H`), arjun (`--headers`) and x8 (`-H`) so the crawl/fetch/
+fuzz/DAST reach the **authenticated** surface (where most POST/JSON lives).
 
 ## Adding a pipeline (checklist)
 
@@ -444,6 +557,11 @@ its centerpiece. Open it locally in a browser; a git diff of it shows exactly ho
   recon tasks). Other tools (subfinder, dnsx, naabu, tlsx, mapcidr, shuffledns, katana, nerva,
   assetfinder, gau, urlfinder, subjack, …) are in `~/go/bin`; feroxbuster in `~/.local/bin`.
 - Trusted resolvers: `/opt/resolvers/resolvers-trusted.txt`.
+- **DAST (`dast` step)** uses `nuclei -dast` with the fuzzing templates at `~/nuclei-templates/dast`
+  (override `PIPT_NUCLEI_DAST_TEMPLATES`); the step skips best-effort if the dir or nuclei is absent.
+- **Auth passthrough** — set `PIPT_HTTP_HEADER` to one or more `Name: value` session headers/cookies
+  (separated by newlines or `;;`) to reach the authenticated surface; threaded into katana/httpx/nuclei
+  (`-H`), arjun (`--headers`), x8 (`-H`). Set it *before* launching (like `PIPT_PROFILE`).
 - **EyeWitness (optional, `screenshot` step)** — a Selenium app, **installed** at `/opt/EyeWitness`
   with its own venv (`/opt/EyeWitness/.venv`, selenium ≥4.45 → Selenium Manager auto-provisions
   chromedriver; runs `--headless=new`, no Xvfb/sudo needed). `_eyewitness_cmd` resolves it
@@ -469,6 +587,55 @@ its centerpiece. Open it locally in a browser; a git diff of it shows exactly ho
 
 The architecture sections above say *what* the recon pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **Per-app loops are surface-first, DAST-first — four phases, not three.** Map only the EXPLORABLE
+  surface (OSINT/crawl, no guessing) and DAST *that* first, THEN guess/fuzz, THEN DAST the guessed
+  surface. The phases: (1) explorable surface — passive/crawl/headless + `fetch_delta`/`mine_responses` +
+  `api_spec`, tail `request_catalog` → `requests.jsonl`; (2) `dast` over that surface (low-hanging fruit);
+  (3) guessing — `wordlist`→`tech_enum`→`content_discovery` fixpoint→`recrawl`; (4) `request_catalog_full`
+  (`requests_full.jsonl`)→`param_fuzz`→`dast_full`. *Why:* high-signal findings on the REAL attack
+  surface arrive fast — across the whole scope (the phase barrier) — before sinking hours into fuzzing;
+  the explorable/guessed split also keeps each DAST scoped. *Why `mine_responses` (extract + jsluice) is
+  phase 1, not phase 3:* `request_catalog` mines POST/form/XHR shapes from the extracted corpus, so
+  without it the phase-2 DAST degrades to GET-only on the surface — defeating the full-request design.
+  *Why `wordlist` (the seed) IS phase 3:* its only consumers are `content_discovery`/`tech_enum`/
+  `param_fuzz` (all phase 3+) — it's pure fuzzing-prep, so it belongs with the guessing, reading the
+  phase-1 corpus across the barrier. *Why two catalog stages + two DAST stages* (not one re-run): a stage
+  owns one artifact (write-once), so the surface catalog (`requests.jsonl`) and the full catalog
+  (`requests_full.jsonl`) are distinct files with distinct writers; same for `findings/dast.jsonl` vs
+  `dast_full.jsonl`. *Why `dast_full` fuzzes only the DELTA* (full minus surface, by `request_key`) + the
+  param-injection requests: phase 2 already covered the surface, so re-DASTing it is wasted nuclei work;
+  the hidden params are new injection points so they're always included. *Rejected:* the literal
+  three-phase reading (fuzz is terminal) — it drops DAST coverage of the fuzzing-discovered surface, a
+  regression vs the old single end-of-pipeline DAST; running `param_fuzz` in phase 2 — it's guessing
+  (brute-forces param names), so it belongs after the low-hanging-fruit pass. *(Supersedes the old Loop
+  1 enumeration / Loop 2 content-discovery / Loop 3 catalog+param+DAST layout.)*
+
+- **DAST fuzzes FULL requests, not bare URLs — via a request catalog fed to nuclei `-im jsonl`.** A URL
+  list only carries a GET query, so reconftw and the old `param_fuzz` could fuzz nothing but query
+  params. The catalog (`requests.jsonl`) records `{method, headers, body, params:[{name,loc}], raw}` and
+  nuclei `-im jsonl` builds each fuzzed request from `raw` (the authoritative field — empty `raw` →
+  "failed to read method line"), fuzzing query/path/header/cookie/**body** per template `part`. *How we
+  got the data:* katana already discovers forms (`-fx`), XHR (`-xhr`) and request bodies — `parse_katana`
+  threw all but the URL away; we now drop `-omit-raw` and keep it. *Verified empirically* (the format was
+  reverse-engineered from nuclei's parse error + confirmed with `-dast -dfp`: a synthesized `POST` body
+  engages `sqli`/`xss` fuzz points — see the `nuclei-dast-jsonl` memory). *Why a catalog stage* (not
+  inline in dast): `param_fuzz` and `dast` both read it; one writer (`request_catalog`), many readers,
+  respecting write-once. *Why build `raw` ourselves* rather than depend on katana's: identical builder
+  serves synthesized requests (param discovery, OpenAPI expansion); `raw` is path+Host so it's
+  scheme-agnostic (only `url` is re-schemed). *Rejected:* `-im openapi` as a second nuclei run (api_spec
+  expands specs into the one jsonl catalog instead); feeding nuclei bare URLs (`-im list` — GET query only).
+
+- **Param discovery covers ALL locations (query · body · json · header), gated by the catalog.** arjun
+  (`-m GET/POST/JSON`) and x8 (`-X` · `--data-type json` · `--headers`) natively discover params in every
+  location; the old `param_fuzz` artificially restricted to GET. Query discovery runs over every endpoint
+  shape; body/json target the endpoints the crawl saw with a body (`select_body_targets`) topped up from
+  the query set (probe hidden POST params); header is x8-only. Merged by `(url, param, loc)` — query≠body
+  are distinct injection points. *Why catalog-driven:* trying every method on every endpoint multiplies
+  request load; the catalog says where bodies actually are. *Politeness:* tight per-location caps
+  (`PARAM_MAX_*`), bounded `(tool, location)` fan-out, per-tool wall-clock cap. *Why nuclei-dast-only* for
+  the DAST itself: it's runnable today (templates installed, zero extra deps); dalfox/sqlmap/etc. remain a
+  future best-effort layer like shortscan/eyewitness.
 
 - **Scan scheme = the one that WORKS for the scanners, not httpx's https guess.** httpx (breadth) is
   fed bare hosts, defaults to https, and *ignores the input scheme* — and its Go TLS happily

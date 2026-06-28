@@ -21,11 +21,13 @@ import subprocess
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qsl, unquote_plus, urljoin, urlsplit
 
 from pipt.core import scope, tools, workspace
 from pipt.core.log import get_logger, is_verbose
@@ -151,17 +153,20 @@ NOISE_EXTENSIONS = frozenset({
     "mp3", "mp4", "wav", "avi", "mov", "webm",
 })
 
-# wordlist synthesis (LOOP 2 — active collection → custom per-app wordlist)
+# wordlist synthesis (PHASE 3 — active collection → custom per-app wordlist)
 _TOKEN_MAX_LEN = 40                       # drop longer "segments" (hashes/junk)
 OSINT_FETCH_RL = "50"  # httpx req/s when downloading the OSINT delta into responses/osint/
-# wordlist STRATEGY (content_discovery combine): the CUSTOM layer (app-derived tokens) always goes in
-# full; how much of the TRADITIONAL layer (global content + tech CMS lists) rides along depends on the
-# mode. `auto` (override via env PIPT_WL_MODE ∈ auto|targeted|broad) → `targeted` when the app gave a
-# rich custom corpus (lean on it, cap the traditional lists), else `broad` (opaque app → full lists).
-WL_RICH_TOKENS = 200   # custom-token count at/above which `auto` picks `targeted`
-WL_TARGETED_CAP = 2000  # in `targeted`, keep only the top-N of each traditional list (freq-ordered)
+# wordlist STRATEGY (content_discovery) — a STAGED escalation, not one flat list. Pass A (every
+# scanned host) fuzzes a combine of: custom (app-derived, full, first) + stage 0 `content`=olfa_micro
+# (full, the grab-bag that ranks juicy/anomalous paths high) + stage 1 `an_directories` top-STAGE1_CAP
+# (real web paths, frequency-ordered, ~97% additive over olfa) + stage 2 the ONE per-stack language
+# list matched by detected tech, top-STAGE2_CAP + stage 2b the small `an_txt`/`an_xml` filetype lists
+# (full). Stage 3 (the deep dive) is a SEPARATE gated pass — see DEEP_DIVE_* below. Lists resolve by
+# ROLE (wordlists.py / wl_global/), never hardcoded; a missing role just drops its stage.
+STAGE1_CAP = 30000  # an_directories_1m: top-N frequency head folded into Pass A (684k full would blow up)
+STAGE2_CAP = 30000  # per-stack language list (an_php/an_aspx/an_jsp): top-N head
 
-# content discovery (LOOP 2) — feroxbuster forced browsing. Global wordlists are
+# content discovery (PHASE 3) — feroxbuster forced browsing. Global wordlists are
 # resolved by ROLE (see wordlists.py / wl_global/), never hardcoded here.
 # Gentle on live infra: --smart (auto-tune) adapts the rate down when the target errors/times
 # out; low -t/-L keep concurrency bounded from the start. (--rate-limit is mutually exclusive
@@ -175,7 +180,7 @@ FEROX_TIMEOUT = "15"     # --timeout per-request seconds (tolerate slow apps)
 # hangs the whole pipeline (no per-request timeout breaks it). --smart-compatible; exits gracefully,
 # keeping partial results. See the scanme.nmap.org incident.
 FEROX_TIME_LIMIT = "20m"  # --time-limit total scan duration (normal scans here finish in ~5m)
-# content-discovery FIXPOINT (LOOP 2) — after round 0 (the classic forced-browse), feed the
+# content-discovery FIXPOINT (PHASE 3) — after round 0 (the classic forced-browse), feed the
 # feroxbuster-discovered bodies back through download → mine → tokenize → fuzz the NEW token delta,
 # until a fixpoint. Bounded by FOUR independent stops (no-new-words, no-new-urls, the per-app
 # wall-clock deadline, diminishing-returns) under a hard round cap — see content_discovery().
@@ -184,11 +189,51 @@ CONTENT_DEADLINE_S = 900        # per-app wall-clock budget across ALL rounds (i
 DEEP_FEROX_TIME_LIMIT = "5m"    # --time-limit for feedback rounds (round 0 keeps FEROX_TIME_LIMIT)
 MIN_NEW_TOKENS = 20             # a round contributing fewer new fuzz words ⇒ stop (diminishing returns)
 DEEP_DOWNLOAD_CAP = 300         # max NEW urls downloaded+mined per round (logged when it bites)
+# DEEP DIVE (PHASE 3, stage 3) — a SEPARATE forced-browse pass with the HUGE Assetnote manual lists
+# (mn_php 3M, mn_phpmillion 1M, mn_html 4M — nearly disjoint from the an_* heads) at full depth, run
+# ONLY on the few high-value hosts. OPT-IN (env PIPT_DEEP_DIVE truthy) because at these sizes it costs
+# hours/host. Gated tight: a host qualifies only if Pass A already found ≥ DEEP_DIVE_MIN_HITS results
+# on it (a real, content-bearing app), and at most the DEEP_DIVE_MAX_HOSTS richest qualify per app.
+DEEP_DIVE_MIN_HITS = 50      # Pass A hits on a host below which the deep dive is not worth it
+DEEP_DIVE_MAX_HOSTS = 2      # deep-dive at most the N richest scanned hosts per app
+DEEP_DIVE_DEADLINE_S = 3600  # per-app wall-clock budget for the whole deep dive
+DEEP_DIVE_TIME_LIMIT = "30m"  # feroxbuster --time-limit per deep-dive host run
+DEEP_DIVE_DEPTH = "3"        # recursion depth for the deep dive (Pass A uses FEROX_DEPTH=2)
 
-# parameter fuzzing (LOOP 3) — arjun ∥ x8 hidden-parameter discovery over the enumerated endpoints.
+# parameter fuzzing (PHASE 4) — arjun ∥ x8 hidden-parameter discovery over the enumerated endpoints.
 # Per-endpoint and request-heavy (a 6.5k-name wordlist over N endpoints, two tools), so the endpoint
 # set is deduped by path-template and capped, and both tools run gently (low concurrency + rate cap).
 PARAM_MAX_ENDPOINTS = 50   # cap distinct endpoint shapes fuzzed per app (logged when it bites)
+# multi-location discovery (query · body · json · header) — body/json/header are heavier and
+# lower-yield than query, so they get tighter caps. arjun -m GET/POST/JSON ∥ x8 -X/--data-type/--headers.
+PARAM_MAX_BODY_ENDPOINTS = 25    # body + json discovery cap (POST/PUT/PATCH or body-bearing endpoints)
+PARAM_MAX_HEADER_ENDPOINTS = 15  # header discovery cap (x8 only — arjun has no header-discovery mode)
+PARAM_FANOUT = 3                 # concurrent (tool, location) param jobs per app
+
+# per-app DAST (PHASE 2 surface + PHASE 4 deep) — nuclei -dast over the request catalog (full requests
+# → fuzz query/path/header/cookie/body, not just GET query). Phase 2 hits the explorable surface
+# (requests.jsonl); phase 4 hits the guessed delta + discovered params. Whole-scope full-template nuclei
+# is nuclei_scope (breadth). Best-effort (skips if nuclei / dast templates absent).
+DAST_MAX_REQUESTS = 1500   # cap requests fed to nuclei per app (reconftw DEEP_LIMIT2 analog); logged
+DAST_AGGRESSION = "low"    # nuclei -fa (low|medium|high): payload count per fuzz point — low = polite
+
+# API spec discovery (PHASE 1) — probe for OpenAPI/Swagger JSON specs + GraphQL endpoints, expand the
+# spec into full request records (method/body/params) → requests_api.jsonl, folded into the catalog.
+# The richest source of method+body+param info — the API surface a crawler / GET-fuzzer can't see.
+API_SPEC_PATHS = ("/openapi.json", "/swagger.json", "/v2/api-docs", "/v3/api-docs", "/api-docs",
+                  "/swagger/v1/swagger.json", "/api/swagger.json", "/api/openapi.json",
+                  "/api/v1/openapi.json", "/swagger/doc.json")
+GRAPHQL_PATHS = ("/graphql", "/api/graphql", "/v1/graphql", "/query")
+API_SPEC_MAX_OPS = 300     # cap operations expanded per app (logged when it bites)
+
+# re-seed crawl (PHASE 3) — when fuzzing finds an entry point into UN-CRAWLED territory (e.g. a
+# /debugging dir the link-crawler never reached), crawl it so its linked/rendered surface + request
+# shapes aren't lost. PIPT_RECRAWL ∈ off|preview|on (default `on`); `preview` selects+logs the seeds
+# without crawling (review raw/recrawl/seeds.txt). Bounded even when on: few shallow seeds, depth 2.
+RECRAWL = os.environ.get("PIPT_RECRAWL", "on").lower().strip()
+RECRAWL_MAX_SEEDS = 10     # cap new-territory entry points crawled per app (logged when it bites)
+RECRAWL_DEPTH = "2"        # katana -d for the re-seed crawl (shallower than the phase-1 crawl)
+RECRAWL_CT = "120"         # katana -ct crawl-duration cap per seed host (seconds)
 ARJUN_THREADS = "5"        # arjun -t
 ARJUN_RATE = "20"          # arjun --rate-limit (req/s)
 ARJUN_TIMEOUT = "15"       # arjun -T (per-request seconds)
@@ -208,6 +253,31 @@ TECH_EXTENSIONS = {  # detected-tech keyword → file extensions to fuzz
     "ruby": ["rb"],
     "coldfusion": ["cfm", "cfc"],
 }
+# detected-tech keyword → wordlist ROLE for the stage-2 per-stack language list (Pass A). Only the
+# matching list rides along (never php on a .NET site); a tech that matches nothing skips stage 2. The
+# API-driven stacks (server-side JS: node/express/next/nuxt; python frameworks) get `an_apiroutes` —
+# their surface is API routes, not a server-page extension. NB: react/vue/angular are CLIENT-side and
+# imply nothing about the backend, so they're deliberately NOT mapped. Python has no dedicated Assetnote
+# list, so it leans on an_apiroutes + the .py extension + the generic stages (an_directories/olfa).
+STAGE2_TECH_ROLES = {
+    "php": "an_php",
+    "asp.net": "an_aspx", "iis": "an_aspx", "microsoft-iis": "an_aspx", "coldfusion": "an_aspx",
+    "java": "an_jsp", "jsp": "an_jsp", "tomcat": "an_jsp", "jboss": "an_jsp", "spring": "an_jsp",
+    "node": "an_apiroutes", "express": "an_apiroutes", "next": "an_apiroutes", "nuxt": "an_apiroutes",
+    "python": "an_apiroutes", "django": "an_apiroutes", "flask": "an_apiroutes", "fastapi": "an_apiroutes",
+}
+STAGE2B_ROLES = ("an_txt", "an_xml")  # small always-on filetype lists (robots/security.txt; sitemap/opensearch)
+# detected-tech keyword → DEEP-DIVE (stage 3) roles, gated to a php/.NET/java stack (the huge MANUAL
+# lists that exist). `mn_html` is GENERIC (every app serves html) so it always rides on a qualifying
+# host; js/python have no dedicated manual list → they get only the generic mn_html.
+DEEPDIVE_TECH_ROLES = {
+    "php": ("mn_php", "mn_phpmillion"),
+    "asp.net": ("mn_aspx", "mn_asp", "mn_cfm"), "iis": ("mn_aspx", "mn_asp", "mn_cfm"),
+    "microsoft-iis": ("mn_aspx", "mn_asp", "mn_cfm"), "coldfusion": ("mn_cfm",),
+    "java": ("mn_jsp", "mn_do"), "jsp": ("mn_jsp", "mn_do"), "tomcat": ("mn_jsp", "mn_do"),
+    "jboss": ("mn_jsp", "mn_do"), "spring": ("mn_jsp", "mn_do"),
+}
+DEEPDIVE_GENERIC_ROLES = ("mn_html",)
 
 # clustering (surfagr.sh port) — group webapps into application-groups by union-find over
 # APP-IDENTITY signals only (see _cluster_signals/_CLUSTER_EDGES). Tuned PRECISION-FIRST: never
@@ -254,15 +324,39 @@ DETECT_SECRETS = str(_DETECT_SECRETS_BIN) if _DETECT_SECRETS_BIN.exists() else "
 _CRAWLEY_BIN = Path.home() / "go" / "bin" / "crawley"
 CRAWLEY = str(_CRAWLEY_BIN) if _CRAWLEY_BIN.exists() else "crawley"
 
-# param_fuzz fleet (LOOP 3) — arjun (pip/uv, ~/.local/bin) ∥ x8 (cargo, ~/.cargo/bin). Best-effort.
+# param_fuzz fleet (PHASE 4) — arjun (pip/uv, ~/.local/bin) ∥ x8 (cargo, ~/.cargo/bin). Best-effort.
 _ARJUN_BIN = Path.home() / ".local" / "bin" / "arjun"
 ARJUN = str(_ARJUN_BIN) if _ARJUN_BIN.exists() else "arjun"
 _X8_BIN = Path.home() / ".cargo" / "bin" / "x8"
 X8 = str(_X8_BIN) if _X8_BIN.exists() else "x8"
 
+# nuclei DAST fuzzing templates (per-app `dast` step). Default to the standard nuclei-templates dast/
+# dir; override with PIPT_NUCLEI_DAST_TEMPLATES. The step skips (best-effort) if the dir is absent.
+_NUCLEI_DAST_TEMPLATES = Path.home() / "nuclei-templates" / "dast"
+NUCLEI_DAST_TEMPLATES = os.environ.get("PIPT_NUCLEI_DAST_TEMPLATES") or str(_NUCLEI_DAST_TEMPLATES)
+
 # EyeWitness (optional, screenshot step) — known venv install (own .venv + Python/EyeWitness.py);
 # resolved by _eyewitness_cmd (overridable via PIPT_EYEWITNESS / `eyewitness` on PATH).
 _EYEWITNESS_DIR = Path("/opt/EyeWitness")
+
+
+# --- auth passthrough (env PIPT_HTTP_HEADER) — operator session headers/cookies so the crawl/fuzz/
+# DAST reach the AUTHENTICATED surface (most POST/JSON lives behind a login). One or more
+# "Name: value" headers, separated by newlines or ";;". Threaded into katana/httpx/arjun/x8/nuclei.
+def _auth_headers() -> list[str]:
+    """The operator's session headers/cookies (env PIPT_HTTP_HEADER), as a list of 'Name: value'
+    strings. Read each call (testable); empty when unset or malformed (a part without ':' is dropped)."""
+    raw = os.environ.get("PIPT_HTTP_HEADER", "")
+    return [p.strip() for p in re.split(r";;|\n", raw) if p.strip() and ":" in p]
+
+
+def _header_flags(flag: str = "-H") -> list[str]:
+    """[flag, header, flag, header, …] for the operator's session headers — appended to a tool's argv
+    so it reaches the authenticated surface. Empty when none set. katana/httpx/nuclei all take -H."""
+    out: list[str] = []
+    for h in _auth_headers():
+        out += [flag, h]
+    return out
 
 # --- preflight tool inventory (logical name → command/path resolved with shutil.which) ---
 # CORE: the pipeline genuinely relies on these — a missing one is a WARNING (its stage yields
@@ -479,6 +573,241 @@ def tokenize_urls(urls: Iterable[str]) -> list[str]:
     return sorted(out)
 
 
+# --- lexicon extraction (build_wordlist) — pure, unit-testable corpus miners ---
+# These turn the crawled link surface AND the downloaded response bodies into per-app wordlist
+# products beyond the endpoint seed: parameter-name candidates, high-semantic value words, and
+# identities (users/emails). values/identities have no consumer yet (deliverables for the planned
+# DAST), so the filters lean PRECISION-FIRST — a smaller clean list beats a noisy one.
+_VALUE_MIN_LEN = 3
+_JSON_MAX_BYTES = 2_000_000        # skip JSON-parsing a body larger than this (memory bound)
+_JSON_MAX_DEPTH = 6
+_JSON_MAX_ITEMS = 200              # per-list fan-out bound while walking a parsed body
+# query keys whose VALUES are noise (session/tracking/nonce) — skipped when mining value words
+_TRACKING_PARAMS = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "gclid", "fbclid",
+    "ref", "sid", "token", "csrf", "nonce", "sig", "signature", "hash", "t", "ts", "_", "v", "cb",
+})
+# boilerplate dropped from app-name / apex value words
+_BOILERPLATE_WORDS = frozenset({
+    "login", "logout", "home", "welcome", "error", "404", "403", "500", "index", "untitled",
+    "page", "sign", "register", "search", "www", "com", "net", "org",
+})
+# JSON/form field names whose VALUES are likely identities (usernames)
+_IDENTITY_FIELDS = ("username", "user", "login", "email", "owner", "author")
+_EMAIL_DENY_DOMAINS = frozenset({
+    "example.com", "example.org", "example.net", "domain.com", "email.com", "localhost",
+    "sentry.io", "w3.org", "schema.org",
+})
+# asset extensions that masquerade as an email TLD (logo@2x.png, sprite@3x.svg, …)
+_EMAIL_DENY_TLDS = frozenset({
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "css", "js", "jsx", "ts", "json",
+    "html", "htm", "php", "map", "woff", "woff2", "ttf",
+})
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24}")
+_MAILTO_RE = re.compile(r"mailto:([A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24})",
+                        re.IGNORECASE)
+_FIELD_TAG_RE = re.compile(r"<(?:input|select|textarea|button)\b[^>]{0,400}?>", re.IGNORECASE)
+_NAME_ID_RE = re.compile(r"""\b(?:name|id)\s*=\s*["']([^"']{1,40})["']""", re.IGNORECASE)
+_TITLE_RE = re.compile(r"<title[^>]*>([^<]{1,200})</title>", re.IGNORECASE)
+_META_NAME_RE = re.compile(
+    r"""<meta\b[^>]*?(?:property\s*=\s*["']og:site_name["']|name\s*=\s*["']application-name["'])"""
+    r"""[^>]*?content\s*=\s*["']([^"']{1,200})["']""",
+    re.IGNORECASE,
+)
+
+
+def _query_of(url: str) -> str:
+    """The raw query string of a URL/endpoint (between '?' and '#'), or '' if none. Pure."""
+    return url.partition("?")[2].split("#", 1)[0]
+
+
+def _looks_opaque(s: str) -> bool:
+    """True for hash/token/uuid/base64-ish blobs that pollute a value/identity lexicon. Pure."""
+    if any(c in s for c in "+/="):                       # base64 charset/padding
+        return True
+    if _UUID_RE.fullmatch(s):
+        return True
+    low = s.lower()
+    if len(low) >= 16 and all(c in "0123456789abcdef" for c in low):  # long hex hash  # noqa: PLR2004
+        return True
+    return sum(c.isalpha() for c in s) / len(s) < 0.4    # mostly digits/symbols  # noqa: PLR2004
+
+
+def _add_value(out: set[str], raw: str) -> None:
+    """Add a value word if it survives the precision filters (length, numeric, opaqueness). Pure."""
+    v = raw.strip()
+    if _VALUE_MIN_LEN <= len(v) <= _TOKEN_MAX_LEN and not v.isdigit() and not _looks_opaque(v):
+        out.add(v)
+
+
+def _split_words(text: str) -> list[str]:
+    """Split a human string into lowercase alphanumeric word tokens (titles, apex labels). Pure."""
+    return [w for w in re.split(r"[^A-Za-z0-9]+", text.lower()) if w]
+
+
+def query_param_names(urls: Iterable[str]) -> list[str]:
+    """Parameter-NAME candidates from query strings in the link corpus. Pure."""
+    out: set[str] = set()
+    for u in urls:
+        for pair in _query_of(u).split("&"):
+            _add_token(out, pair.partition("=")[0])
+    return sorted(out)
+
+
+def query_param_values(urls: Iterable[str]) -> list[str]:
+    """High-signal VALUE words from query strings (URL-decoded), skipping tracking/opaque values. Pure."""
+    out: set[str] = set()
+    for u in urls:
+        for pair in _query_of(u).split("&"):
+            key, sep, val = pair.partition("=")
+            if sep and key.lower() not in _TRACKING_PARAMS:
+                _add_value(out, unquote_plus(val))
+    return sorted(out)
+
+
+def jsluice_param_names(records: Iterable[dict]) -> list[str]:
+    """Parameter names from jsluice `urls` records (queryParams + bodyParams). Pure over parsed dicts."""
+    out: set[str] = set()
+    for r in records:
+        for p in (r.get("queryParams") or []):
+            _add_token(out, str(p))
+        for p in (r.get("bodyParams") or []):
+            _add_token(out, str(p))
+    return sorted(out)
+
+
+def html_field_names(html: str) -> list[str]:
+    """name=/id= of form fields (input/select/textarea/button) in an HTML body. Pure."""
+    out: set[str] = set()
+    for tag in _FIELD_TAG_RE.finditer(html):
+        for m in _NAME_ID_RE.finditer(tag.group(0)):
+            _add_token(out, m.group(1))
+    return sorted(out)
+
+
+def _walk_json(obj: object, visit: Callable[[str, object], None]) -> None:
+    """Depth/fan-out-bounded walk of a parsed JSON value; call visit(key, value) per dict item. Pure."""
+    def walk(o: object, depth: int) -> None:
+        if depth > _JSON_MAX_DEPTH:
+            return
+        if isinstance(o, dict):
+            for k, v in o.items():
+                visit(str(k), v)
+                walk(v, depth + 1)
+        elif isinstance(o, list):
+            for it in o[:_JSON_MAX_ITEMS]:
+                walk(it, depth + 1)
+
+    walk(obj, 0)
+
+
+def json_keys(obj: object) -> list[str]:
+    """Object keys from a parsed JSON value (depth/fan-out bounded). Pure."""
+    out: set[str] = set()
+    _walk_json(obj, lambda k, _v: _add_token(out, k))
+    return sorted(out)
+
+
+def html_app_name(html: str) -> list[str]:
+    """App-name value words from <title> / og:site_name / application-name, boilerplate dropped. Pure."""
+    out: set[str] = set()
+    for raw in [*_TITLE_RE.findall(html), *_META_NAME_RE.findall(html)]:
+        for tok in _split_words(raw):
+            if len(tok) >= _VALUE_MIN_LEN and tok not in _BOILERPLATE_WORDS and not tok.isdigit():
+                out.add(tok)
+    return sorted(out)
+
+
+def stack_terms(tech: Iterable[str], header_signals: Iterable[str]) -> list[str]:
+    """Bare value words from detected tech + header signals (cdn:cloudflare → cloudflare). Pure."""
+    out: set[str] = set()
+    for t in tech:
+        out.update(tok for tok in _split_words(str(t)) if len(tok) >= _VALUE_MIN_LEN)
+    for s in header_signals:
+        term = str(s).split(":", 1)[-1].strip().lower()
+        if len(term) >= _VALUE_MIN_LEN:
+            out.add(term)
+    return sorted(out)
+
+
+def extract_param_names(*, links: list[str], jsluice_recs: list[dict],
+                        html_bodies: list[str], json_objs: list[object]) -> list[str]:
+    """Aggregate parameter-name candidates from links + JS (jsluice) + HTML forms + JSON keys. Pure."""
+    out = {*query_param_names(links), *jsluice_param_names(jsluice_recs)}
+    for h in html_bodies:
+        out.update(html_field_names(h))
+    for o in json_objs:
+        out.update(json_keys(o))
+    return sorted(out)
+
+
+def extract_value_words(*, links: list[str], html_bodies: list[str], tech: Iterable[str],
+                        header_signals: Iterable[str], group_apex: str | None) -> list[str]:
+    """Aggregate high-semantic value words: query values + app name + stack terms + apex label. Pure."""
+    out = {*query_param_values(links), *stack_terms(tech, header_signals)}
+    for h in html_bodies:
+        out.update(html_app_name(h))
+    if group_apex:
+        for label in group_apex.lower().split(".")[:-1]:   # drop the TLD label
+            out.update(tok for tok in _split_words(label)
+                       if len(tok) >= _VALUE_MIN_LEN and tok not in _BOILERPLATE_WORDS)
+    return sorted(out)
+
+
+def extract_emails(text: str) -> list[str]:
+    """Emails in a body (bounded regex), dropping example/asset-TLD false positives. Pure."""
+    out: set[str] = set()
+    for m in _EMAIL_RE.finditer(text):
+        addr = m.group(0).lower()
+        domain = addr.rsplit("@", 1)[1]
+        if domain in _EMAIL_DENY_DOMAINS or domain.rsplit(".", 1)[-1] in _EMAIL_DENY_TLDS:
+            continue
+        out.add(addr)
+    return sorted(out)
+
+
+def mailto_links(urls: Iterable[str]) -> list[str]:
+    """Email addresses from mailto: links in the corpus. Pure."""
+    out: set[str] = set()
+    for u in urls:
+        m = _MAILTO_RE.search(u)
+        if m:
+            out.add(m.group(1).lower())
+    return sorted(out)
+
+
+def _add_identity(out: set[str], raw: str) -> None:
+    """Add a username-ish value if it survives the precision filters (no spaces/@/opaque). Pure."""
+    v = raw.strip()
+    if (_VALUE_MIN_LEN <= len(v) <= _TOKEN_MAX_LEN and not v.isdigit()
+            and " " not in v and "@" not in v and not _looks_opaque(v)):
+        out.add(v.lower())
+
+
+def identity_field_values(json_objs: Iterable[object]) -> list[str]:
+    """Username-ish VALUES of identity-named keys (user/login/owner/…) in parsed JSON bodies. Pure."""
+    out: set[str] = set()
+
+    def visit(k: str, v: object) -> None:
+        if isinstance(v, str) and any(f in k.lower() for f in _IDENTITY_FIELDS):
+            _add_identity(out, v)
+
+    for o in json_objs:
+        _walk_json(o, visit)
+    return sorted(out)
+
+
+def extract_identities(*, links: list[str], html_bodies: list[str],
+                       json_objs: list[object]) -> dict[str, list[str]]:
+    """Aggregate identities: emails (mailto + bodies) and usernames (email local-parts + JSON fields). Pure."""
+    emails = set(mailto_links(links))
+    for h in html_bodies:
+        emails.update(extract_emails(h))
+    usernames = {*identity_field_values(json_objs), *(e.split("@", 1)[0] for e in emails)}
+    return {"emails": sorted(emails), "usernames": sorted(usernames)}
+
+
 def passive_delta(passive: list[str], crawled: list[str]) -> list[str]:
     """OSINT URLs (gau/urlfinder) whose bodies the crawl never fetched.
 
@@ -500,22 +829,26 @@ def tech_extensions(tech: list[str], mapping: dict[str, list[str]]) -> list[str]
     return tools.dedupe(out)
 
 
-def resolve_wl_mode(mode: str, custom_count: int, *, rich_threshold: int) -> str:
-    """Pick the wordlist strategy. An explicit 'targeted'/'broad' passes through; 'auto' (or anything
-    else) resolves by corpus richness: a rich custom corpus (>= rich_threshold app tokens) ⇒ 'targeted'
-    (lean on the app-specific list, cap the traditional ones), else 'broad' (opaque app ⇒ full lists)."""
-    if mode in ("targeted", "broad"):
-        return mode
-    return "targeted" if custom_count >= rich_threshold else "broad"
+def roles_for_tech(tech: list[str], mapping: Mapping[str, str | tuple[str, ...]]) -> list[str]:
+    """Wordlist ROLE names selected by detected tech (case-insensitive substring match), deduped in
+    mapping order. A mapping value is one role (str) or several (tuple). Pure."""
+    tags = [t.lower() for t in tech]
+    out: list[str] = []
+    for key, roles in mapping.items():
+        if any(key in tag for tag in tags):
+            out += [roles] if isinstance(roles, str) else list(roles)
+    return tools.dedupe(out)
 
 
-def combine_wordlist(custom: list[str], traditional: list[list[str]], *, mode: str, cap: int) -> list[str]:
-    """Assemble the content-discovery wordlist. The custom layer (app-derived) always goes in FULL and
-    FIRST; the traditional layer (global content + tech CMS lists) rides along whole in 'broad', or
-    with each list capped to its top-`cap` in 'targeted' (SecLists are ~frequency-ordered, so top-N is
-    the high-value head). Deduped, custom-first preserved. Pure."""
-    trad = [w for lst in traditional for w in (lst if mode == "broad" else lst[:cap])]
-    return tools.dedupe([*custom, *trad])
+def assemble_wordlist(custom: list[str], layers: list[tuple[list[str], int | None]]) -> list[str]:
+    """Assemble a content-discovery wordlist in priority order: the CUSTOM layer (app-derived) in FULL
+    and FIRST, then each (lines, cap) layer truncated to its top-`cap` (None = full). Assetnote/OLFA
+    lists are ~frequency-ordered, so a top-N cap keeps the high-signal head and drops the blow-up tail.
+    Deduped, first-occurrence order preserved. Pure."""
+    out = list(custom)
+    for lines, cap in layers:
+        out += lines if cap is None else lines[:cap]
+    return tools.dedupe(out)
 
 
 # response-header NAME present ⇒ signal (httpx normalizes header keys to snake_case lowercase)
@@ -716,6 +1049,280 @@ def parse_katana(out: str) -> list[str]:
         if endpoint:
             urls.append(endpoint)
     return urls
+
+
+# --- request catalog (requests.jsonl) — full HTTP requests, not bare URLs ----------------------
+# A bare URL can only describe a GET query (reconftw's limit); to fuzz POST/JSON/body/header the DAST
+# needs the METHOD + CONTENT-TYPE + BODY. katana already discovers this (-fx forms, -xhr, request
+# bodies) — parse_katana (URL-only) just discards it. These pure helpers build per-request records
+# {method,url,headers,body,params[loc],raw,sources}; `raw` is the full HTTP request nuclei `-im jsonl`
+# fuzzes (proven against nuclei -dast -dfp — see the nuclei-dast-jsonl note). For a request katana
+# captured we reuse its own `raw`; for synthesized ones (forms, param discovery, API specs) we build
+# the raw ourselves with build_raw_request. Param locations: query (URL), body (urlencoded), json keys.
+def build_raw_request(method: str, url: str, headers: Mapping[str, str] | None = None,
+                      body: str = "") -> str:
+    """A raw HTTP/1.1 request string (CRLF) for nuclei `-im jsonl`: request line + Host + caller
+    headers + blank line + body. Host is derived from the URL (never duplicated from caller headers);
+    with a body and no caller Content-Type one is guessed from the body shape (JSON vs urlencoded) and
+    Content-Length added. Pure; the format validated to drive DAST fuzzing of every request part."""
+    method = (method or "GET").upper()
+    parts = urlsplit(url if "://" in url else f"http://{url}")
+    target = parts.path or "/"
+    if parts.query:
+        target = f"{target}?{parts.query}"
+    hdrs: dict[str, str] = {str(k): str(v) for k, v in (headers or {}).items()
+                            if k and str(k).lower() != "host"}
+    if body and not any(k.lower() == "content-type" for k in hdrs):
+        hdrs["Content-Type"] = ("application/json" if body.lstrip()[:1] in "{["
+                                else "application/x-www-form-urlencoded")
+    if body and not any(k.lower() == "content-length" for k in hdrs):
+        hdrs["Content-Length"] = str(len(body.encode("utf-8")))
+    lines = [f"{method} {target} HTTP/1.1", f"Host: {parts.netloc}",
+             *(f"{k}: {v}" for k, v in hdrs.items())]
+    return "\r\n".join(lines) + "\r\n\r\n" + body
+
+
+def _qs_names(qs: str) -> list[str]:
+    """Parameter names of a query/urlencoded-body string ('a=1&b=2' → ['a','b']), deduped. Pure."""
+    return tools.dedupe([k for k, _ in parse_qsl(qs, keep_blank_values=True) if k])
+
+
+def request_params(url: str, body: str = "", content_type: str = "") -> list[dict]:
+    """Known parameters of a request with their LOCATION: query (URL), body (urlencoded) or json (JSON
+    object keys; content-type or body shape decides). Names only (values dropped). Pure — the param
+    surface the DAST/param steps reason about."""
+    out: list[dict] = [{"name": n, "loc": "query"}
+                       for n in _qs_names(urlsplit(url if "://" in url else f"http://{url}").query)]
+    b = body.strip()
+    if b:
+        if "json" in content_type.lower() or b[:1] in "{[":
+            obj = _try_json(b)
+            if isinstance(obj, dict):
+                out += [{"name": str(k), "loc": "json"} for k in obj]
+        else:
+            out += [{"name": n, "loc": "body"} for n in _qs_names(b)]
+    return out
+
+
+def _form_field_names(form: dict) -> list[str]:
+    """Input/field names of a katana -fx form record, tolerant of its schema (a list under
+    parameters/fields/inputs, each a name string or a {name|key:…} dict). Pure."""
+    raw = form.get("parameters") or form.get("fields") or form.get("inputs") or []
+    names: list[str] = []
+    for it in raw if isinstance(raw, list) else []:
+        if isinstance(it, str):
+            names.append(it)
+        elif isinstance(it, dict) and (n := it.get("name") or it.get("key")):
+            names.append(str(n))
+    return tools.dedupe([n for n in names if n])
+
+
+def _katana_forms(rec: dict, base_url: str) -> list[dict]:
+    """Synthesize catalog requests from a record's -fx forms: GET → field names as query params,
+    POST/other → urlencoded body. action resolved against the page URL. Skips shapes we can't read
+    (no crash). Pure."""
+    out: list[dict] = []
+    for form in rec.get("forms") or []:
+        if not isinstance(form, dict):
+            continue
+        action = form.get("action") or base_url
+        url = urljoin(base_url, str(action)) if base_url else str(action)
+        method = (form.get("method") or "GET").upper()
+        names = _form_field_names(form)
+        if not (url and names):
+            continue
+        if method == "GET":
+            full = url + ("&" if "?" in url else "?") + "&".join(f"{n}=" for n in names)
+            out.append({"method": "GET", "url": full, "headers": {}, "body": "",
+                        "params": [{"name": n, "loc": "query"} for n in names],
+                        "raw": build_raw_request("GET", full), "sources": ["katana-form"]})
+        else:
+            ct = {"Content-Type": "application/x-www-form-urlencoded"}
+            body = "&".join(f"{n}=" for n in names)
+            out.append({"method": method, "url": url, "headers": ct, "body": body,
+                        "params": [{"name": n, "loc": "body"} for n in names],
+                        "raw": build_raw_request(method, url, ct, body), "sources": ["katana-form"]})
+    return out
+
+
+def parse_katana_requests(out: str, *, source: str = "katana") -> list[dict]:
+    """Catalog records from katana -j JSONL — preserves the METHOD/BODY/headers/forms that
+    parse_katana (URL-only) drops. Each crawled request → one record (its own `raw` reused when present
+    — authoritative for nuclei — else built); each -fx form → a synthesized request. Order preserved
+    (dedup at merge_requests). Pure."""
+    records: list[dict] = []
+    for rec in _jsonl_str(out):
+        req = rec.get("request") or {}
+        endpoint = req.get("endpoint")
+        if endpoint:
+            method = (req.get("method") or "GET").upper()
+            headers = req.get("headers") or req.get("header") or {}
+            headers = headers if isinstance(headers, dict) else {}
+            body = req.get("body") or ""
+            ct = next((str(v) for k, v in headers.items() if str(k).lower() == "content-type"), "")
+            records.append({
+                "method": method, "url": endpoint, "headers": headers, "body": body,
+                "params": request_params(endpoint, body, ct),
+                "raw": req.get("raw") or build_raw_request(method, endpoint, headers, body),
+                "sources": [source],
+            })
+        records += _katana_forms(rec, endpoint or "")
+    return records
+
+
+def request_key(rec: dict) -> tuple:
+    """Dedup key for a catalog request: (method, path-template). Collapses /user/123 vs /user/456 and
+    ignores query/values but keeps GET≠POST distinct — one representative per request SHAPE;
+    merge_requests unions the params discovered across the collapsed shapes. Pure."""
+    return (rec.get("method") or "GET").upper(), path_template(rec.get("url") or "")
+
+
+def merge_requests(records: Iterable[dict]) -> list[dict]:
+    """Dedup catalog requests by request_key (first wins): union `sources`, union `params` by
+    (name,loc). Deterministic order. Pure — the catalog merge across crawl/headless/specs/params."""
+    by_key: dict[tuple, dict] = {}
+    for r in records:
+        key = request_key(r)
+        if key not in by_key:
+            by_key[key] = {**r, "sources": sorted(set(r.get("sources") or [])),
+                           "params": list(r.get("params") or [])}
+            continue
+        cur = by_key[key]
+        cur["sources"] = sorted(set(cur["sources"]) | set(r.get("sources") or []))
+        seen = {(p.get("name"), p.get("loc")) for p in cur["params"]}
+        for p in r.get("params") or []:
+            if (p.get("name"), p.get("loc")) not in seen:
+                cur["params"].append(p)
+                seen.add((p.get("name"), p.get("loc")))
+    return sorted(by_key.values(), key=lambda r: (r.get("url") or "", r.get("method") or ""))
+
+
+def _url_to_get_request(url: str, source: str) -> dict:
+    """A URL-only discovery (passive/crawley/feroxbuster/jsluice) as a GET catalog request — its query
+    string becomes its known params. Pure."""
+    return {"method": "GET", "url": url, "headers": {}, "body": "",
+            "params": request_params(url), "raw": build_raw_request("GET", url), "sources": [source]}
+
+
+def catalog_records(request_recs: Iterable[dict], get_urls: Iterable[str], in_scope: set[str],
+                    schemes: dict[str, str], *, get_source: str = "url") -> list[dict]:
+    """Assemble the per-app request catalog: the full request records (crawl/headless/API spec) plus
+    the URL-only sources folded in as GET requests — every url scheme-normalized to the reachable
+    scheme (force_scheme: the http fallback a strict-TLS scanner needs) and in-scope-filtered, then
+    deduped by request shape (merge_requests). Only the `url` field is re-schemed; `raw` is HTTP/1.1
+    (path + Host, scheme-agnostic) so it's unaffected. Pure."""
+    def keep(url: str) -> bool:
+        return bool(url) and (not in_scope or url_host(url) in in_scope)
+    recs: list[dict] = []
+    for r in request_recs:
+        u = force_scheme(r.get("url") or "", schemes)
+        if keep(u):
+            recs.append({**r, "url": u})
+    for raw_url in get_urls:
+        u = force_scheme(raw_url, schemes)
+        if keep(u):
+            recs.append(_url_to_get_request(u, get_source))
+    return merge_requests(recs)
+
+
+def jsluice_requests(records: Iterable[dict], source_urls: dict[str, str]) -> list[dict]:
+    """Catalog requests from jsluice `urls` records — recovers the METHOD / contentType / body params
+    jsluice already extracts from fetch/XHR/ajax calls (mine_responses keeps only the URL). Relative
+    urls are resolved against the JS file's SOURCE url (source_urls keyed by the extracted file stem);
+    a url that stays relative (no source) is skipped — it can't be fuzzed without a host. bodyParams →
+    a JSON or urlencoded body skeleton for body-bearing methods. Pure."""
+    out: list[dict] = []
+    for r in records:
+        raw_url = (r.get("url") or "").strip()
+        if not raw_url or raw_url[:1] in "#?" or raw_url.startswith(("data:", "javascript:", "mailto:")):
+            continue
+        base = source_urls.get(Path(r.get("filename") or "").stem, "")
+        url = urljoin(base, raw_url) if base else raw_url
+        if "://" not in url:                          # unresolved relative → no host → can't fuzz
+            continue
+        method = (r.get("method") or "GET").upper()
+        ct = str(r.get("contentType") or "")
+        hdrs = r.get("headers")
+        headers = {str(k): str(v) for k, v in hdrs.items()} if isinstance(hdrs, dict) else {}
+        body_names = [str(p) for p in (r.get("bodyParams") or []) if p]
+        if body_names and method in {"POST", "PUT", "PATCH", "DELETE"}:
+            if "json" in ct.lower():
+                headers.setdefault("Content-Type", "application/json")
+                body = json.dumps(dict.fromkeys(body_names, ""))
+            else:
+                headers.setdefault("Content-Type", ct or "application/x-www-form-urlencoded")
+                body = "&".join(f"{n}=" for n in tools.dedupe(body_names))
+        else:
+            body = ""
+        out.append(_synth_request(method, url, headers, body, "jsluice"))
+    return out
+
+
+class _FormParser(HTMLParser):
+    """Collect <form> elements (method, action, field names) from an HTML body. stdlib-only."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.forms: list[dict] = []
+        self._cur: dict | None = None
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        a = dict(attrs)
+        if tag == "form":
+            self._cur = {"method": (a.get("method") or "GET"), "action": a.get("action") or "",
+                         "fields": []}
+        elif tag in ("input", "select", "textarea", "button") and self._cur is not None and a.get("name"):
+            self._cur["fields"].append(a["name"])
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form" and self._cur is not None:
+            self.forms.append(self._cur)
+            self._cur = None
+
+    def close(self) -> None:
+        super().close()
+        if self._cur is not None:                     # flush an unclosed trailing <form>
+            self.forms.append(self._cur)
+            self._cur = None
+
+
+def parse_forms(html: str) -> list[dict]:
+    """`<form>` elements of an HTML body → [{method, action, fields:[name]}]. Pure (best-effort: a
+    malformed body yields whatever parsed)."""
+    parser = _FormParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except (ValueError, AssertionError):
+        pass
+    return parser.forms
+
+
+def html_form_requests(bodies_dir: Path, source_urls: dict[str, str]) -> list[dict]:
+    """Catalog requests from the <form> elements in the downloaded HTML corpus — recovers POST/GET form
+    endpoints, INCLUDING on the unlinked pages feroxbuster discovered (their bodies are stored, but
+    katana -fx only saw the pages katana itself crawled). action resolved against the page's source url
+    (source_urls by file stem). GET → fields as query, others → urlencoded body. Pure (reads files)."""
+    out: list[dict] = []
+    if not bodies_dir.exists():
+        return out
+    for path in sorted(bodies_dir.glob("*.html")):
+        base = source_urls.get(path.stem, "")
+        if not base:                                  # no source url → can't resolve a relative action
+            continue
+        for form in parse_forms(path.read_text(encoding="utf-8", errors="replace")):
+            names = tools.dedupe([str(n) for n in form["fields"] if n])
+            action = urljoin(base, form["action"]) if form["action"] else base
+            if not names or "://" not in action:
+                continue
+            if form["method"].upper() == "GET":
+                full = action + ("&" if "?" in action else "?") + "&".join(f"{n}=" for n in names)
+                out.append(_synth_request("GET", full, {}, "", "html-form"))
+            else:
+                out.append(_synth_request(form["method"], action,
+                                          {"Content-Type": "application/x-www-form-urlencoded"},
+                                          "&".join(f"{n}=" for n in names), "html-form"))
+    return out
 
 
 def count_hrefs(html: str) -> int:
@@ -1330,18 +1937,21 @@ def _scan_hosts(ws: AppWorkspace) -> list[str]:
     return dedup_by_body(tools.read_lines(ws.hosts), body_by_host)
 
 
-def _run_katana(ws: AppWorkspace, hosts: list[str], app_id: str) -> list[str]:
+def _run_katana(ws: AppWorkspace, hosts: list[str], app_id: str) -> str:
     """katana — the DOWNLOADER crawler: parses JS endpoints (-jc/-jsl), known files
-    (-kf all), forms (-fx), climbs parent paths (-pc), scoped to each host's fqdn
-    (-fs fqdn), and stores every response under responses/ (-srd) for offline mining.
-    JSONL output (-j, bodies/raw omitted from stdout — the bodies still land on disk
-    via -srd). Returns the crawled URLs (request.endpoint per record)."""
-    cmd = ["katana", "-silent", "-j", "-jc", "-jsl", "-kf", "all", "-fx", "-pc",
+    (-kf all), forms (-fx), XHR/fetch url+method (-xhr), climbs parent paths (-pc),
+    scoped to each host's fqdn (-fs fqdn), stores every response under responses/ (-srd)
+    for offline mining. Returns katana's raw JSONL stdout — the caller derives BOTH the
+    crawled URLs (parse_katana) and the request catalog (parse_katana_requests).
+
+    -omit-raw is OFF (was on) so request.method/body/raw survive in the JSONL — the catalog
+    needs them to fuzz POST/JSON, not just GET; -omit-body still trims the heavy response
+    body (already on disk via -srd). Auth headers (PIPT_HTTP_HEADER) reach the logged-in surface."""
+    cmd = ["katana", "-silent", "-j", "-jc", "-jsl", "-kf", "all", "-fx", "-xhr", "-pc",
            "-fs", "fqdn", "-d", KATANA_DEPTH, "-c", KATANA_CONC,
-           "-omit-raw", "-omit-body", "-srd", str(ws.responses)]
-    out = _run("katana", cmd, stdin="\n".join(hosts),
-               dest=ws.raw("katana") / "crawl" / "out.jsonl", label=app_id)
-    return parse_katana(out)
+           "-omit-body", "-srd", str(ws.responses), *_header_flags("-H")]
+    return _run("katana", cmd, stdin="\n".join(hosts),
+                dest=ws.raw("katana") / "crawl" / "out.jsonl", label=app_id)
 
 
 def _run_crawley(hosts: list[str], app_id: str) -> list[str]:
@@ -1405,11 +2015,17 @@ def crawl(activity: Activity, app_id: str) -> None:
     with ThreadPoolExecutor(max_workers=2) as pool:
         katana_fut = pool.submit(_run_katana, ws, hosts, app_id)
         crawley_fut = pool.submit(_run_crawley, hosts, app_id)
-        katana_urls, crawley_urls = katana_fut.result(), crawley_fut.result()
+        katana_out, crawley_urls = katana_fut.result(), crawley_fut.result()
+    katana_urls = parse_katana(katana_out)
     tools.write_lines(ws.canonical("endpoints_crawley.txt"), crawley_urls)
     passive = tools.read_lines(ws.canonical("endpoints_passive.txt"))
     tools.write_lines(ws.canonical("endpoints.txt"),
                       denoise(tools.dedupe([*passive, *katana_urls, *crawley_urls])))
+    # the request catalog: katana's method/body/forms/xhr (a GET-only URL list can't drive DAST of
+    # POST/JSON). crawley/passive are URL-only → folded in later as GET requests by the catalog merge.
+    n_req = tools.write_jsonl(ws.canonical("requests_crawl.jsonl"),
+                              merge_requests(parse_katana_requests(katana_out)))
+    log.debug("    catalog (%s) — %d request shape(s) from katana → requests_crawl.jsonl", app_id, n_req)
 
     root_html = _stored_root_html(ws, hosts)
     raw_href, marker = count_hrefs(root_html), has_thin_shell_marker(root_html)
@@ -1432,7 +2048,7 @@ def crawl_headless(activity: Activity, app_id: str) -> None:
     and extracts what link-crawling can't reach — JS-built routes and XHR/fetch URLs
     (-jsl/-xhr) — storing bodies under responses/headless/ for offline mining. -iqp folds
     query-param variants; -ct bounds runaway SPAs per host; -aff is OFF (never submit forms).
-    Output endpoints_headless.txt is folded into the loop-2 wordlist (like endpoints_js.txt).
+    Output endpoints_headless.txt is folded into the phase-3 wordlist (like endpoints_js.txt).
     """
     ws = activity.app(app_id)
     cls_path = ws.canonical("crawl_class.json")
@@ -1446,13 +2062,19 @@ def crawl_headless(activity: Activity, app_id: str) -> None:
     store.mkdir(parents=True, exist_ok=True)
     cmd = ["katana", "-silent", "-j", "-hl", "-nos", "-jc", "-jsl", "-xhr", "-fx", "-iqp",
            "-fs", "fqdn", "-d", HEADLESS_DEPTH, "-c", HEADLESS_CONC, "-ct", HEADLESS_CT,
-           "-rl", HEADLESS_RL, "-omit-raw", "-omit-body", "-srd", str(store)]
+           "-rl", HEADLESS_RL, "-omit-body", "-srd", str(store), *_header_flags("-H")]
     log.info("  → headless (%s) — JS-rendered, %d host(s) (capped at %d concurrent)",
              app_id, len(hosts), HEADLESS_PARALLELISM)
     with _HEADLESS_SLOTS:
         out = _run("katana-headless", cmd, stdin="\n".join(hosts),
                    dest=ws.raw("katana") / "headless" / "out.jsonl", label=app_id)
     tools.write_lines(ws.canonical("endpoints_headless.txt"), denoise(parse_katana(out)))
+    # headless catches the SPA's XHR/fetch API calls (often POST/JSON) link-crawling can't —
+    # exactly the surface a GET-only fuzzer misses. Preserve their method/body in the catalog.
+    n_req = tools.write_jsonl(ws.canonical("requests_headless.jsonl"),
+                              merge_requests(parse_katana_requests(out, source="katana-headless")))
+    log.debug("    catalog (%s) — %d request shape(s) from headless → requests_headless.jsonl",
+              app_id, n_req)
 
 
 def subenum(activity: Activity, app_id: str) -> None:
@@ -1503,35 +2125,86 @@ def takeover(activity: Activity, app_id: str) -> None:
     tools.write_lines(ws.canonical("takeover.txt"), findings)
 
 
-# --- LOOP 2 (content discovery) — runs after the loop-1 barrier ---
-def build_wordlist(activity: Activity, app_id: str) -> None:
-    """LOOP 2.1 — synthesize the per-app CUSTOM wordlist (wl_custom/seed.txt) OFFLINE.
+# --- per-app depth (PHASE 1 corpus mining + PHASE 3 content discovery) — run after their barriers ---
+def _try_json(text: str) -> object | None:
+    """Parse a stored body as JSON when it plausibly is one (cheap guard + size cap), else None.
 
-    No fetching: the crawl (loop 1) already downloaded and JS-parsed the linked surface — its
-    JS-discovered endpoints and robots/sitemap paths are already in endpoints.txt. This step
-    tokenizes endpoints.txt (plus the gated headless crawl's endpoints_headless.txt, when present)
-    into path segments, filename basenames and parameter names (tokenize_urls). Output is
-    **app-derived tokens only** — the traditional layer (global content + tech CMS lists) is added
-    later by content_discovery's combine, so 'custom' stays genuinely custom (see resolve_wl_mode /
-    combine_wordlist). Reads loop-1 artifacts directly — the cross-loop barrier guarantees they exist.
+    _extract_bodies saves every non-JS body as .html (no .json), so a JSON API response is on disk
+    as .html; this lets build_wordlist mine its keys/values without a separate store."""
+    s = text.strip()
+    if not s or s[0] not in "{[" or len(s) > _JSON_MAX_BYTES:
+        return None
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _group_apex(hosts: list[str]) -> str | None:
+    """The group's representative apex (first non-IP host) — seeds app-name value words. Pure."""
+    for h in hosts:
+        host = url_host(h)
+        if host and not is_ip(host):
+            return apex(host)
+    return None
+
+
+def build_wordlist(activity: Activity, app_id: str) -> None:
+    """PHASE 3 — OFFLINE lexicon extractor (fuzzing-prep): mine the crawled LINKS *and* the downloaded
+    response BODIES into per-app wl_custom products.
+
+    Reads the PHASE-1 corpus across the barrier — mine_responses already extracted it to raw/extracted/
+    (read, never re-extract) and wrote endpoints_js.txt. Its only consumers are content_discovery /
+    tech_enum / param_fuzz (all phase 3+), so it lives with the guessing. Emits four app-derived products
+    (the traditional global/tech lists are layered in later by content_discovery):
+      - seed.txt        endpoint candidates (tokenize_urls over the whole link surface)
+      - params.txt      parameter-NAME candidates (query keys + jsluice query/body params + HTML form
+                        fields + JSON object keys) → merged into param_fuzz custom-first
+      - values.txt      high-semantic VALUE words (query values + app name + stack terms + apex label)
+      - identities.txt  users/emails (emails + mailto + email local-parts + identity-field values)
+    values.txt / identities.txt have no consumer yet — deliverables for the planned DAST; the filters
+    lean precision-first. Reads phase-1 artifacts directly — the barrier guarantees they exist.
     """
     ws = activity.app(app_id)
-    words = tokenize_urls([*tools.read_lines(ws.canonical("endpoints.txt")),
-                           *tools.read_lines(ws.canonical("endpoints_headless.txt"))])
-    n = tools.write_lines(ws.wl_custom / "seed.txt", words)
-    log.info("  → wordlist (%s) — %d app token(s), offline → wl_custom/seed.txt", app_id, n)
+    links = [*tools.read_lines(ws.canonical("endpoints.txt")),
+             *tools.read_lines(ws.canonical("endpoints_headless.txt")),
+             *tools.read_lines(ws.canonical("endpoints_js.txt"))]
+
+    bodies = ws.raw("extracted")  # mine_responses already extracted the corpus here — read, don't re-extract
+    js_files: list[str] = []
+    html_bodies: list[str] = []
+    json_objs: list[object] = []
+    if bodies.exists():
+        js_files = sorted(str(p) for p in bodies.glob("*.js"))
+        for p in sorted(bodies.glob("*.html")):
+            text = p.read_text(encoding="utf-8", errors="replace")
+            obj = _try_json(text)
+            (json_objs.append(obj) if obj is not None else html_bodies.append(text))
+    recs = _jsluice_records(js_files)
+
+    meta = workspace.read_meta(ws.meta)
+    n_seed = tools.write_lines(ws.wl_custom / "seed.txt", tokenize_urls(links))
+    n_par = tools.write_lines(ws.wl_custom / "params.txt", extract_param_names(
+        links=links, jsluice_recs=recs, html_bodies=html_bodies, json_objs=json_objs))
+    n_val = tools.write_lines(ws.wl_custom / "values.txt", extract_value_words(
+        links=links, html_bodies=html_bodies, tech=meta.get("tech") or [],
+        header_signals=meta.get("header_signals") or [], group_apex=_group_apex(meta.get("hosts") or [])))
+    ids = extract_identities(links=links, html_bodies=html_bodies, json_objs=json_objs)
+    n_id = tools.write_lines(ws.wl_custom / "identities.txt", sorted({*ids["emails"], *ids["usernames"]}))
+    log.info("  → wordlist (%s) offline — seed %d · params %d · values %d · identities %d",
+             app_id, n_seed, n_par, n_val, n_id)
 
 
 def fetch_delta(activity: Activity, app_id: str) -> None:
-    """LOOP 2.2 — download the discovery delta into the response store (∥ wordlist).
+    """PHASE 1 — download the discovery delta into the response store.
 
     The discovery sources whose bodies katana never downloaded — passive_probe
     (gau/urlfinder) and crawley (endpoints_crawley.txt) — are the only URLs a separate
     downloader needs; katana already stored everything IT fetched (responses/index.txt
     is that record). httpx fetches the delta's live URLs (dropping dead hosts) and
     stores their bodies under responses/osint/, so offline body-mining covers the
-    archived/OSINT/crawley-only surface too. Reads loop-1 artifacts directly — the
-    barrier guarantees they exist.
+    archived/OSINT/crawley-only surface too. Needs crawl_headless so the crawl + headless
+    stores are complete (so 'have' is right and we don't re-download what katana stored).
     """
     ws = activity.app(app_id)
     have = [url for idx in _all_store_indices(ws) for _, url in _store_index(idx)]  # already stored
@@ -1545,8 +2218,146 @@ def fetch_delta(activity: Activity, app_id: str) -> None:
         return
     store = ws.responses / "osint"
     store.mkdir(parents=True, exist_ok=True)
-    _run("httpx", [HTTPX, "-silent", "-srd", str(store), "-rl", OSINT_FETCH_RL],
+    _run("httpx", [HTTPX, "-silent", "-srd", str(store), "-rl", OSINT_FETCH_RL, *_header_flags("-H")],
          stdin="\n".join(delta), dest=ws.raw("httpx") / "osint" / "out.txt", label=app_id)
+
+
+# --- API spec discovery (OpenAPI/Swagger/GraphQL) — the API surface a crawler/GET-fuzzer misses ----
+def _schema_prop_names(schema: object) -> list[str]:
+    """Top-level property names of an OpenAPI/JSON-schema object ({properties:{name:…}}). Pure."""
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    return [str(k) for k in props] if isinstance(props, dict) else []
+
+
+def _openapi_base(spec: dict, spec_url: str) -> str:
+    """Base URL for a spec's operations: an absolute v3 server, else origin(spec_url) + (v3 relative
+    server path | v2 basePath). Pure."""
+    parts = urlsplit(spec_url if "://" in spec_url else f"https://{spec_url}")
+    origin = f"{parts.scheme}://{parts.netloc}"
+    servers = spec.get("servers")
+    if isinstance(servers, list) and servers and isinstance(servers[0], dict):
+        srv = str(servers[0].get("url") or "")
+        if srv.startswith("http"):
+            return srv.rstrip("/")
+        if srv.startswith("/"):
+            return origin + srv.rstrip("/")
+    base_path = spec.get("basePath")
+    if isinstance(base_path, str) and base_path.startswith("/"):
+        return origin + base_path.rstrip("/")
+    return origin
+
+
+def _openapi_params(params: list) -> tuple[list[str], dict[str, str], list[str], list[str]]:
+    """Classify an operation's parameters by location → (query names, header map, json body names,
+    urlencoded body names). Path params are handled by the {..}→1 substitution, not here. Pure."""
+    query: list[str] = []
+    headers: dict[str, str] = {}
+    json_names: list[str] = []
+    form_names: list[str] = []
+    for p in params:
+        if not isinstance(p, dict) or not p.get("name"):
+            continue
+        name, loc = str(p["name"]), p.get("in")
+        if loc == "query":
+            query.append(name)
+        elif loc == "header":
+            headers[name] = "x"
+        elif loc == "body":                       # swagger v2 body parameter
+            json_names += _schema_prop_names(p.get("schema"))
+        elif loc == "formData":                   # swagger v2 form parameter
+            form_names.append(name)
+    return query, headers, json_names, form_names
+
+
+def _openapi_request(base: str, path: str, method: str, params: list, op: dict) -> dict:
+    """One catalog request from an OpenAPI/Swagger operation: path params → '1', query/header recorded,
+    requestBody / in:body → a JSON or urlencoded body skeleton (keys, empty values). Pure."""
+    query, headers, json_names, form_names = _openapi_params(params)
+    body_def = op.get("requestBody")
+    content = body_def.get("content") if isinstance(body_def, dict) else None
+    if isinstance(content, dict):                 # openapi v3 requestBody
+        json_names += _schema_prop_names((content.get("application/json") or {}).get("schema"))
+        form_names += _schema_prop_names((content.get("application/x-www-form-urlencoded") or {}).get("schema"))
+    url = base + re.sub(r"\{[^}]+\}", "1", path)   # any {path param} → placeholder
+    if query:
+        url += ("&" if "?" in url else "?") + "&".join(f"{n}=" for n in tools.dedupe(query))
+    if json_names:
+        headers.setdefault("Content-Type", "application/json")
+        body = json.dumps(dict.fromkeys(tools.dedupe(json_names), ""))
+    elif form_names:
+        headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        body = "&".join(f"{n}=" for n in tools.dedupe(form_names))
+    else:
+        body = ""
+    return _synth_request(method, url, headers, body, "openapi")
+
+
+def is_openapi(obj: object) -> bool:
+    """Whether a parsed JSON body looks like an OpenAPI/Swagger spec (has openapi|swagger + paths)."""
+    return (isinstance(obj, dict) and bool(obj.get("openapi") or obj.get("swagger"))
+            and isinstance(obj.get("paths"), dict))
+
+
+def expand_openapi(spec: object, spec_url: str, *, cap: int) -> list[dict]:
+    """Expand an OpenAPI v3 / Swagger v2 JSON spec into catalog request records — one per operation
+    (method x path), capped. Handles shared path-item params + per-operation params. Pure."""
+    if not isinstance(spec, dict):
+        return []
+    paths = spec.get("paths")
+    if not isinstance(paths, dict):
+        return []
+    base = _openapi_base(spec, spec_url)
+    out: list[dict] = []
+    for path, item in paths.items():
+        if not isinstance(item, dict):
+            continue
+        shared = item.get("parameters")
+        shared = shared if isinstance(shared, list) else []
+        for method in ("get", "post", "put", "patch", "delete"):
+            op = item.get(method)
+            if not isinstance(op, dict):
+                continue
+            op_params = op.get("parameters")
+            op_params = op_params if isinstance(op_params, list) else []
+            out.append(_openapi_request(base, str(path), method, [*shared, *op_params], op))
+            if len(out) >= cap:
+                return out
+    return out
+
+
+def api_spec(activity: Activity, app_id: str) -> None:
+    """PHASE 1 — discover API specs (OpenAPI/Swagger JSON) + GraphQL endpoints and expand them into the
+    request catalog (requests_api.jsonl).
+
+    The richest source of method+body+param surface — exactly the API endpoints a link-crawler and a
+    GET-only fuzzer miss. Probes a fixed set of well-known spec paths on the group's hosts (httpx, 200
+    only, bodies stored), parses each JSON spec and expands EVERY operation into a full request record;
+    GraphQL endpoints that respond are recorded as a POST-json request the DAST can fuzz. Best-effort
+    (no spec → empty file). request_catalog folds requests_api.jsonl in across the barrier.
+    """
+    ws = activity.app(app_id)
+    roots = [h.rstrip("/") for h in _scan_hosts(ws)]
+    if not roots:
+        return
+    store = ws.raw("api_spec")
+    _run("httpx", [HTTPX, "-silent", "-srd", str(store / "store"), "-mc", "200", *_header_flags("-H")],
+         stdin="\n".join(r + p for r in roots for p in API_SPEC_PATHS),
+         dest=store / "probe.txt", label=app_id)
+    records: list[dict] = []
+    for stored, url in _store_index(store / "store" / "index.txt"):
+        if not Path(stored).is_file():
+            continue
+        obj = _try_json(http_body(Path(stored).read_text(encoding="utf-8", errors="replace")))
+        if is_openapi(obj):
+            records += expand_openapi(obj, url, cap=API_SPEC_MAX_OPS)
+    # GraphQL: any endpoint that responds (200/400/405 to the GET probe) → a POST-json request to fuzz
+    gql = _run("httpx", [HTTPX, "-silent", "-mc", "200,400,405", *_header_flags("-H")],
+               stdin="\n".join(r + p for r in roots for p in GRAPHQL_PATHS),
+               dest=store / "graphql.txt", label=app_id)
+    records += [_synth_request("POST", u, {"Content-Type": "application/json"},
+                               '{"query":"{__typename}"}', "graphql") for u in _lines(gql)]
+    n = tools.write_jsonl(ws.canonical("requests_api.jsonl"), merge_requests(records))
+    log.info("  → api_spec (%s) — %d API request(s) from specs/graphql → requests_api.jsonl", app_id, n)
 
 
 def _store_index(index: Path) -> list[tuple[str, str]]:
@@ -1686,12 +2497,18 @@ def _run_jsluice_secrets(js_files: list[str]) -> list[dict]:
     return [_norm_jsluice_secret(r) for r in _jsonl_str(tools.run([JSLUICE, "secrets", *js_files]))]
 
 
-def _jsluice_urls(js_files: list[str]) -> list[str]:
-    """jsluice endpoint extraction over JS files (best-effort; [] if none, or jsluice is absent).
-    Reused by mine_responses (round 0) and the content_discovery fixpoint (each feedback round)."""
+def _jsluice_records(js_files: list[str]) -> list[dict]:
+    """Parsed `jsluice urls` records over JS files (best-effort; [] if none, or jsluice is absent).
+    Each record: {url, queryParams[], bodyParams[], method, type, filename}. Shared by mine_responses
+    (urls), build_wordlist (params), and the content_discovery fixpoint (each feedback round)."""
     if not js_files or shutil.which(JSLUICE) is None:
         return []
-    return [r["url"] for r in _jsonl_str(tools.run([JSLUICE, "urls", *js_files])) if r.get("url")]
+    return _jsonl_str(tools.run([JSLUICE, "urls", *js_files]))
+
+
+def _jsluice_urls(js_files: list[str]) -> list[str]:
+    """jsluice endpoint URLs over JS files — a projection of _jsluice_records (best-effort)."""
+    return [r["url"] for r in _jsluice_records(js_files) if r.get("url")]
 
 
 def _run_gitleaks(ws: AppWorkspace, bodies: Path, app_id: str) -> list[dict]:
@@ -1740,7 +2557,7 @@ def _secret_fleet(ws: AppWorkspace, bodies: Path, js_files: list[str], app_id: s
 
 
 def mine_responses(activity: Activity, app_id: str) -> None:
-    """LOOP 2 — mine the per-app response store OFFLINE for ENDPOINTS (cashes in 'fetch once').
+    """PHASE 1 — mine the per-app response store OFFLINE for ENDPOINTS (cashes in 'fetch once').
 
     Extracts every stored response body (cheap crawl + headless + fetch_delta) to raw/extracted/
     WITHOUT re-fetching, then runs jsluice over the JS for endpoints (→ endpoints_js.txt), folded
@@ -1797,7 +2614,7 @@ def _shortscan_surface(activity: Activity, ws: AppWorkspace, app_id: str) -> tup
 
 
 def tech_enum(activity: Activity, app_id: str) -> None:
-    """LOOP 2 (surface) — specialized per-stack scanners whose output FEEDS enum.
+    """PHASE 3 (surface) — specialized per-stack scanners whose output FEEDS enum.
 
     Best-effort dispatch keyed on the cluster's detected tech: a scanner runs only if
     its tech matched AND its binary is installed. Primary output is SURFACE (fuzz words) →
@@ -1805,9 +2622,9 @@ def tech_enum(activity: Activity, app_id: str) -> None:
     DUAL-ROLE and emit findings: shortscan's IIS 8.3 short-name enumeration is itself an
     information-disclosure finding → tilde_enum.jsonl (a dedicated artifact; the general findings
     model/consolidate is backlog #4). Findings-only scanners (wpprobe, nuclei, …) belong to
-    tech_vulnscan / loop 3.
+    tech_vulnscan / phase 4.
 
-    Today: shortscan (IIS/ASP.NET 8.3 short-name enumeration). Reads loop-1 hosts
+    Today: shortscan (IIS/ASP.NET 8.3 short-name enumeration). Reads phase-1 hosts
     across the barrier; needs the wordlist seed for the shortutil rainbow table.
     """
     ws = activity.app(app_id)
@@ -1838,29 +2655,33 @@ def _ferox_time_limit(round_idx: int, remaining_s: float) -> str:
     return f"{max(1, int(min(_dur_seconds(DEEP_FEROX_TIME_LIMIT), remaining_s)))}s"
 
 
-def _run_ferox(ws: AppWorkspace, hosts: list[str], words: list[str], round_idx: int,
-               *, remaining: float) -> list[dict]:
+def _run_ferox(ws: AppWorkspace, hosts: list[str], words: list[str], round_idx: int,  # noqa: PLR0913
+               *, remaining: float, depth: str = FEROX_DEPTH, time_limit: str | None = None,
+               tag: str | None = None) -> list[dict]:
     """One feroxbuster forced-browse pass over `hosts` with `words` → parsed `response` records.
 
-    Writes the round wordlist + raw JSON under wl_custom/ and raw/feroxbuster/ (feroxbuster writes
-    JSON to -o, not stdout, so it bypasses _run). --smart brings auto-tune soft-404 calibration +
-    collect-words/backups + link extraction/recursion. --time-limit is the hard cap that breaks
+    `tag` names the wordlist/JSON files (default `round<idx>`); `depth`/`time_limit` override the
+    recursion depth / total cap (default FEROX_DEPTH and the fixpoint's _ferox_time_limit) — the deep
+    dive uses both. Writes the wordlist + raw JSON under wl_custom/ and raw/feroxbuster/ (feroxbuster
+    writes JSON to -o, not stdout, so it bypasses _run). --smart brings auto-tune soft-404 calibration
+    + collect-words/backups + link extraction/recursion. --time-limit is the hard cap that breaks
     --smart's backoff livelock (the scanme.nmap.org incident). Returns [] for an empty wordlist."""
     app_id = ws.root.name
-    wordlist = ws.wl_custom / f"round{round_idx}.txt"
+    label = tag or f"round{round_idx}"
+    wordlist = ws.wl_custom / f"{label}.txt"
     n_wl = tools.write_lines(wordlist, words)
     if not n_wl:
         return []
     exts = tech_extensions(workspace.read_meta(ws.meta).get("tech") or [], TECH_EXTENSIONS)
     ext_args = ["-x", *exts] if exts else []
-    out_file = ws.raw("feroxbuster") / f"round{round_idx}.json"
+    out_file = ws.raw("feroxbuster") / f"{label}.json"
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    tl = _ferox_time_limit(round_idx, remaining)
-    log.info("  → feroxbuster (%s) r%d — %d host(s), %d term(s), --time-limit %s",
-             app_id, round_idx, len(hosts), n_wl, tl)
+    tl = time_limit or _ferox_time_limit(round_idx, remaining)
+    log.info("  → feroxbuster (%s) %s — %d host(s), %d term(s), -d %s, --time-limit %s",
+             app_id, label, len(hosts), n_wl, depth, tl)
     cmd = [FEROX, "--stdin", "--silent", "--json", "-o", str(out_file), "--no-state", "-k",
            "--smart", "-t", FEROX_THREADS, "-L", FEROX_SCAN_LIMIT, "--timeout", FEROX_TIMEOUT,
-           "--time-limit", tl, "-d", FEROX_DEPTH, "-w", str(wordlist), *ext_args]
+           "--time-limit", tl, "-d", depth, "-w", str(wordlist), *ext_args]
     tools.run(cmd, stdin="\n".join(hosts), stream_stderr=is_verbose())
     raw = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
     recs = parse_ferox(raw)
@@ -1870,8 +2691,8 @@ def _run_ferox(ws: AppWorkspace, hosts: list[str], words: list[str], round_idx: 
     # app on the other scheme) instead of leaving the group's content discovery empty.
     if not recs and ferox_transport_failed(raw) and any(h.startswith("https://") for h in hosts):
         http_hosts = tools.dedupe([https_to_http(h) for h in hosts])
-        log.warning("  ⚠ feroxbuster (%s) r%d — https unreachable (legacy-TLS handshake refused); "
-                    "retrying over http", app_id, round_idx)
+        log.warning("  ⚠ feroxbuster (%s) %s — https unreachable (legacy-TLS handshake refused); "
+                    "retrying over http", app_id, label)
         tools.run(cmd, stdin="\n".join(http_hosts), stream_stderr=is_verbose())
         raw = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
         recs = parse_ferox(raw)
@@ -1955,7 +2776,7 @@ def _scan_secrets(ws: AppWorkspace, app_id: str) -> None:
 
 
 def content_discovery(activity: Activity, app_id: str) -> None:
-    """LOOP 2.3 — forced browsing to a FIXPOINT: fuzz → download → mine → fuzz the new token delta.
+    """PHASE 3 — forced browsing to a FIXPOINT: fuzz → download → mine → fuzz the new token delta.
 
     Discovers UNLINKED paths/files — the one thing reusing downloaded bodies can't do, so it must
     make new requests. Round 0 is the classic feroxbuster --smart pass (auto-tune soft-404 +
@@ -1968,13 +2789,15 @@ def content_discovery(activity: Activity, app_id: str) -> None:
 
     Targets the group's hosts deduped by response body (_scan_hosts): one host per backend —
     same-backend aliases (domain+IP, http+https) collapsed (no re-fuzz; the scanme.nmap.org incident)
-    but distinct environments (staging vs test) each fuzzed. Combined wordlist (per-app seed +
-    tech_enum surface + JS-mined paths, then a global SecLists list) + tech-derived extensions.
-    BOUNDED by four convergence/budget stops under a hard round cap (see _content_rounds), so it
-    never loops forever and never re-fuzzes/re-downloads.
+    but distinct environments (staging vs test) each fuzzed. The Pass-A wordlist is the STAGED combine
+    (build_content_wordlist): custom + olfa_micro + an_directories head + per-stack language head + the
+    small filetype lists, plus tech-derived extensions. BOUNDED by four convergence/budget stops under
+    a hard round cap (see _content_rounds), so it never loops forever and never re-fuzzes/re-downloads.
 
-    Finally the secret-scanning fleet runs ONCE over the now-complete corpus (_scan_secrets) →
-    secrets.jsonl. Output: scans/<app_id>/content_discovery.jsonl (merge of all rounds, deduped).
+    Stage 3 (the deep dive, _deep_dive) is an OPT-IN extra pass with the huge Assetnote manual lists on
+    the few high-value hosts; its hits merge into the same artifact. Finally the secret-scanning fleet
+    runs ONCE over the now-complete corpus (_scan_secrets) → secrets.jsonl. Output:
+    scans/<app_id>/content_discovery.jsonl (merge of all rounds + the deep dive, deduped).
     """
     ws = activity.app(app_id)
     hosts = _scan_hosts(ws)
@@ -1982,30 +2805,96 @@ def content_discovery(activity: Activity, app_id: str) -> None:
         log.debug("  · skip content_discovery (no host) for %s", app_id)
         return
 
-    # CUSTOM layer (app-derived, high signal) — always in full, first
-    seed = tools.read_lines(ws.wl_custom / "seed.txt")              # build_wordlist app tokens
-    shortnames = tools.read_lines(ws.wl_custom / "shortnames.txt")  # tech_enum surface (8.3 names)
-    js_tokens = tokenize_urls(tools.read_lines(ws.canonical("endpoints_js.txt")))  # mine_responses
-    custom = [*seed, *shortnames, *js_tokens]
-    # TRADITIONAL layer (global content + tech CMS lists), resolved by role; sized by the mode
     tech = workspace.read_meta(ws.meta).get("tech") or []
-    content_wl = wordlists.role_path(activity, "content")
-    traditional = [tools.read_lines(content_wl) if content_wl else [],
-                   *(tools.read_lines(p) for p in wordlists.tech_role_paths(tech, activity.wl_global))]
-    mode = resolve_wl_mode(os.environ.get("PIPT_WL_MODE", "auto"),
-                           len(tools.dedupe(custom)), rich_threshold=WL_RICH_TOKENS)
-    wordlist = combine_wordlist(custom, traditional, mode=mode, cap=WL_TARGETED_CAP)
-    log.info("    wordlist (%s) — mode=%s · %d custom + %d traditional → %d combined", app_id, mode,
-             len(tools.dedupe(custom)), sum(len(t) for t in traditional), len(wordlist))
+    wordlist = build_content_wordlist(activity, ws, tech)
 
     hits, rounds, stop = _content_rounds(ws, hosts, wordlist)
+    hits = _deep_dive(activity, ws, hosts, tech, hits)  # stage 3 — opt-in, gated; merges into hits
     n = tools.write_jsonl(ws.canonical("content_discovery.jsonl"), hits)
     log.info("    content_discovery (%s) → %d result(s) over %d round(s) [stop: %s]",
              app_id, n, rounds, stop)
     _scan_secrets(ws, app_id)
 
 
-# --- LOOP 3 (param discovery) — arjun ∥ x8 hidden-parameter fuzzing ---
+def build_content_wordlist(activity: Activity, ws: AppWorkspace, tech: list[str]) -> list[str]:
+    """Pass-A staged wordlist (stages 0+1+2+2b) for content_discovery. Reads roles by name and hands
+    (lines, cap) layers to the pure assemble_wordlist. A missing role just drops its stage."""
+    app_id = ws.root.name
+    # stage 0 custom (app-derived, high signal) — always full, first
+    custom = [*tools.read_lines(ws.wl_custom / "seed.txt"),                 # build_wordlist app tokens
+              *tools.read_lines(ws.wl_custom / "shortnames.txt"),           # tech_enum surface (8.3 names)
+              *tokenize_urls(tools.read_lines(ws.canonical("endpoints_js.txt")))]  # mine_responses
+
+    def _read(role: str) -> list[str]:
+        p = wordlists.role_path(activity, role)
+        return tools.read_lines(p) if p else []
+
+    layers: list[tuple[list[str], int | None]] = [
+        (_read("content"), None),                                  # stage 0: olfa_micro grab-bag (full)
+        (_read("an_directories"), STAGE1_CAP),                     # stage 1: real paths head
+    ]
+    layers += [(_read(role), STAGE2_CAP)                           # stage 2: ONE per-stack language head
+               for role in roles_for_tech(tech, STAGE2_TECH_ROLES)]
+    layers += [(_read(role), None) for role in STAGE2B_ROLES]      # stage 2b: small filetype lists (full)
+    wordlist = assemble_wordlist(custom, layers)
+    log.info("    wordlist (%s) — %d custom + stages[%s] → %d combined", app_id,
+             len(tools.dedupe(custom)),
+             " ".join(str(min(len(ls), cap) if cap else len(ls)) for ls, cap in layers), len(wordlist))
+    return wordlist
+
+
+def _richest_hosts(hits: list[dict], hosts: list[str], *, cap: int) -> list[str]:
+    """The `cap` scanned hosts with the most Pass-A hits (a content-richness proxy), in-scope only.
+    Used to pick deep-dive targets — the few high-value hosts worth the huge lists. Pure."""
+    scanned = {url_host(h): h for h in hosts}
+    counts: dict[str, int] = {}
+    for r in hits:
+        host = url_host(r.get("url") or "")
+        if host in scanned:
+            counts[host] = counts.get(host, 0) + 1
+    ranked = sorted(counts, key=lambda h: counts[h], reverse=True)
+    return [scanned[h] for h in ranked[:cap]]
+
+
+def _deep_dive(activity: Activity, ws: AppWorkspace, hosts: list[str], tech: list[str],
+               hits: list[dict]) -> list[dict]:
+    """Stage 3 — OPT-IN (PIPT_DEEP_DIVE) deep forced-browse with the huge Assetnote manual lists at
+    full recursion, on the few high-value hosts only. Gated: per-host Pass-A hits ≥ DEEP_DIVE_MIN_HITS
+    and at most DEEP_DIVE_MAX_HOSTS hosts. Merges its hits into `hits` (no body download — the secret
+    fleet already scans the Pass-A corpus). Returns the (possibly extended) hits."""
+    app_id = ws.root.name
+    if not os.environ.get("PIPT_DEEP_DIVE"):
+        return hits
+    roles = [*roles_for_tech(tech, DEEPDIVE_TECH_ROLES), *DEEPDIVE_GENERIC_ROLES]
+    words: list[str] = []
+    for role in roles:
+        p = wordlists.role_path(activity, role)
+        if p:
+            words += tools.read_lines(p)
+    words = tools.dedupe(words)
+    if not words:
+        log.debug("  · skip deep-dive (%s) — no deep list resolved", app_id)
+        return hits
+    per_host = _richest_hosts(hits, hosts, cap=DEEP_DIVE_MAX_HOSTS)
+    targets = [h for h in per_host if sum(url_host(r.get("url") or "") == url_host(h) for r in hits)
+               >= DEEP_DIVE_MIN_HITS]
+    if not targets:
+        log.info("  · skip deep-dive (%s) — no host ≥ %d Pass-A hits", app_id, DEEP_DIVE_MIN_HITS)
+        return hits
+    log.info("  → deep-dive (%s) — %d host(s), %d term(s), -d %s, --time-limit %s",
+             app_id, len(targets), len(words), DEEP_DIVE_DEPTH, DEEP_DIVE_TIME_LIMIT)
+    deadline = time.monotonic() + DEEP_DIVE_DEADLINE_S
+    for i, host in enumerate(targets):
+        if time.monotonic() >= deadline:
+            log.warning("  ⚠ deep-dive (%s) — deadline hit, %d host(s) skipped", app_id, len(targets) - i)
+            break
+        recs = _run_ferox(ws, [host], words, 0, remaining=deadline - time.monotonic(),
+                          depth=DEEP_DIVE_DEPTH, time_limit=DEEP_DIVE_TIME_LIMIT, tag=f"deepdive{i}")
+        hits = merge_ferox_by_url(hits, recs)
+    return hits
+
+
+# --- PHASE 4 (param discovery) — arjun ∥ x8 hidden-parameter fuzzing ---
 def _is_id_segment(seg: str) -> bool:
     """A path segment that's an id/hash → collapsed to '*' in a path template (pure)."""
     if seg.isdigit():
@@ -2050,8 +2939,74 @@ def select_param_endpoints(urls: Iterable[str], in_scope_hosts: set[str], *, cap
     return out
 
 
-def parse_arjun(text: str) -> list[dict]:
-    """arjun -oJ ({<url>: {method, params:[names], headers}}) → common shape per discovered param."""
+def select_body_targets(catalog: Iterable[dict], in_scope: set[str], *, cap: int) -> tuple[list[str], list[str]]:
+    """From the request catalog, the endpoints to test for BODY/JSON params, split by content type:
+    the records the crawl saw with a body or a body-bearing method (POST/PUT/PATCH) — that's where
+    hidden body params actually live. Deduped by (method, path-template), each side capped. Returns
+    (urlencoded_urls, json_urls). Pure."""
+    body: list[str] = []
+    js: list[str] = []
+    seen: set[tuple] = set()
+    for r in catalog:
+        method = (r.get("method") or "GET").upper()
+        has_body = bool((r.get("body") or "").strip()) or method in {"POST", "PUT", "PATCH"}
+        url = r.get("url") or ""
+        if not (has_body and url) or (in_scope and url_host(url) not in in_scope):
+            continue
+        key = (method, path_template(url))
+        if key in seen:
+            continue
+        seen.add(key)
+        ct = next((str(v) for k, v in (r.get("headers") or {}).items()
+                   if str(k).lower() == "content-type"), "")
+        is_json = "json" in ct.lower() or any(p.get("loc") == "json" for p in r.get("params") or [])
+        (js if is_json else body).append(url)
+    return body[:cap], js[:cap]
+
+
+def _first_segment(path: str) -> str:
+    """The first non-empty path segment of a URL path ('/a/b/c'→'a', '/'→'', '/x'→'x'). Pure — the
+    top-level 'region' a recrawl seed must open to count as new (un-crawled) territory."""
+    for seg in path.split("/"):
+        if seg:
+            return seg
+    return ""
+
+
+def select_recrawl_seeds(discovered: Iterable[str], crawled: Iterable[str], in_scope: set[str],
+                         *, cap: int) -> list[str]:
+    """The fuzzing-discovered entry points that open UN-CRAWLED territory — a discovered URL whose
+    TOP-LEVEL path segment no crawled URL uses (conservative: only genuinely-new top-level regions, so
+    a new sub-dir UNDER an already-crawled region does NOT seed). One shallowest seed per new region,
+    static assets / JS files / out-of-scope dropped, capped. Pure (logging only).
+
+    `covered` = the (host, first-segment) of every crawled URL; a discovered /debugging/x whose segment
+    'debugging' isn't covered → the crawler never went there → seed (one per new segment)."""
+    covered = {(urlsplit(c).netloc, _first_segment(urlsplit(c).path or "/")) for c in crawled if c}
+    seeds: list[str] = []
+    seen: set[tuple] = set()
+    for raw in discovered:
+        u = (raw or "").strip()
+        # skip empties, out-of-scope, static assets (denoise) and JS files (not navigable pages)
+        if (not u or "://" not in u or (in_scope and url_host(u) not in in_scope)
+                or not denoise([u]) or is_js_url(u)):
+            continue
+        p = urlsplit(u)
+        key = (p.netloc, _first_segment(p.path or "/"))
+        if key in covered or key in seen:
+            continue
+        seen.add(key)
+        seeds.append(u)
+    seeds.sort(key=lambda s: (s.count("/"), s))   # shallowest entry points first, deterministic
+    if len(seeds) > cap:
+        log.warning("⚠ recrawl: capping new-territory seeds %d→%d", len(seeds), cap)
+        return seeds[:cap]
+    return seeds
+
+
+def parse_arjun(text: str, *, loc: str = "query") -> list[dict]:
+    """arjun -oJ ({<url>: {method, params:[names], headers}}) → common shape per discovered param,
+    stamped with its LOCATION (query/body/json — arjun's -m method determines which)."""
     try:
         data = json.loads(text) if text.strip() else {}
     except json.JSONDecodeError:
@@ -2061,13 +3016,15 @@ def parse_arjun(text: str) -> list[dict]:
         if not isinstance(rec, dict):
             continue
         method = rec.get("method") or "GET"
-        out += [{"url": url, "param": str(p), "method": method, "sources": ["arjun"], "reason": None}
+        out += [{"url": url, "param": str(p), "method": method, "loc": loc,
+                 "sources": ["arjun"], "reason": None}
                 for p in (rec.get("params") or []) if p]
     return out
 
 
-def parse_x8(text: str) -> list[dict]:
-    """x8 -O json ([{url, method, found_params:[{name, reason_kind, …}]}]) → common shape per param."""
+def parse_x8(text: str, *, loc: str = "query") -> list[dict]:
+    """x8 -O json ([{url, method, found_params:[{name, reason_kind, …}]}]) → common shape per param,
+    stamped with its LOCATION (query/body/json/header — x8's mode determines which)."""
     try:
         data = json.loads(text) if text.strip() else []
     except json.JSONDecodeError:
@@ -2080,18 +3037,20 @@ def parse_x8(text: str) -> list[dict]:
         for p in rec.get("found_params") or []:
             name = p.get("name") if isinstance(p, dict) else p
             if url and name:
-                out.append({"url": url, "param": str(name), "method": method, "sources": ["x8"],
+                out.append({"url": url, "param": str(name), "method": method, "loc": loc,
+                            "sources": ["x8"],
                             "reason": p.get("reason_kind") if isinstance(p, dict) else None})
     return out
 
 
 def merge_params(records: list[dict]) -> list[dict]:
-    """Dedup discovered params across arjun/x8 by (url, param): union `sources`, keep first method +
-    first non-null reason. Deterministic order (sorted), so the same input yields the same file. Pure."""
-    ordered = sorted(records, key=lambda r: (r.get("url") or "", r.get("param") or ""))
+    """Dedup discovered params across arjun/x8 by (url, param, LOCATION): union `sources`, keep first
+    method + first non-null reason. A param found in the query AND the body of the same url is two
+    distinct findings (different injection points). Deterministic order. Pure."""
+    ordered = sorted(records, key=lambda r: (r.get("url") or "", r.get("param") or "", r.get("loc") or ""))
     by_key: dict[tuple, dict] = {}
     for r in ordered:
-        key = (r.get("url"), r.get("param"))
+        key = (r.get("url"), r.get("param"), r.get("loc"))
         if key in by_key:
             cur = by_key[key]
             cur["sources"] = sorted(set(cur["sources"]) | set(r.get("sources", [])))
@@ -2101,27 +3060,69 @@ def merge_params(records: list[dict]) -> list[dict]:
     return list(by_key.values())
 
 
-def _run_arjun(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: str) -> list[dict]:
-    """arjun over the targets file (best-effort). Writes JSON to -oJ (bypasses _run). Falls back to
-    arjun's builtin wordlist when the params role is unresolved."""
+def merge_params_wordlist(custom: list[str], glob: list[str]) -> list[str]:
+    """The arjun/x8 wordlist: per-app custom param candidates FIRST, then the global params role,
+    deduped (custom-first preserved). Pure."""
+    return tools.dedupe([*custom, *glob])
+
+
+def _effective_params_wl(ws: AppWorkspace, glob: Path | None) -> Path | None:
+    """Resolve the params wordlist for arjun/x8: wl_custom/params.txt (build_wordlist) merged
+    custom-first with the global `params` role into raw/param_fuzz/params.txt (tool scratch). Falls
+    back to the global path unchanged when there are no custom params, or None when neither resolves
+    (preserving the 'no params wl → x8 skipped' semantics)."""
+    custom = tools.read_lines(ws.wl_custom / "params.txt")
+    if not custom:
+        return glob
+    merged = merge_params_wordlist(custom, tools.read_lines(glob) if glob else [])
+    dest = ws.raw("param_fuzz") / "params.txt"
+    tools.write_lines(dest, merged)
+    return dest
+
+
+# location → the arjun request method (-m) that injects params there. arjun has no header-discovery
+# mode, so "header" is x8-only (absent here).
+_ARJUN_METHOD = {"query": "GET", "body": "POST", "json": "JSON"}
+
+
+def _arjun_header_flags() -> list[str]:
+    """arjun takes session headers as ONE --headers arg (newline-separated), unlike the repeated -H of
+    katana/httpx/x8."""
+    hs = _auth_headers()
+    return ["--headers", "\n".join(hs)] if hs else []
+
+
+def _run_arjun(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: str,
+               *, loc: str = "query") -> list[dict]:
+    """arjun over the targets file for ONE location (best-effort). -m picks the request method that
+    puts params in `loc` (query→GET, body→POST, json→JSON). Writes JSON to -oJ (bypasses _run);
+    falls back to arjun's builtin wordlist when the params role is unresolved. loc='header' is x8-only."""
+    method = _ARJUN_METHOD.get(loc)
+    if method is None:
+        return []
     if shutil.which(ARJUN) is None:
         log.debug("  · skip arjun (not installed) for %s", app_id)
         return []
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [ARJUN, "-i", str(targets_file), "-oJ", str(out_file), "-t", ARJUN_THREADS,
-           "-T", ARJUN_TIMEOUT, "--rate-limit", ARJUN_RATE, "-q"]
+    cmd = [ARJUN, "-i", str(targets_file), "-oJ", str(out_file), "-m", method, "-t", ARJUN_THREADS,
+           "-T", ARJUN_TIMEOUT, "--rate-limit", ARJUN_RATE, "-q", *_arjun_header_flags()]
     if params_wl is not None:
         cmd += ["-w", str(params_wl)]
     try:
         tools.run(cmd, timeout=PARAM_TOOL_TIMEOUT, stream_stderr=is_verbose())
     except subprocess.TimeoutExpired:
-        log.warning("⚠ arjun hit the %ds cap for %s — keeping partial results", PARAM_TOOL_TIMEOUT, app_id)
-    return parse_arjun(out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else "")
+        log.warning("⚠ arjun(%s) hit the %ds cap for %s — keeping partial results",
+                    loc, PARAM_TOOL_TIMEOUT, app_id)
+    text = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
+    return parse_arjun(text, loc=loc)
 
 
-def _run_x8(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: str) -> list[dict]:
-    """x8 over the targets file (best-effort). Writes JSON to -o (bypasses _run). Needs a params
-    wordlist (skipped if the role is unresolved). --one-worker-per-host is the politeness lever."""
+def _run_x8(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: str,
+            *, mode: str = "query") -> list[dict]:
+    """x8 over the targets file for ONE location (best-effort). mode picks where x8 injects: query
+    (default), body (-X POST), json (-X POST -t json), header (--headers). Writes JSON to -o (bypasses
+    _run). Needs a params wordlist (skipped if the role is unresolved). --one-worker-per-host is the
+    politeness lever."""
     if shutil.which(X8) is None:
         log.debug("  · skip x8 (not installed) for %s", app_id)
         return []
@@ -2132,11 +3133,20 @@ def _run_x8(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: 
     cmd = [X8, "-u", str(targets_file), "-w", str(params_wl), "-O", "json", "-o", str(out_file),
            "-W", X8_WORKERS, "-c", X8_CONCURRENCY, "--timeout", X8_TIMEOUT, "-d", X8_DELAY,
            "--one-worker-per-host", "--disable-progress-bar"]
+    if mode == "body":
+        cmd += ["-X", "POST"]
+    elif mode == "json":
+        cmd += ["-X", "POST", "-t", "json"]
+    elif mode == "header":
+        cmd += ["--headers"]
+    cmd += ["-H", *_auth_headers()] if _auth_headers() else []
     try:
         tools.run(cmd, timeout=PARAM_TOOL_TIMEOUT, stream_stderr=is_verbose())
     except subprocess.TimeoutExpired:
-        log.warning("⚠ x8 hit the %ds cap for %s — keeping partial results", PARAM_TOOL_TIMEOUT, app_id)
-    return parse_x8(out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else "")
+        log.warning("⚠ x8(%s) hit the %ds cap for %s — keeping partial results",
+                    mode, PARAM_TOOL_TIMEOUT, app_id)
+    text = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
+    return parse_x8(text, loc=mode)
 
 
 def _working_schemes(ws: AppWorkspace) -> dict[str, str]:
@@ -2158,42 +3168,277 @@ def _working_schemes(ws: AppWorkspace) -> dict[str, str]:
     return schemes
 
 
-def param_fuzz(activity: Activity, app_id: str) -> None:
-    """LOOP 3 — hidden-parameter discovery (arjun ∥ x8) over the app's enumerated endpoints.
+def recrawl(activity: Activity, app_id: str) -> None:
+    """PHASE 3 — bounded re-seed crawl of fuzzing-discovered entry points into UN-CRAWLED territory.
 
-    Selects the endpoints to test (`select_param_endpoints`): the loop-1/2 endpoint artifacts
-    (endpoints.txt + endpoints_js/headless + 2xx content_discovery hits), scoped to the group's hosts,
-    deduped by path-template and capped (PARAM_MAX_ENDPOINTS) — one representative per endpoint shape,
-    since arjun/x8 are request-heavy. Target schemes are normalized to the reachable scheme first
-    (`_working_schemes`) so the cap isn't spent on https URLs a strict-TLS client can't handshake.
-    Runs arjun ∥ x8 (best-effort, like the secret fleet) with the `params` role wordlist, merges their
-    finds by (url, param) → params.jsonl (a deliverable + the input the future DAST consumes). Reads
-    loop-2 artifacts across the barrier — no `needs`.
+    When content_discovery's forced-browse finds a directory the link-crawler never reached (e.g. an
+    unlinked /debugging that opens a whole sub-app), forced-browse + body-mining recover the downloaded
+    surface but NOT what needs a real crawl (JS-rendered nav, deeper link-following). This re-seeds
+    katana on those entry points (select_recrawl_seeds: a discovered URL whose directory no crawled URL
+    touched), storing bodies into the corpus so request_catalog mines them — no new mining code.
+
+    Mode via env PIPT_RECRAWL (default `on`): `off` skip; `preview` select + write + LOG the seeds but
+    DON'T crawl (review raw/recrawl/seeds.txt); `on` also crawl. Bounded even when on: at most
+    RECRAWL_MAX_SEEDS shallow seeds, depth RECRAWL_DEPTH, -ct per-host cap, ONE pass (no crawl⇄fuzz loop).
+    Reads content_discovery across the barrier (no needs)."""
+    if RECRAWL == "off":
+        return
+    ws = activity.app(app_id)
+    crawled = [*tools.read_lines(ws.canonical("endpoints.txt")),
+               *tools.read_lines(ws.canonical("endpoints_headless.txt")),
+               *[u for idx in _all_store_indices(ws) for _, u in _store_index(idx)]]
+    discovered = [r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
+                  if r.get("url") and 200 <= (r.get("status") or 0) < 300]  # 2xx entry points only  # noqa: PLR2004
+    in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
+    seeds = select_recrawl_seeds(discovered, crawled, in_scope, cap=RECRAWL_MAX_SEEDS)
+    seeds_file = ws.raw("recrawl") / "seeds.txt"
+    tools.write_lines(seeds_file, seeds)
+    if not seeds:
+        log.debug("  · recrawl (%s) — no new-territory seeds", app_id)
+        return
+    if RECRAWL != "on":   # preview (default): surface the seeds for review, do NOT crawl
+        log.info("  → recrawl (%s) — PREVIEW: %d new-territory seed(s) → %s "
+                 "(set PIPT_RECRAWL=on to crawl them)", app_id, len(seeds), seeds_file)
+        return
+    store = ws.responses / "recrawl"
+    store.mkdir(parents=True, exist_ok=True)
+    cmd = ["katana", "-silent", "-j", "-jc", "-jsl", "-kf", "all", "-fx", "-xhr", "-fs", "fqdn",
+           "-d", RECRAWL_DEPTH, "-c", KATANA_CONC, "-ct", RECRAWL_CT,
+           "-omit-body", "-srd", str(store), *_header_flags("-H")]
+    out = _run("katana-recrawl", cmd, stdin="\n".join(seeds),
+               dest=ws.raw("katana") / "recrawl" / "out.jsonl", label=app_id)
+    n = tools.write_jsonl(ws.canonical("requests_recrawl.jsonl"),
+                          merge_requests(parse_katana_requests(out, source="katana-recrawl")))
+    log.info("  → recrawl (%s) — crawled %d new-territory seed(s) → %d request(s) (bodies → responses/recrawl/)",
+             app_id, len(seeds), n)
+
+
+def _assemble_catalog(ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[dict], int]:
+    """Assemble a per-app request catalog → (catalog records, count mined from corpus). Pure-ish (reads
+    disk only). Three contributions, all deduped by request shape (`merge_requests`):
+    1. the crawl/headless/API-spec request records (method/body/forms/xhr/spec);
+    2. SHAPES MINED from the downloaded corpus — `jsluice_requests` (fetch/XHR method+body, the JS API
+       surface) + `html_form_requests` (POST/GET forms, incl. the UNLINKED pages feroxbuster found —
+       their bodies are stored, but katana -fx only saw what katana crawled). "fetch once, mine offline":
+       no re-crawl — the bodies are already on disk; relative urls resolve against each body's source url;
+    3. the URL-only discovery sources (passive/crawley/feroxbuster/jsluice endpoints) as GET fallbacks.
+    Every url is scheme-normalized to the empirically-reachable scheme (_working_schemes — the http
+    fallback a strict-TLS scanner needs) and in-scope-filtered.
+
+    `include_guessed` gates the GUESSED-surface inputs (recrawl requests + content_discovery 2xx hits +
+    the fuzz-downloaded corpus, which only exists once content_discovery/recrawl have run): False builds
+    the EXPLORABLE-surface catalog (phase 1, requests.jsonl), True the full catalog (phase 4,
+    requests_full.jsonl). The corpus mining scales with what's on disk — the gate just keeps the surface
+    catalog stable even on a --resume rerun after the guessed artifacts already exist."""
+    in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
+    schemes = _working_schemes(ws)
+    # mine request SHAPES from the already-downloaded corpus (idempotent extract → ensure it's present)
+    bodies, _ = _extract_bodies(ws)
+    source_urls = {Path(s).stem: u for idx in _all_store_indices(ws) for s, u in _store_index(idx)}
+    js_files = sorted(str(p) for p in bodies.glob("*.js")) if bodies else []
+    mined = jsluice_requests(_jsluice_records(js_files), source_urls)
+    mined += html_form_requests(bodies, source_urls) if bodies else []
+    request_recs = [*tools.read_jsonl(ws.canonical("requests_crawl.jsonl")),
+                    *tools.read_jsonl(ws.canonical("requests_headless.jsonl")),
+                    *tools.read_jsonl(ws.canonical("requests_api.jsonl")),
+                    *mined]
+    get_urls = [*tools.read_lines(ws.canonical("endpoints.txt")),
+                *tools.read_lines(ws.canonical("endpoints_js.txt")),
+                *tools.read_lines(ws.canonical("endpoints_headless.txt"))]
+    if include_guessed:
+        request_recs += tools.read_jsonl(ws.canonical("requests_recrawl.jsonl"))  # re-seed crawl (if on)
+        get_urls += [r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
+                     if r.get("url") and 200 <= (r.get("status") or 0) < 300]  # noqa: PLR2004
+    return catalog_records(request_recs, get_urls, in_scope, schemes), len(mined)
+
+
+def request_catalog(activity: Activity, app_id: str) -> None:
+    """PHASE 1 (tail) — assemble the EXPLORABLE-SURFACE request catalog (requests.jsonl), the
+    full-request DAST input for phase 2.
+
+    Crawl/headless/API-spec records + shapes mined from the crawl corpus + the URL-only discovery
+    sources as GET fallbacks — NO guessed surface (content_discovery/recrawl run later, in phase 3).
+    Offline (net=False); needs crawl_headless/mine_responses/api_spec so the records + extracted corpus
+    are present. A bare URL list can only fuzz GET query — this catalog is what unlocks POST/JSON/body."""
+    ws = activity.app(app_id)
+    catalog, n_mined = _assemble_catalog(ws, include_guessed=False)
+    n = tools.write_jsonl(ws.canonical("requests.jsonl"), catalog)
+    methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
+    log.info("  → request_catalog (%s) — %d surface request shape(s) [%s] (mined %d from corpus) → requests.jsonl",
+             app_id, n, methods, n_mined)
+
+
+def request_catalog_full(activity: Activity, app_id: str) -> None:
+    """PHASE 4 (head) — rebuild the catalog INCLUDING the guessed surface → requests_full.jsonl.
+
+    Same assembly as request_catalog but folds in the fuzzing-discovered surface: recrawl requests +
+    content_discovery 2xx hits + the shapes mined from the now-extended corpus (responses/discovered/,
+    responses/recrawl/ — re-extracted idempotently). Offline (net=False); reads phase-1 + phase-3
+    artifacts across the barriers, so it sees the COMPLETE corpus. Feeds param_fuzz + dast_full."""
+    ws = activity.app(app_id)
+    catalog, n_mined = _assemble_catalog(ws, include_guessed=True)
+    n = tools.write_jsonl(ws.canonical("requests_full.jsonl"), catalog)
+    methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
+    log.info("  → request_catalog_full (%s) — %d request shape(s) [%s] (mined %d from corpus) → requests_full.jsonl",
+             app_id, n, methods, n_mined)
+
+
+def param_fuzz(activity: Activity, app_id: str) -> None:
+    """PHASE 4 — hidden-parameter discovery across ALL locations (query · body · json · header), not
+    just GET, over the FULL request catalog (requests_full.jsonl) — so it probes the fuzzing-discovered
+    endpoints for hidden params too, not only the crawl surface.
+
+    reconftw and the old param_fuzz tested only the GET query string. Here:
+    - QUERY discovery runs over every endpoint shape (select_param_endpoints: deduped by path-template,
+      capped PARAM_MAX_ENDPOINTS);
+    - BODY + JSON discovery targets the endpoints the crawl saw with a body (forms/xhr/POST —
+      select_body_targets), topped up from the query set to PARAM_MAX_BODY_ENDPOINTS so hidden POST
+      params on a GET-looking endpoint are probed too;
+    - HEADER discovery (x8 only — arjun has no header mode) over a small subset.
+    arjun (-m GET/POST/JSON) ∥ x8 (-X / --data-type json / --headers), best-effort, capped per-tool
+    wall-clock; merged by (url, param, loc) → params.jsonl (a deliverable + the DAST input). The
+    catalog urls are already scheme-normalized (request_catalog), so no re-scheme here.
     """
     ws = activity.app(app_id)
+    catalog = tools.read_jsonl(ws.canonical("requests_full.jsonl"))
     in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
-    schemes = _working_schemes(ws)  # route arjun/x8 to the scheme the scanners reached (http fallback)
-    urls = [force_scheme(u, schemes) for u in [
-        *tools.read_lines(ws.canonical("endpoints.txt")),
-        *tools.read_lines(ws.canonical("endpoints_js.txt")),
-        *tools.read_lines(ws.canonical("endpoints_headless.txt")),
-        *[r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
-          if r.get("url") and 200 <= (r.get("status") or 0) < 300],  # noqa: PLR2004
-    ]]
-    targets = select_param_endpoints(urls, in_scope, cap=PARAM_MAX_ENDPOINTS)
-    if not targets:
+    query_targets = select_param_endpoints((r.get("url") or "" for r in catalog), in_scope,
+                                           cap=PARAM_MAX_ENDPOINTS)
+    if not query_targets:
         log.debug("  · skip param_fuzz (no endpoints) for %s", app_id)
         return
-    targets_file = ws.raw("param_fuzz") / "targets.txt"
-    tools.write_lines(targets_file, targets)
-    params_wl = wordlists.role_path(activity, "params")
-    log.info("  → param_fuzz (%s) — %d endpoint(s), arjun ∥ x8%s", app_id, len(targets),
+    body_targets, json_targets = select_body_targets(catalog, in_scope, cap=PARAM_MAX_BODY_ENDPOINTS)
+    # probe hidden POST params on GET-looking endpoints too (top up urlencoded body, still capped)
+    body_targets = tools.dedupe([*body_targets, *query_targets])[:PARAM_MAX_BODY_ENDPOINTS]
+    header_targets = query_targets[:PARAM_MAX_HEADER_ENDPOINTS]
+    params_wl = _effective_params_wl(ws, wordlists.role_path(activity, "params"))
+    jobs = [(loc, t) for loc, t in
+            (("query", query_targets), ("body", body_targets),
+             ("json", json_targets), ("header", header_targets)) if t]
+    log.info("  → param_fuzz (%s) — %s, arjun ∥ x8%s", app_id,
+             " ".join(f"{loc}:{len(t)}" for loc, t in jobs),
              "" if params_wl else " (no params wl → x8 skipped)")
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        a = pool.submit(_run_arjun, targets_file, ws.raw("arjun") / "out.json", params_wl, app_id)
-        x = pool.submit(_run_x8, targets_file, ws.raw("x8") / "out.json", params_wl, app_id)
-        records = [*a.result(), *x.result()]
+    # one bounded pool over the flat (tool, location) matrix — arjun only where it has a mode
+    records: list[dict] = []
+    with ThreadPoolExecutor(max_workers=PARAM_FANOUT) as pool:
+        futs = []
+        for loc, targets in jobs:
+            tf = ws.raw("param_fuzz") / f"targets_{loc}.txt"
+            tools.write_lines(tf, targets)
+            if loc in _ARJUN_METHOD:
+                futs.append(pool.submit(_run_arjun, tf, ws.raw("arjun") / f"{loc}.json",
+                                        params_wl, app_id, loc=loc))
+            futs.append(pool.submit(_run_x8, tf, ws.raw("x8") / f"{loc}.json", params_wl, app_id, mode=loc))
+        for fut in futs:
+            records += fut.result()
     params = merge_params(records)
     n = tools.write_jsonl(ws.canonical("params.jsonl"), params)
-    log.info("    param_fuzz (%s) → %d param(s) on %d endpoint(s) → params.jsonl",
-             app_id, n, len({p["url"] for p in params}))
+    by_loc = " ".join(f"{loc}:{c}" for loc, c in sorted(Counter(p.get("loc") for p in params).items()))
+    log.info("    param_fuzz (%s) → %d param(s) on %d endpoint(s) [%s] → params.jsonl",
+             app_id, n, len({p["url"] for p in params}), by_loc)
+
+
+# --- DAST (PHASE 2 surface + PHASE 4 deep) — nuclei -dast over the request catalog --------------
+def _synth_request(method: str, url: str, headers: dict[str, str], body: str, source: str) -> dict:
+    """A catalog request synthesized from scratch (its raw built by build_raw_request) — used to turn
+    discovered hidden params into a concrete fuzzable request. Pure."""
+    ct = next((str(v) for k, v in headers.items() if str(k).lower() == "content-type"), "")
+    return {"method": method.upper(), "url": url, "headers": headers, "body": body,
+            "params": request_params(url, body, ct),
+            "raw": build_raw_request(method, url, headers, body), "sources": [source]}
+
+
+def build_fuzz_requests(params: Iterable[dict]) -> list[dict]:
+    """Synthesize fuzzable requests from the discovered params (params.jsonl), grouped by (url,
+    location): query→GET ?p=, body→POST urlencoded, json→POST JSON {p:""}, header→GET with the headers
+    present. nuclei fuzzes params that EXIST in the request, so a hidden param param_fuzz found is only
+    reachable once injected into a concrete request here. Pure."""
+    groups: dict[tuple, list[str]] = {}
+    for p in params:
+        url, name, loc = p.get("url"), p.get("param"), p.get("loc") or "query"
+        if url and name:
+            groups.setdefault((url, loc), []).append(str(name))
+    out: list[dict] = []
+    for (url, loc), raw_names in groups.items():
+        names = tools.dedupe(raw_names)
+        if loc == "header":
+            out.append(_synth_request("GET", url, dict.fromkeys(names, "x"), "", "param_fuzz"))
+        elif loc == "json":
+            out.append(_synth_request("POST", url, {"Content-Type": "application/json"},
+                                      json.dumps(dict.fromkeys(names, "")), "param_fuzz"))
+        elif loc == "body":
+            out.append(_synth_request("POST", url, {"Content-Type": "application/x-www-form-urlencoded"},
+                                      "&".join(f"{n}=" for n in names), "param_fuzz"))
+        else:  # query
+            full = url + ("&" if "?" in url else "?") + "&".join(f"{n}=" for n in names)
+            out.append(_synth_request("GET", full, {}, "", "param_fuzz"))
+    return out
+
+
+def dast_requests(catalog: Iterable[dict], params: Iterable[dict], *, cap: int) -> list[dict]:
+    """The full request set to fuzz: the catalog + the synthesized requests for discovered hidden
+    params, deduped by shape (merge_requests) and capped (logged when it bites). Pure (logging only)."""
+    merged = merge_requests([*catalog, *build_fuzz_requests(params)])
+    if len(merged) > cap:
+        log.warning("⚠ dast: capping request set %d→%d (set PIPT_* / raise DAST_MAX_REQUESTS)",
+                    len(merged), cap)
+        return merged[:cap]
+    return merged
+
+
+def _run_dast(ws: AppWorkspace, requests_: list[dict], *, input_name: str, out_name: str,
+              label: str) -> None:
+    """Run nuclei -dast over a prepared request set → findings/<out_name>. Shared by dast (phase-2
+    surface) + dast_full (phase-4 guessed). nuclei -im jsonl builds each fuzzed request from `raw`, so
+    it fuzzes query · path · header · cookie · BODY — not just the GET query a bare URL list allows.
+    Best-effort: skips if the nuclei binary or the dast templates (PIPT_NUCLEI_DAST_TEMPLATES) are
+    absent, or the request set is empty. Provenance input → raw/dast/<input_name>."""
+    stage = out_name.removesuffix(".jsonl")
+    if shutil.which("nuclei") is None:
+        log.debug("  · skip %s (nuclei not installed) for %s", stage, label)
+        return
+    if not Path(NUCLEI_DAST_TEMPLATES).is_dir():
+        log.info("  · skip %s (no dast templates at %s) for %s", stage, NUCLEI_DAST_TEMPLATES, label)
+        return
+    if not requests_:
+        log.debug("  · skip %s (no requests) for %s", stage, label)
+        return
+    input_file = ws.raw("dast") / input_name   # nuclei -l input (provenance, tool's own input)
+    tools.write_jsonl(input_file, [{"request": {"endpoint": r["url"], "raw": r["raw"]}}
+                                   for r in requests_])
+    log.info("  → %s (%s) — nuclei -dast over %d request(s) [-fa %s]", stage, label, len(requests_),
+             DAST_AGGRESSION)
+    cmd = ["nuclei", "-dast", "-im", "jsonl", "-l", str(input_file), "-t", NUCLEI_DAST_TEMPLATES,
+           "-fa", DAST_AGGRESSION, "-rl", NUCLEI_RL, "-c", NUCLEI_CONC, "-timeout", NUCLEI_TIMEOUT,
+           "-retries", NUCLEI_RETRIES, "-j", "-silent", "-duc", *_header_flags("-H")]
+    out = tools.run(cmd, stream_stderr=is_verbose())
+    n = tools.write_jsonl(ws.findings / out_name, _jsonl_str(out))
+    log.info("    %s (%s) → %d finding(s) → findings/%s", stage, label, n, out_name)
+
+
+def dast(activity: Activity, app_id: str) -> None:
+    """PHASE 2 — DAST the EXPLORABLE SURFACE (low-hanging fruit): nuclei -dast over the surface catalog
+    (requests.jsonl), fuzzing the OBSERVED params (query/body/form/xhr the crawl actually saw). Fast,
+    high-signal findings on the real attack surface BEFORE the heavy fuzzing — no hidden-param discovery
+    yet (that's guessing → phase 4). Output → findings/dast.jsonl. Reads requests.jsonl across the
+    barrier (phase 1)."""
+    ws = activity.app(app_id)
+    requests_ = dast_requests(tools.read_jsonl(ws.canonical("requests.jsonl")), [],
+                              cap=DAST_MAX_REQUESTS)
+    _run_dast(ws, requests_, input_name="input.jsonl", out_name="dast.jsonl", label=app_id)
+
+
+def dast_full(activity: Activity, app_id: str) -> None:
+    """PHASE 4 — DAST the GUESSED surface (detailed). To avoid re-DASTing what phase-2 already covered,
+    it fuzzes only the DELTA: the request shapes in the full catalog (requests_full.jsonl) NOT already
+    in the surface catalog (requests.jsonl, keyed by request_key) PLUS the synthesized requests for the
+    hidden params param_fuzz discovered (params.jsonl) — those are NEW injection points even on a
+    crawl-surface endpoint. Output → findings/dast_full.jsonl. Needs request_catalog_full + param_fuzz.
+    """
+    ws = activity.app(app_id)
+    surface_keys = {request_key(r) for r in tools.read_jsonl(ws.canonical("requests.jsonl"))}
+    delta = [r for r in tools.read_jsonl(ws.canonical("requests_full.jsonl"))
+             if request_key(r) not in surface_keys]
+    requests_ = dast_requests(delta, tools.read_jsonl(ws.canonical("params.jsonl")),
+                              cap=DAST_MAX_REQUESTS)
+    _run_dast(ws, requests_, input_name="input_full.jsonl", out_name="dast_full.jsonl", label=app_id)

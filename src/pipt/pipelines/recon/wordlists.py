@@ -33,13 +33,35 @@ _DEFAULT_DIRS = (
 # role -> ordered candidate paths relative to a search dir; first existing wins. Lists the
 # common filenames across collections, so it's provider-agnostic (not SecLists-only).
 ROLE_CANDIDATES: dict[str, tuple[str, ...]] = {
-    "content": (
+    "content": (  # general content BASE — prefer OneListForAll's curated micro list, fall back to SecLists
+        "onelistforallmicro.txt", "Discovery/Web-Content/onelistforallmicro.txt",
         "Discovery/Web-Content/raft-medium-directories.txt",
         "Discovery/Web-Content/directory-list-2.3-medium.txt",
         "Discovery/Web-Content/common.txt",
         "raft-medium-directories.txt", "common.txt", "directory-list-2.3-medium.txt",
     ),
-    "params": (  # hidden-parameter names for arjun/x8 (param_fuzz, loop 3)
+    # --- staged content-discovery lists (see tasks.build_content_wordlist) ---
+    # stage 1: real web paths, frequency-ordered (Assetnote httparchive_directories_1m) — capped head
+    "an_directories": ("an_directories_1m.txt", "Discovery/Web-Content/an_directories_1m.txt"),
+    # stage 2: per-stack language lists (Assetnote httparchive_*), gated on detected tech.
+    # an_apiroutes serves the API-driven stacks (node/next/express, python frameworks).
+    "an_php": ("an_php.txt", "Discovery/Web-Content/an_php.txt"),
+    "an_aspx": ("an_aspx_asp_cfm_svc_ashx_asmx.txt", "Discovery/Web-Content/an_aspx_asp_cfm_svc_ashx_asmx.txt"),
+    "an_jsp": ("an_jsp_jspa_do_action.txt", "Discovery/Web-Content/an_jsp_jspa_do_action.txt"),
+    "an_apiroutes": ("an_apiroutes.txt", "Discovery/Web-Content/an_apiroutes.txt"),
+    # stage 2b: small always-useful filetype lists (Assetnote httparchive_*)
+    "an_txt": ("an_txt.txt", "Discovery/Web-Content/an_txt.txt"),
+    "an_xml": ("an_xml.txt", "Discovery/Web-Content/an_xml.txt"),
+    # stage 3 (deep dive): huge Assetnote MANUAL lists, run full on high-value hosts only
+    "mn_php": ("mn_php.txt", "Discovery/Web-Content/mn_php.txt"),
+    "mn_phpmillion": ("mn_phpmillion.txt", "Discovery/Web-Content/mn_phpmillion.txt"),
+    "mn_html": ("mn_html.txt", "Discovery/Web-Content/mn_html.txt"),
+    "mn_jsp": ("mn_jsp.txt", "Discovery/Web-Content/mn_jsp.txt"),
+    "mn_do": ("mn_do.txt", "Discovery/Web-Content/mn_do.txt"),
+    "mn_aspx": ("mn_aspx_lowercase.txt", "Discovery/Web-Content/mn_aspx_lowercase.txt"),
+    "mn_asp": ("mn_asp_lowercase.txt", "Discovery/Web-Content/mn_asp_lowercase.txt"),
+    "mn_cfm": ("mn_cfm.txt", "Discovery/Web-Content/mn_cfm.txt"),
+    "params": (  # hidden-parameter names for arjun/x8 (param_fuzz, phase 4)
         "Discovery/Web-Content/burp-parameter-names.txt",
         "burp-parameter-names.txt",
     ),

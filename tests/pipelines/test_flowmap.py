@@ -28,14 +28,14 @@ def test_render_is_deterministic():
 
 
 def test_layer_puts_parallel_stages_on_one_level():
-    """Loop 1: passive_probe/subenum (no needs) share level 0; crawl (needs passive_probe) is
-    level 1; takeover (needs crawl+subenum) is level 2. (screenshot is now post-cluster, not loop 1.)"""
-    loop1 = [s for s in PIPELINE.stages if s.per_app and s.phase == 1]
-    levels = flowmap._layer(loop1)
+    """Phase 1 (explorable surface): api_spec/passive_probe/subenum (no needs) share level 0; crawl
+    (needs passive_probe) is level 1; request_catalog (the surface-catalog tail) is the deepest level."""
+    phase1 = [s for s in PIPELINE.stages if s.per_app and s.phase == 1]
+    levels = flowmap._layer(phase1)
     names = [sorted(s.name for s in lv) for lv in levels]
-    assert names[0] == ["passive_probe", "subenum"]
+    assert names[0] == ["api_spec", "passive_probe", "subenum"]
     assert "crawl" in names[1]
-    assert "takeover" in names[-1]
+    assert "request_catalog" in names[-1]
 
 
 def test_main_writes_file(tmp_path):

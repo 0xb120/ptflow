@@ -65,6 +65,18 @@ def _phase_tone(phase: int) -> str:
     return _PHASE_TONES[(phase - 1) % len(_PHASE_TONES)]
 
 
+def _legend_loops(stages: Sequence[Stage]) -> str:
+    """Legend swatches for the per-app loops actually present — one per distinct phase, colored by
+    _phase_tone (matching the band headers). Derived, so the legend is correct for ANY phase count."""
+    phases = sorted({s.phase for s in stages if s.per_app})
+    return "\n".join(
+        f'<span class="k"><span class="swatch" style="color:{tone};background:{tone}"></span>'
+        f"loop {p}</span>"
+        for p in phases
+        for tone in (_phase_tone(p),)
+    )
+
+
 def _layer(subset: list[Stage]) -> list[list[Stage]]:
     """Longest-path layering over `needs` (edges within `subset` only): level 0 = no deps, level
     N = 1 + max(level of deps). Stages on the same level have no path between them ⇒ run in parallel.
@@ -179,6 +191,7 @@ def render(stages: Sequence[Stage], spec: MapSpec) -> str:
         css=_CSS,
         eyebrow=_esc(spec.title),
         thesis=_esc(spec.thesis),
+        legend_loops=_legend_loops(stages),
         body="".join(parts),
     )
 
@@ -251,9 +264,9 @@ _DOC = """<!doctype html>
 <p class="thesis">{thesis}</p>
 <div class="legend" aria-label="legenda">
 <span class="k"><span class="swatch" style="color:#4fd6c8;background:#4fd6c8"></span>breadth</span>
-<span class="k"><span class="swatch" style="color:#f0b429;background:#f0b429"></span>spanning</span>
-<span class="k"><span class="swatch" style="color:#7bd88f;background:#7bd88f"></span>loop 1</span>
-<span class="k"><span class="swatch" style="color:#ff4d9d;background:#ff4d9d"></span>loop 2</span>
+<span class="k"><span class="swatch" style="color:#f0b429;background:#f0b429"></span>spanning / post-cluster</span>
+<span class="k"><span class="swatch" style="color:#cdd8e8;background:#cdd8e8"></span>pivot</span>
+{legend_loops}
 <span class="k"><span class="swatch" style="color:#8b8fa3;background:#8b8fa3"></span>fan-in</span>
 <span class="k"><span class="sym">∥</span> parallelo</span>
 <span class="k"><span class="sym">▼</span> needs</span>
