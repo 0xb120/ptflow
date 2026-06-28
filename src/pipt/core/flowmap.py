@@ -183,7 +183,7 @@ def render(stages: Sequence[Stage], spec: MapSpec) -> str:
     if spec.fanin is not None:
         heading, meta = spec.fanin
         body = f"<div class=\"lvl\">{_node(heading, '', meta, needs=(), parallel=False)}</div>"
-        parts.append(_band("", "fan-in", "join dello spanning, poi l'agente terminale",
+        parts.append(_band("", "fan-in", "join dello spanning, poi il fan-in terminale deterministico",
                            _TONE_FANIN, body))
 
     return _DOC.format(

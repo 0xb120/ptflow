@@ -91,6 +91,14 @@ def test_read_jsonl_missing_returns_empty(tmp_path):
     assert tools.read_jsonl(tmp_path / "nope.jsonl") == []
 
 
+def test_read_jsonl_skips_unparseable_lines(tmp_path):
+    # a file holding a tool's RAW stdout (nerva/nuclei) may carry a stray non-JSON line (banner/
+    # progress) — it must be skipped, not crash the consuming stage.
+    p = tmp_path / "raw.jsonl"
+    p.write_text('{"a": 1}\nstarting scan...\n{"b": 2}\n   \nnot json\n', encoding="utf-8")
+    assert tools.read_jsonl(p) == [{"a": 1}, {"b": 2}]
+
+
 def test_run_stream_stderr_returns_stdout():
     assert tools.run(["printf", "hi"], stream_stderr=True) == "hi"
 

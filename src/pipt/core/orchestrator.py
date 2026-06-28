@@ -213,6 +213,24 @@ def _run_loops(  # noqa: PLR0913
             _await(fut, label, failures)
 
 
+def _terminal_fanin(pipeline: Pipeline, activity: Activity, failures: list[str]) -> None:
+    """Deterministic terminal fan-in, run after every loop + spanning join: (1) `consolidate` — an
+    OPTIONAL pipeline hook (like preflight) that lifts per-app findings into <activity>/findings/<type>
+    .jsonl, failure-isolated so it can't sink the run; (2) the DORMANT agent seam (StubProvider), kept
+    in place — the real findings come from consolidate."""
+    do_consolidate = getattr(pipeline, "consolidate", None)
+    if callable(do_consolidate):
+        log.info("▶ consolidate")
+        try:
+            do_consolidate(activity)
+        except Exception:  # terminal aggregation must not abort the whole run
+            log.exception("⚠ consolidate failed")
+            failures.append("consolidate")
+    log.info("▶ agent")
+    n = propose_hypotheses(activity, pipeline.provider())
+    log.info("  → %d hypothesis(es)", n)
+
+
 @flow(task_runner=ThreadPoolTaskRunner(max_workers=CONFIG.fanout.max_workers))  # ty: ignore[no-matching-overload]
 def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *, resume: bool) -> int:
     """Drive the full DAG. Returns the number of stage failures (0 = clean).
@@ -262,12 +280,10 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *, resume
             _run_loops(list(pipeline.stages), app_ids,
                        pipeline_name, activity_name, root, failures, resume=resume)
 
-        # 4. join the spanning + post-cluster-spanning stages (ran ∥ everything above), then agent fan-in
+        # 4. join the spanning + post-cluster-spanning stages (ran ∥ everything above), then fan-in
         for label, fut in {**spanning, **cluster_spanning}.items():
             _await(fut, label, failures)
-        log.info("▶ agent")
-        n = propose_hypotheses(activity, pipeline.provider())
-        log.info("  → %d hypothesis(es)", n)
+        _terminal_fanin(pipeline, activity, failures)
     except KeyboardInterrupt:  # Ctrl-C/SIGINT: stop the draining workers from spawning new tools
         tools.signal_abort()   # (feroxbuster r+1, downloads, trufflehog…) → network goes quiet fast
         raise

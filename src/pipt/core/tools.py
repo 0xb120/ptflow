@@ -232,10 +232,24 @@ def write_lines(path: Path, lines: Iterable[str]) -> int:
 
 
 def read_jsonl(path: Path) -> list[dict]:
-    """Read a JSONL file (one JSON object per line). Returns [] if missing."""
+    """Read a JSONL file (one JSON object per line), SKIPPING any unparseable line. Returns [] if
+    missing. Tolerant by design: some of these files hold a tool's RAW stdout (nerva, nuclei), where a
+    stray non-JSON line (a banner/progress note) must not crash the consuming stage — mirrors the
+    stdout JSONL parser used elsewhere. A skipped line is logged at DEBUG."""
     if not path.exists():
         return []
-    return [json.loads(ln) for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+    out: list[dict] = []
+    skipped = 0
+    for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not ln.strip():
+            continue
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            skipped += 1
+    if skipped:
+        log.debug("read_jsonl: skipped %d unparseable line(s) in %s", skipped, path)
+    return out
 
 
 def write_jsonl(path: Path, records: Iterable[dict]) -> int:

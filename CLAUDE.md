@@ -15,10 +15,13 @@ pipeline runs an asset-discovery (breadth) phase over the whole scope, clusters 
 results into "application groups", then runs one or more per-app **loops** (depth)
 that fan out under Prefect.
 
-> **Agent seam is suspended.** A terminal agent stage (`core/agent.py`,
-> `HypothesisProvider`) still runs as a dormant `StubProvider` fan-in, but its real
-> (Claude-backed) implementation is parked. Don't build toward it; the terminal step
-> will eventually become a deterministic `consolidate`. Leave the seam in place.
+> **Terminal step = deterministic `consolidate` (done); agent seam dormant.** The real terminal
+> fan-in is now `consolidate` (`pipelines/recon/tasks.consolidate`, an optional `Pipeline` hook the
+> orchestrator calls like `preflight`): it lifts every app group's per-app findings into the
+> activity-level `<activity>/findings/<type>.jsonl`, one file per finding TYPE (`cve`/`dast` fold
+> their surface+deep passes). The old agent stage (`core/agent.py`, `HypothesisProvider`) still runs
+> as a **dormant** `StubProvider` fan-in beside it — its real (Claude-backed) implementation is
+> parked; don't build toward it, and leave the seam in place.
 
 ## Commands
 
@@ -159,7 +162,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       requests_full.jsonl                #   request_catalog_full (PHASE 4): + guessed surface (param_fuzz/dast_full input)
       raw/recrawl/seeds.txt              #   recrawl: new-territory seeds (PIPT_RECRAWL on=crawl [default] · preview=list only)
       params.jsonl                       #   param_fuzz: hidden params, ALL locations {url,param,loc:query|body|json|header}
-      findings/tilde_enum.jsonl  findings/dast.jsonl  findings/dast_full.jsonl  #   per-app findings (shortscan; DAST surface/deep); #4 consolidates up
+      findings/tilde_enum.jsonl  findings/dast.jsonl  findings/dast_full.jsonl  #   per-app findings (shortscan; DAST surface/deep); consolidate lifts up
       findings/cve.jsonl  findings/cve_full.jsonl    #   cve_lookup (PHASE 2) / cve_lookup_full (PHASE 4): known CVEs on enumerated software
       raw/cve/seen.txt                   #   cve_lookup: (product,version) covered in PHASE 2 → PHASE 4 reports only the delta
       wl_custom/seed.txt  wl_custom/round*.txt   #   per-app GENERATED wordlists (seed offline; round N = fuzzed delta)
@@ -168,7 +171,10 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                    #   raw/httpx/{screenshot,osint,discovered}, raw/katana/{crawl,headless},
                    #   raw/subjack/candidates.txt, raw/shortscan/rainbow*.txt,
                    #   raw/api_spec/ (spec probe+store), raw/dast/{input,input_full}.jsonl (nuclei -im jsonl input)
-  findings/hypotheses.jsonl              # dormant agent fan-in output
+  findings/cve.jsonl  findings/dast.jsonl  findings/tilde_enum.jsonl  findings/secrets.jsonl  findings/takeover.jsonl  findings/default_creds.jsonl
+                                         #   CONSOLIDATE output — per-app findings lifted up by TYPE (each record stamped app_id;
+                                         #   cve/dast fold surface+deep). nuclei_scope.jsonl is the whole-scope nuclei finding.
+  findings/hypotheses.jsonl              # dormant agent fan-in output (StubProvider seam, kept in place)
   screenshots/screenshot/screenshot.html # UNIFIED gallery — one batched httpx run, 1 host/group (+ eyewitness/report.html)
   poc/  tmp/  logs/
   wl_global/                             # shared/global INPUT wordlists (SecLists & co.)
@@ -440,8 +446,8 @@ scanner can be **DUAL-ROLE** and emit both; the role just decides which loop its
   wordlist. shortscan is **dual-role**: the IIS 8.3 enumeration is itself an information-disclosure
   finding, so from the SAME run `parse_shortscan_findings` emits it → the per-app findings folder
   `scans/<app_id>/findings/tilde_enum.jsonl` (`AppWorkspace.findings`; a per-app dir keeps the fan-out
-  race-free). The general findings model + the `consolidate` that lifts per-app `findings/` into the
-  activity-level `<activity>/findings/` are backlog #4. Best-effort dispatch keyed on detected tech
+  race-free). The `consolidate` terminal step lifts per-app `findings/` into the activity-level
+  `<activity>/findings/<type>.jsonl` (see "Consolidate" below). Best-effort dispatch keyed on detected tech
   (no-op if tech unmatched / binary absent).
 - `tech_vulnscan` (loop 4, gated, planned) runs scanners whose output is **findings-only** (`wpprobe`,
   nuclei tech-tags, `nikto`, …).
@@ -520,7 +526,7 @@ query/path/header/cookie/**body** per template `part`, `-fa low` for live-infra 
   `raw/dast/input_full.jsonl`). It does NOT re-DAST the surface phase 2 already covered.
 
 Whole-scope full-template nuclei stays `nuclei_scope` (breadth, ∥ everything); these are the per-app
-fuzzing passes. Per-app findings → `consolidate` (backlog #4) lifts them. arjun/x8/api_spec provenance in
+fuzzing passes. Per-app findings → `consolidate` (terminal fan-in) lifts them. arjun/x8/api_spec provenance in
 their `raw/` dirs.
 
 **Auth passthrough** (`PIPT_HTTP_HEADER`, `_header_flags`/`_auth_headers`) threads operator session
@@ -537,8 +543,13 @@ is active + template-coverage-limited), especially for non-HTTP services where t
 
 - **Software sources** (`collect_software`, pure): web server (`Server` header), app tech (wappalyzer
   `tech` in `meta.json`), non-HTTP **service banners** (nerva `metadata.banner` — SSH/ftp/db, mapped to
-  the app's hosts by hostname/IP), and **libs mined from the crawl corpus** (JS lib banners + HTML
-  `<meta generator>` — `_corpus_software`). **Version-pinned only** (`_norm_version`, ≥ X.Y), precision-first.
+  the app's hosts by hostname/IP), and **libs mined from the crawl corpus**: JS lib banners + HTML
+  `<meta generator>` (`_corpus_software`) **plus versioned ASSET references** (`mine_asset_versions`) —
+  the lib version is often only in the filename/CDN path (`jquery-3.6.0.min.js`, `/npm/vue@2.6.14/`,
+  `ajax/libs/angularjs/1.8.2/`), so it's mined from both the body heads (`<script src>`) AND the fetched
+  URLs in the `-srd` store (`_corpus_urls`). A curated product map keys it (precision-first: an unknown
+  `foo-1.2.3.js` never fabricates a product; the token must be word-bounded + version-adjacent, so
+  `jquery` never claims `jquery-ui-1.13.2`). **Version-pinned only** (`_norm_version`, ≥ X.Y).
 - **Why two passes:** the structured sources (tech/Server/nerva) are fixed at cluster, but the **corpus
   grows** between the phase-1 crawl and the phase-3 `content_discovery`/`recrawl` downloads — so the
   phase-4 pass re-mines the expanded corpus and reports only the **delta** vs phase 2 (the covered
@@ -558,8 +569,29 @@ is active + template-coverage-limited), especially for non-HTTP services where t
 - **DB provisioning (out-of-band):** `search_vulns -u` downloads the prebuilt local DB (or
   `--full-update` rebuilds it); the stage never builds it during a run. Override the binary with
   `PIPT_SEARCH_VULNS`. *(The CVE quality lever is version detection — nerva covers services well; httpx
-  `tech` often lacks versions, so version-less software is skipped. Mining more corpus version banners is
-  the natural extension.)*
+  `tech` often lacks versions, so version-less software is skipped. The corpus mining now also recovers
+  versioned asset filenames/CDN paths (`mine_asset_versions`), the most common place a JS-lib version
+  actually appears; a curated WordPress/CMS plugin-path miner is the natural next extension.)*
+
+### Consolidate — the deterministic terminal fan-in
+
+`consolidate` (`tasks.consolidate`, an OPTIONAL `Pipeline` hook the orchestrator calls after every
+loop + spanning join, like `preflight`) lifts every app group's per-app findings into the
+activity-level `<activity>/findings/<type>.jsonl` — **one file per finding TYPE**, every record
+stamped with its `app_id` for traceability. It's fully OFFLINE (reads on-disk artifacts only) and
+idempotent (overwrites each run / `--resume`). Sources (`_CONSOLIDATE_SOURCES` + the takeover lines):
+
+- `findings/cve.jsonl` ← per-app `findings/cve.jsonl` + `findings/cve_full.jsonl` (surface+deep folded)
+- `findings/dast.jsonl` ← per-app `findings/dast.jsonl` + `findings/dast_full.jsonl`
+- `findings/tilde_enum.jsonl` ← per-app `findings/tilde_enum.jsonl`
+- `findings/secrets.jsonl` ← per-app `secrets.jsonl`
+- `findings/default_creds.jsonl` ← per-app `default_creds.jsonl`
+- `findings/takeover.jsonl` ← per-app `takeover.txt` lines → `{app_id, type, evidence, source}` records
+
+An empty TYPE writes no file (no clutter). The whole-scope `findings/nuclei_scope.jsonl` is already an
+activity-level finding and is left untouched. The dormant agent seam (`findings/hypotheses.jsonl`)
+runs separately and is kept in place. A `consolidate` failure is isolated (logged + counted), never
+aborting the run.
 
 ## Adding a pipeline (checklist)
 
@@ -634,6 +666,22 @@ its centerpiece. Open it locally in a browser; a git diff of it shows exactly ho
 The architecture sections above say *what* the recon pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
 
+- **`consolidate` is the deterministic terminal fan-in, organized by finding TYPE — not the agent.**
+  An optional `Pipeline` hook (`tasks.consolidate`, called via `getattr` like `preflight`) lifts
+  per-app findings into `<activity>/findings/<type>.jsonl`, one file per TYPE, each record stamped
+  `app_id`. *Why one file per TYPE, folding cve+cve_full / dast+dast_full:* the surface/deep split is
+  a pipeline-PHASE artifact, not a finding-type distinction — an operator triages by "the CVEs", "the
+  DAST hits", so the activity view is by type; the per-app phase files stay split on disk (write-once).
+  *Why a `getattr` hook, not a `Pipeline` Protocol method:* keeps the orchestrator pipeline-agnostic
+  (the example pipeline has no `consolidate` → skipped), same pattern as `preflight`. *Why keep the
+  dormant agent call too:* "leave the seam in place" — `StubProvider` → `hypotheses.jsonl` still runs
+  beside consolidate (parked, harmless), so reviving the Claude agent later is a drop-in. *Why
+  failure-isolated:* a terminal aggregation must never sink a run's results — a raise is logged +
+  counted, not propagated. *Rejected:* removing the agent seam (the guidance is to keep it); a single
+  `findings/all.jsonl` with a `type` field (the operator asked for per-type files); making consolidate
+  a `Stage` (it's a whole-activity fan-in after the last barrier, like the agent — not a per-app/
+  spanning stage, so it sits in the orchestrator terminal, not the DAG).
+
 - **Known-CVE lookup is OFFLINE correlation of enumerated software, in two passes mirroring the DAST.**
   `cve_lookup` (phase 2, ∥ `dast`) and `cve_lookup_full` (phase 4, ∥ `dast_full`) feed `search_vulns`'
   local DB (NVD+GHSA+ExploitDB+EPSS) the software we ALREADY enumerated — web server, wappalyzer tech,
@@ -655,8 +703,11 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
   nmap-`vulners` (reconftw: needs `nmap -sV` + network) which we don't run. *Rejected:* a whole-scope
   spanning stage (loses the crawl-timed two-pass + per-app attribution); querying version-less products
   (noisy general-product CVEs — `--ignore-general-product-vulns`); building the DB during a run (slow,
-  network — it's out-of-band). *Open:* mining more corpus version banners (the quality lever is version
-  detection); nerva IP-only records that don't map to an app hostname.
+  network — it's out-of-band). *Corpus version mining* now covers JS-lib banners, `<meta generator>`
+  AND versioned asset filenames/CDN paths (`mine_asset_versions`, over body heads + fetched `-srd`
+  URLs) — the version is most often in the filename, not a banner. *Open:* a curated CMS plugin-path
+  miner (WordPress `/wp-content/plugins/<slug>/<ver>/`); nerva IP-only records whose IP isn't in
+  `domain_ip_map.txt` (the bracketed-IP parse bug is fixed — IP attribution now works).
 
 - **Per-app loops are surface-first, DAST-first — four phases, not three.** Map only the EXPLORABLE
   surface (OSINT/crawl, no guessing) and DAST *that* first, THEN guess/fuzz, THEN DAST the guessed

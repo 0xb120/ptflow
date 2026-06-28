@@ -364,7 +364,7 @@ FLOWMETA: dict[str, StepMeta] = {
         outputs=("findings/cve_full.jsonl",),
         notes=("offline (net=False) · best-effort: salta se search_vulns/DB assenti",
                "vede le librerie scaricate fuzzando (responses/discovered, recrawl) che la FASE 2 non aveva",
-               "per-app findings → consolidate (pianificato)"),
+               "per-app findings → consolidate (fan-in terminale)"),
     ),
 }
 
@@ -378,8 +378,13 @@ _PIVOT = StepMeta(
            "gli scanner attivi deduplicano gli host per body (_scan_hosts); passive/subenum/takeover stanno su tutti"),
 )
 _FANIN = StepMeta(
-    summary="Fan-in terminale: oggi StubProvider deterministico; diventerà un consolidate.",
-    outputs=("findings/hypotheses.jsonl",),
+    summary="Fan-in terminale DETERMINISTICO (consolidate): solleva i findings per-app in "
+            "<activity>/findings/<tipo>.jsonl — un file per categoria, ogni record con app_id. cve e "
+            "dast uniscono superficie (fase 2) + deep (fase 4); takeover.txt → record. nuclei_scope è "
+            "già a livello activity. Il seam dell'agente (StubProvider) resta dormiente accanto.",
+    outputs=("findings/cve.jsonl", "findings/dast.jsonl", "findings/tilde_enum.jsonl",
+             "findings/secrets.jsonl", "findings/takeover.jsonl", "findings/default_creds.jsonl",
+             "findings/hypotheses.jsonl"),
 )
 
 SPEC = MapSpec(
@@ -391,7 +396,7 @@ SPEC = MapSpec(
     steps=FLOWMETA,
     phase_labels={1: "surface recon", 2: "DAST surface", 3: "fuzzing/guessing", 4: "DAST deep"},
     pivot=("scans/<app_id>/", _PIVOT),
-    fanin=("agent", _FANIN),
+    fanin=("consolidate", _FANIN),
 )
 
 # docs/pipeline-flow.html at the repo root (flowmeta.py is src/pipt/pipelines/recon/ → parents[4]).
