@@ -206,6 +206,24 @@ FLOWMETA: dict[str, StepMeta] = {
             "-fa low = payload contenuti (politeness live) · il full-template whole-scope è nuclei_scope (breadth)",
         ),
     ),
+    "cve_lookup": StepMeta(
+        summary="FASE 2 — CVE NOTE sui software ENUMERATI della superficie esplorabile (∥ dast). "
+                "Correlazione OFFLINE (net=False, zero traffico): web server + tech wappalyzer + banner "
+                "servizi non-HTTP (nerva) + librerie minate dal corpus crawl → DB locale search_vulns. "
+                "Solo version-pinned.",
+        commands=(
+            "# software = collect_software(tech, Server header, banner nerva, lib del corpus) — solo con versione",
+            "search_vulns -q '<Prodotto Versione>' -f json --ignore-general-product-vulns --use-created-product-ids",
+            "# --use-created-product-ids: product ID alla versione ESATTA (no ladder) · cache memo process-wide · offline DB locale",
+        ),
+        outputs=("findings/cve.jsonl", "raw/cve/seen.txt"),
+        notes=(
+            "DB costruito FUORI dal run (search_vulns -u) · best-effort: salta se binario/DB assenti",
+            "record: cve · cvss · epss · cisa_kev · exploits · cwe · hosts · sources — ordinati per triage (exploited/KEV first)",
+            "seen.txt = coppie (prodotto,versione) coperte → la passata FASE 4 fa solo il delta",
+            "override binario: PIPT_SEARCH_VULNS · normalizzazione versione (lezione 6.6.1p1) · search_vulns fa lui il check dei range",
+        ),
+    ),
     # --- PHASE 3: guessing / surface expansion ---
     "wordlist": StepMeta(
         summary="Estrattore di LESSICO offline (fuzzing-prep): mina sia i link crawlati sia i body "
@@ -333,6 +351,20 @@ FLOWMETA: dict[str, StepMeta] = {
             "NON ri-DAST-a la superficie già coperta in FASE 2 · best-effort: salta se manca nuclei o i template dast",
             "il full-template whole-scope è nuclei_scope (breadth) · per-app findings → consolidate (pianificato)",
         ),
+    ),
+    "cve_lookup_full": StepMeta(
+        summary="FASE 4 — CVE NOTE sull'enumerazione ESPANSA (∥ dast_full). Il crawl di FASE 3 "
+                "(content_discovery/recrawl) fa crescere il corpus, quindi ri-mina le librerie e riporta "
+                "solo il DELTA: software non già coperto dalla passata di FASE 2 (raw/cve/seen.txt).",
+        commands=(
+            "# stessa correlazione offline di cve_lookup, sul corpus ora esteso",
+            "search_vulns -q '<Prodotto Versione>' -f json --ignore-general-product-vulns",
+            "# delta = (prodotto,versione) NON in raw/cve/seen.txt · cache memo condivisa con la passata FASE 2",
+        ),
+        outputs=("findings/cve_full.jsonl",),
+        notes=("offline (net=False) · best-effort: salta se search_vulns/DB assenti",
+               "vede le librerie scaricate fuzzando (responses/discovered, recrawl) che la FASE 2 non aveva",
+               "per-app findings → consolidate (pianificato)"),
     ),
 }
 

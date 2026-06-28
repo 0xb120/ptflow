@@ -160,6 +160,8 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       raw/recrawl/seeds.txt              #   recrawl: new-territory seeds (PIPT_RECRAWL on=crawl [default] · preview=list only)
       params.jsonl                       #   param_fuzz: hidden params, ALL locations {url,param,loc:query|body|json|header}
       findings/tilde_enum.jsonl  findings/dast.jsonl  findings/dast_full.jsonl  #   per-app findings (shortscan; DAST surface/deep); #4 consolidates up
+      findings/cve.jsonl  findings/cve_full.jsonl    #   cve_lookup (PHASE 2) / cve_lookup_full (PHASE 4): known CVEs on enumerated software
+      raw/cve/seen.txt                   #   cve_lookup: (product,version) covered in PHASE 2 → PHASE 4 reports only the delta
       wl_custom/seed.txt  wl_custom/round*.txt   #   per-app GENERATED wordlists (seed offline; round N = fuzzed delta)
       responses/  responses/headless/  responses/discovered/round*/   # downloaded corpus (katana/httpx -srd) — mined offline
       raw/<tool>/  # provenance + tool scratch: raw/extracted/ (mined bodies),
@@ -284,7 +286,10 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
   - **Loop 2 — DAST the explorable surface** (`phase=2`, low-hanging fruit): `dast` runs **nuclei
     `-dast -im jsonl`** over `requests.jsonl`, fuzzing the **observed** params (query/path/header/
     cookie/**body**) → `findings/dast.jsonl`. Fast, high-signal findings on the real attack surface
-    before any fuzzing; no hidden-param discovery (that's guessing → phase 4).
+    before any fuzzing; no hidden-param discovery (that's guessing → phase 4). `cve_lookup` runs **∥
+    `dast`** (same phase, offline `net=False`): known-CVE correlation of the enumerated software (web
+    server + tech + non-HTTP service banners + corpus libs) against `search_vulns`' local DB →
+    `findings/cve.jsonl`. See "CVE lookup" below.
   - **Loop 3 — guessing / surface expansion** (`phase=3`): `wordlist` (offline seed from JS/body/seed)
     → `tech_enum` (surface-generating per-stack scanners) → `content_discovery` — feroxbuster forced
     browsing run as a bounded **fixpoint** (fuzz → download → mine → fuzz the new token delta), which
@@ -296,7 +301,10 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     params across **all locations** (query · body · json · header — arjun `-m` ∥ x8
     `-X`/`--data-type`/`--headers`), not GET-only, over the full catalog → `params.jsonl` ; `dast_full`
     runs nuclei `-dast` over the **delta** (full catalog minus the surface catalog) + synthesized
-    requests for the discovered params → `findings/dast_full.jsonl`. See "Request catalog & DAST" below.
+    requests for the discovered params → `findings/dast_full.jsonl`. `cve_lookup_full` runs **∥
+    `dast_full`** (offline): re-mines the EXPANDED corpus (the phase-3 crawl grew it) for software and
+    reports only the **delta** vs the phase-2 pass → `findings/cve_full.jsonl`. See "Request catalog &
+    DAST" + "CVE lookup" below.
   - **Loop 4 — vuln scan** (gated, planned): `tech_vulnscan` — finding-only per-stack scanners
     (`wpprobe`, nuclei tech-tags, `nikto`, …). Specialized scanners are split between loops by output
     role: **surface → `tech_enum`** (loop 3, feeds enum); **findings → `tech_vulnscan`** (loop 4).
@@ -519,6 +527,40 @@ their `raw/` dirs.
 headers/cookies into katana/httpx/nuclei (`-H`), arjun (`--headers`) and x8 (`-H`) so the crawl/fetch/
 fuzz/DAST reach the **authenticated** surface (where most POST/JSON lives).
 
+### CVE lookup — known CVEs on enumerated software (offline correlation, two passes)
+
+`cve_lookup` (phase 2) and `cve_lookup_full` (phase 4) are the gemini of the two DAST passes: where DAST
+*actively fuzzes*, these *passively correlate* the ENUMERATED software against `search_vulns`' LOCAL
+vuln DB (NVD + GHSA + Exploit-DB + Metasploit + EPSS) — **fully offline (`net=False`, no target
+traffic)**, so they run ∥ the DAST without contending for the network cap. They complement nuclei (which
+is active + template-coverage-limited), especially for non-HTTP services where templates are thin.
+
+- **Software sources** (`collect_software`, pure): web server (`Server` header), app tech (wappalyzer
+  `tech` in `meta.json`), non-HTTP **service banners** (nerva `metadata.banner` — SSH/ftp/db, mapped to
+  the app's hosts by hostname/IP), and **libs mined from the crawl corpus** (JS lib banners + HTML
+  `<meta generator>` — `_corpus_software`). **Version-pinned only** (`_norm_version`, ≥ X.Y), precision-first.
+- **Why two passes:** the structured sources (tech/Server/nerva) are fixed at cluster, but the **corpus
+  grows** between the phase-1 crawl and the phase-3 `content_discovery`/`recrawl` downloads — so the
+  phase-4 pass re-mines the expanded corpus and reports only the **delta** vs phase 2 (the covered
+  `(product,version)` set is recorded in `raw/cve/seen.txt`). Without the corpus mining the two passes
+  would be identical.
+- **Matching:** `search_vulns -q "<Product Version>" -f json --ignore-general-product-vulns
+  --use-created-product-ids`. cpe_search sometimes can't map a free-text version to an indexed CPE
+  (verified: `OpenSSH 6.6.1` → no match), so **`--use-created-product-ids`** makes search_vulns
+  SYNTHESIZE a product ID at the **exact** version and do its CPE version-range ("between") check there.
+  We deliberately do NOT query a coarser version (a "ladder") — that asks about a DIFFERENT version and
+  falsely adds/drops exact-version-pinned CVEs (verified: `OpenSSH 6.6` adds 3 CVEs that don't apply to
+  6.6.1). The flag is a no-op for products that already match and never fabricates a match (unknown
+  product → 0). `_search_vulns_query` is **memoized process-wide** so the fan-out doesn't re-query.
+- **Output:** `findings/cve.jsonl` / `findings/cve_full.jsonl` — `{cve, cvss, epss, cisa_kev, exploited,
+  exploits, cwe, hosts, sources, cpe, description}`, sorted for triage (known-exploited/KEV first, then
+  CVSS). Best-effort: skips if `search_vulns` / its DB is absent.
+- **DB provisioning (out-of-band):** `search_vulns -u` downloads the prebuilt local DB (or
+  `--full-update` rebuilds it); the stage never builds it during a run. Override the binary with
+  `PIPT_SEARCH_VULNS`. *(The CVE quality lever is version detection — nerva covers services well; httpx
+  `tech` often lacks versions, so version-less software is skipped. Mining more corpus version banners is
+  the natural extension.)*
+
 ## Adding a pipeline (checklist)
 
 - [ ] Create `src/pipt/pipelines/<name>/` with a `PIPELINE` object satisfying the `Pipeline` protocol.
@@ -559,6 +601,10 @@ its centerpiece. Open it locally in a browser; a git diff of it shows exactly ho
 - Trusted resolvers: `/opt/resolvers/resolvers-trusted.txt`.
 - **DAST (`dast` step)** uses `nuclei -dast` with the fuzzing templates at `~/nuclei-templates/dast`
   (override `PIPT_NUCLEI_DAST_TEMPLATES`); the step skips best-effort if the dir or nuclei is absent.
+- **CVE lookup (`cve_lookup`/`cve_lookup_full`)** uses `search_vulns` (`~/.local/bin/search_vulns`,
+  override `PIPT_SEARCH_VULNS`) against its LOCAL DB. **Build/refresh the DB out-of-band:**
+  `search_vulns -u` (prebuilt download) or `--full-update` (rebuild) — never during a run. The step
+  skips best-effort if the binary or DB is absent. Offline once built (no target traffic).
 - **Auth passthrough** — set `PIPT_HTTP_HEADER` to one or more `Name: value` session headers/cookies
   (separated by newlines or `;;`) to reach the authenticated surface; threaded into katana/httpx/nuclei
   (`-H`), arjun (`--headers`), x8 (`-H`). Set it *before* launching (like `PIPT_PROFILE`).
@@ -587,6 +633,30 @@ its centerpiece. Open it locally in a browser; a git diff of it shows exactly ho
 
 The architecture sections above say *what* the recon pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **Known-CVE lookup is OFFLINE correlation of enumerated software, in two passes mirroring the DAST.**
+  `cve_lookup` (phase 2, ∥ `dast`) and `cve_lookup_full` (phase 4, ∥ `dast_full`) feed `search_vulns`'
+  local DB (NVD+GHSA+ExploitDB+EPSS) the software we ALREADY enumerated — web server, wappalyzer tech,
+  nerva service banners, libs mined from the crawl corpus — and emit `findings/cve{,_full}.jsonl`. *Why
+  offline/`net=False`:* it reads the local DB, makes no target requests, so it overlaps the active DAST
+  for free (no net-cap contention). *Why two passes, not one:* the structured sources are fixed at
+  cluster but the **corpus grows** between the phase-1 and phase-3 crawls, so the phase-4 pass re-mines
+  it and reports only the delta (`raw/cve/seen.txt`); a single pass would miss libs in fuzz-downloaded
+  bodies. *Why per-app, not whole-scope `spanning`:* the operator asked for it tied to the two crawls /
+  ∥ the two DASTs — that's the per-app phase model, not a once-over-everything spanning stage; a
+  process-wide memo cache (`(product,version)→CVEs`) recovers the dedup a whole-scope pass would give.
+  *Why version-pinned + `--use-created-product-ids`, NOT a version ladder:* cpe_search can fail to map an
+  exact version to an indexed CPE (`OpenSSH 6.6.1` → no match), so the flag synthesizes a product ID at
+  the EXACT version and lets search_vulns do the version-range check there. A "ladder" (query a coarser
+  `6.6`) was REJECTED — it asks about a different version and falsely adds/drops exact-version-pinned
+  CVEs (verified: `6.6` adds 3 that don't apply to `6.6.1`). We still drop version-less software
+  (precision-first). *Why search_vulns over alternatives:*
+  it's offline (local DB), multi-source, takes plain product strings (no CPE-building), JSON out — vs
+  nmap-`vulners` (reconftw: needs `nmap -sV` + network) which we don't run. *Rejected:* a whole-scope
+  spanning stage (loses the crawl-timed two-pass + per-app attribution); querying version-less products
+  (noisy general-product CVEs — `--ignore-general-product-vulns`); building the DB during a run (slow,
+  network — it's out-of-band). *Open:* mining more corpus version banners (the quality lever is version
+  detection); nerva IP-only records that don't map to an app hostname.
 
 - **Per-app loops are surface-first, DAST-first — four phases, not three.** Map only the EXPLORABLE
   surface (OSINT/crawl, no guessing) and DAST *that* first, THEN guess/fuzz, THEN DAST the guessed
