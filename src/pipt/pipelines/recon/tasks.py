@@ -455,6 +455,23 @@ def is_ip(host: str) -> bool:
     return len(parts) == 4 and all(p.isdigit() for p in parts)  # noqa: PLR2004
 
 
+_IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")  # dotted-quad literal anywhere in a line
+
+
+def map_hosts_to_ips(lines: Iterable[str], hosts: set[str]) -> set[str]:
+    """IPs belonging to `hosts` from a `dnsx -a -resp` map (domain_ip_map.txt). Each line is
+    ``<host> [A] [<ip>] …`` — the record TYPE and the response IPs are SEPARATE, bracket-wrapped
+    tokens, so positional column [1] is the type ('[A]'), not the IP. Take the host (first token)
+    and extract every dotted-quad IPv4 literal from the REST of the line (bracket-agnostic, multiple
+    A records supported). Pure — used to attribute nerva service banners to an app's hosts by IP."""
+    out: set[str] = set()
+    for line in lines:
+        head, _, rest = line.strip().partition(" ")
+        if head in hosts:
+            out.update(_IPV4_RE.findall(rest))
+    return out
+
+
 def split_cdn_ip_records(records: list[dict], scope_ips: set[str]) -> tuple[list[dict], list[dict]]:
     """Partition httpx records into (kept, dropped) for SCOPE HYGIENE (pure).
 
@@ -830,23 +847,33 @@ def passive_delta(passive: list[str], crawled: list[str]) -> list[str]:
     return [u for u in denoise(tools.dedupe(passive)) if u not in already]
 
 
+def _tech_match(key: str, tags: list[str]) -> bool:
+    """True if `key` occurs as a WHOLE WORD in any tag (word-boundary, case-insensitive). Avoids the
+    substring false positives of a bare `in`: 'java' matches 'Apache Tomcat (Java)' but NOT
+    'JavaScript', and 'next' matches 'Next.js' but NOT 'Nextcloud' — so a client-side-JS app is never
+    mis-gated onto the Java/JSP wordlist + .jsp/.do extensions. `key`/`tags` are lowercase by the
+    callers; re.escape keeps dotted/hyphenated keys (asp.net, microsoft-iis) literal. Pure."""
+    pat = re.compile(rf"\b{re.escape(key)}\b")
+    return any(pat.search(tag) for tag in tags)
+
+
 def tech_extensions(tech: list[str], mapping: dict[str, list[str]]) -> list[str]:
-    """File extensions to fuzz, derived from detected tech (case-insensitive substring)."""
+    """File extensions to fuzz, derived from detected tech (case-insensitive, whole-word match)."""
     tags = [t.lower() for t in tech]
     out: list[str] = []
     for key, exts in mapping.items():
-        if any(key in tag for tag in tags):
+        if _tech_match(key, tags):
             out += exts
     return tools.dedupe(out)
 
 
 def roles_for_tech(tech: list[str], mapping: Mapping[str, str | tuple[str, ...]]) -> list[str]:
-    """Wordlist ROLE names selected by detected tech (case-insensitive substring match), deduped in
+    """Wordlist ROLE names selected by detected tech (case-insensitive, whole-word match), deduped in
     mapping order. A mapping value is one role (str) or several (tuple). Pure."""
     tags = [t.lower() for t in tech]
     out: list[str] = []
     for key, roles in mapping.items():
-        if any(key in tag for tag in tags):
+        if _tech_match(key, tags):
             out += [roles] if isinstance(roles, str) else list(roles)
     return tools.dedupe(out)
 
@@ -1592,7 +1619,7 @@ def httpx_fingerprint(activity: Activity) -> None:
         stdin=httpx_input, dest=activity.asset_discovery_raw("httpx") / "fingerprint.jsonl",
         label="fingerprint",
     )
-    records = [json.loads(ln) for ln in out.splitlines() if ln.strip()]
+    records = _jsonl_str(out)  # tolerant: a stray non-JSON line from httpx must not crash this CORE stage
     kept, dropped = split_cdn_ip_records(records, set(tools.read_lines(activity.scope_ip)))
     tools.write_jsonl(canon("httpx_full_metadata.jsonl"), kept)
     tools.write_jsonl(canon("excluded_cdn.jsonl"), dropped)
@@ -3477,6 +3504,7 @@ _BANNER_PATTERNS = (
 _CORPUS_PATTERNS = (
     (re.compile(r"jQuery(?: JavaScript Library)? v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "jQuery"),
     (re.compile(r"jQuery UI[ -]?(?:v)?(\d+\.\d+[\d.]*)", re.IGNORECASE), "jQuery UI"),
+    (re.compile(r"jQuery Migrate[ -]?(?:v)?(\d+\.\d+[\d.]*)", re.IGNORECASE), "jQuery Migrate"),
     (re.compile(r"Bootstrap v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Bootstrap"),
     (re.compile(r"AngularJS v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "AngularJS"),
     (re.compile(r"Vue(?:\.js)? v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Vue.js"),
@@ -3484,8 +3512,38 @@ _CORPUS_PATTERNS = (
     (re.compile(r"Moment\.js v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Moment.js"),
     (re.compile(r"\bReact v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "React"),
     (re.compile(r"\bD3(?:\.js)? v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "D3"),
+    (re.compile(r"Underscore(?:\.js)? v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Underscore.js"),
+    (re.compile(r"Backbone(?:\.js)? v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Backbone.js"),
+    (re.compile(r"Handlebars(?:\.js)? v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Handlebars.js"),
+    (re.compile(r"Modernizr v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Modernizr"),
+    (re.compile(r"Swiper v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Swiper"),
+    (re.compile(r"Select2 v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "Select2"),
+    (re.compile(r"DataTables v?(\d+\.\d+[\d.]*)", re.IGNORECASE), "DataTables"),
 )
 _GENERATOR_RE = re.compile(r'name=["\']generator["\'][^>]*content=["\']([^"\']+)["\']', re.IGNORECASE)
+
+# Versioned ASSET references (filenames / CDN paths / `<script src>`) — the lib version is often ONLY
+# in the URL (jquery-3.6.0.min.js · /npm/vue@2.6.14/ · ajax/libs/angularjs/1.8.2/), not in a banner
+# comment (minifiers strip those). Map a KNOWN library token → canonical product (precision-first: an
+# unknown 'foo-1.2.3.js' never fabricates a product). The token is word-bounded and must be IMMEDIATELY
+# followed by a separator + dotted version — which also stops a prefix token from matching a longer lib
+# (jquery-ui-1.13.2 → after 'jquery' comes '-ui', not a digit → no jQuery match; 'jquery-ui' → jQuery
+# UI). Names match the banner convention above so dedup collapses the two sources.
+_ASSET_PRODUCTS: tuple[tuple[str, str], ...] = (
+    ("jquery-migrate", "jQuery Migrate"), ("jquery-ui", "jQuery UI"), ("jquery.ui", "jQuery UI"),
+    ("jquery", "jQuery"), ("angularjs", "AngularJS"), ("angular", "AngularJS"),
+    ("bootstrap", "Bootstrap"), ("vue-router", "Vue Router"), ("vue", "Vue.js"),
+    ("react-dom", "React"), ("react", "React"), ("lodash", "Lodash"),
+    ("underscore", "Underscore.js"), ("backbone", "Backbone.js"), ("moment", "Moment.js"),
+    ("d3", "D3"), ("axios", "Axios"), ("ember", "Ember.js"), ("handlebars", "Handlebars.js"),
+    ("modernizr", "Modernizr"), ("tinymce", "TinyMCE"), ("ckeditor", "CKEditor"),
+    ("datatables", "DataTables"), ("highcharts", "Highcharts"), ("leaflet", "Leaflet"),
+    ("swiper", "Swiper"), ("popper", "Popper"), ("select2", "Select2"),
+)
+_ASSET_RE = tuple(
+    (re.compile(rf"\b{re.escape(tok)}[-@/._]v?(\d+\.\d+(?:\.\d+)*)", re.IGNORECASE), product)
+    for tok, product in _ASSET_PRODUCTS
+)
 
 _CVE_CACHE: dict[tuple[str, str], list[dict]] = {}   # (product.lower, version) → CVE records
 _CVE_CACHE_LOCK = threading.Lock()                   # the fan-out runs in one process → dedup across apps
@@ -3542,9 +3600,23 @@ def _banner_software(banner: object) -> tuple[str, str] | None:
     return None
 
 
+def mine_asset_versions(text: str) -> list[tuple[str, str]]:
+    """(product, version) pairs from VERSIONED ASSET references in a corpus text OR a fetched URL —
+    jquery-3.6.0.min.js · /npm/vue@2.6.14/ · ajax/libs/angularjs/1.8.2/ · bootstrap-5.1.3.min.css.
+    Curated product map only (precision-first: an unknown 'foo-1.2.3.js' never fabricates a product),
+    word-bounded + version-adjacent. version-pinned (≥ X.Y), deduped. Pure."""
+    out: set[tuple[str, str]] = set()
+    for rx, product in _ASSET_RE:
+        for m in rx.finditer(text):
+            if (ver := _norm_version(m.group(1))):
+                out.add((product, ver))
+    return sorted(out)
+
+
 def _corpus_software(texts: Iterable[str]) -> list[tuple[str, str]]:
     """Library/CMS versions mined from crawl-corpus body heads — JS lib banners (_CORPUS_PATTERNS) +
-    the HTML <meta generator> tag. version-pinned, deduped. Pure (offline mining)."""
+    the HTML <meta generator> tag + versioned asset refs in the body (`<script src=…>`,
+    mine_asset_versions). version-pinned, deduped. Pure (offline mining)."""
     out: set[tuple[str, str]] = set()
     for text in texts:
         for rx, product in _CORPUS_PATTERNS:
@@ -3554,15 +3626,20 @@ def _corpus_software(texts: Iterable[str]) -> list[tuple[str, str]]:
         gm = _GENERATOR_RE.search(text)
         if gm and (pv := _split_name_version(gm.group(1))):
             out.add(pv)
+        out.update(mine_asset_versions(text))
     return sorted(out)
 
 
-def collect_software(*, tech: Iterable[str], server: object, services: Iterable[tuple[str, str]],
-                     corpus_texts: Iterable[str], app_hosts: Iterable[str]) -> list[dict]:
+def collect_software(*, tech: Iterable[str], server: object,  # noqa: PLR0913
+                     services: Iterable[tuple[str, str]],
+                     corpus_texts: Iterable[str], app_hosts: Iterable[str],
+                     corpus_urls: Iterable[str] = ()) -> list[dict]:
     """Deduped ENUMERATED software → [{product, version, sources, where}], version-pinned. Sources:
     web server (Server header), app tech (wappalyzer), non-HTTP service banners ((host:port, banner)),
-    libs mined from the crawl corpus. tech/server/corpus are attributed to the app's hosts; a service
-    banner to its own host:port. Pure — the query/attribution set for search_vulns."""
+    libs mined from the crawl corpus — body banners/generator/asset-refs (corpus_texts) AND the
+    versioned filenames of the fetched URLs (corpus_urls, e.g. .../jquery-3.6.0.min.js). tech/server/
+    corpus are attributed to the app's hosts; a service banner to its own host:port. Pure — the
+    query/attribution set for search_vulns."""
     grp = sorted(set(app_hosts))
     by_pv: dict[tuple[str, str], dict[str, set]] = {}
 
@@ -3580,6 +3657,9 @@ def collect_software(*, tech: Iterable[str], server: object, services: Iterable[
             add(sw[0], sw[1], "service", [hostport])
     for product, version in _corpus_software(corpus_texts):
         add(product, version, "corpus", grp)
+    for url in corpus_urls:                                  # versioned asset filenames in fetched URLs
+        for product, version in mine_asset_versions(url):
+            add(product, version, "corpus", grp)
     return [{"product": p, "version": v, "sources": sorted(e["sources"]), "where": sorted(e["where"])}
             for (p, v), e in sorted(by_pv.items())]
 
@@ -3670,6 +3750,12 @@ def _corpus_texts(ws: AppWorkspace) -> list[str]:
     return texts
 
 
+def _corpus_urls(ws: AppWorkspace) -> list[str]:
+    """Every fetched URL in the response store (-srd indices) — the lib version is often only in the
+    FILENAME (.../jquery-3.6.0.min.js), which mine_asset_versions recovers. Deduped, offline."""
+    return tools.dedupe(u for idx in _all_store_indices(ws) for _, u in _store_index(idx))
+
+
 def _app_service_banners(activity: Activity, meta: dict) -> list[tuple[str, str]]:
     """Non-HTTP service banners (nerva) on THIS app's hosts → [(host:port, banner)]. Maps a nerva record
     to the app by hostname, or by IP via domain_ip_map.txt. Best-effort: [] if nerva output is absent."""
@@ -3679,13 +3765,8 @@ def _app_service_banners(activity: Activity, meta: dict) -> list[tuple[str, str]
     if not recs:
         return []
     app_hosts = {url_host(h) for h in (meta.get("hosts") or [])}
-    app_ips: set[str] = set()
     dim = canon("domain_ip_map.txt")
-    if dim.exists():
-        for line in tools.read_lines(dim):
-            parts = line.split()
-            if len(parts) >= 2 and parts[0] in app_hosts:  # noqa: PLR2004
-                app_ips.add(parts[1])
+    app_ips = map_hosts_to_ips(tools.read_lines(dim), app_hosts) if dim.exists() else set()
     out: list[tuple[str, str]] = []
     for r in recs:
         host, ip, port = r.get("host"), r.get("ip"), r.get("port")
@@ -3704,6 +3785,7 @@ def _app_software(activity: Activity, ws: AppWorkspace) -> list[dict]:
     return collect_software(
         tech=meta.get("tech") or [], server=server,
         services=_app_service_banners(activity, meta), corpus_texts=_corpus_texts(ws),
+        corpus_urls=_corpus_urls(ws),
         app_hosts=[url_host(h) for h in (meta.get("hosts") or [])])
 
 
@@ -3761,3 +3843,46 @@ def cve_lookup_full(activity: Activity, app_id: str) -> None:
             if "\t" in line}
     delta = [s for s in _app_software(activity, ws) if (s["product"], s["version"]) not in seen]
     _run_cve(ws, delta, out_name="cve_full.jsonl", seen_path=None, label=app_id)
+
+
+# --- consolidate (TERMINAL fan-in) — lift per-app findings → <activity>/findings/<type>.jsonl ------
+# Deterministic terminal step (replaces the dormant agent seam, which stays in place). Each entry maps
+# an activity-level finding TYPE → the per-app JSONL source files (paths relative to the app workspace
+# root) lifted into it, every record stamped with its app_id. A scanner's surface (phase 2) and deep
+# (phase 4) passes FOLD INTO ONE type file (cve+cve_full → cve · dast+dast_full → dast), so the
+# activity findings/ is organized by finding TYPE, not by pipeline phase.
+_CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
+    "cve.jsonl": ("findings/cve.jsonl", "findings/cve_full.jsonl"),
+    "dast.jsonl": ("findings/dast.jsonl", "findings/dast_full.jsonl"),
+    "tilde_enum.jsonl": ("findings/tilde_enum.jsonl",),
+    "secrets.jsonl": ("secrets.jsonl",),
+    "default_creds.jsonl": ("default_creds.jsonl",),
+}
+
+
+def consolidate(activity: Activity) -> dict[str, int]:
+    """TERMINAL fan-in (deterministic, OFFLINE) — lift every app group's per-app findings into the
+    activity level: one <activity>/findings/<type>.jsonl per finding TYPE, each record stamped with its
+    app_id for traceability. A scanner's surface+deep passes fold into one file (cve, dast); the
+    subjack takeover lines become records too. Reads only on-disk artifacts; tolerant of a malformed
+    line (read_jsonl skips it). Whole-scope nuclei_scope.jsonl is already an activity finding and is
+    left untouched; the dormant agent seam (hypotheses.jsonl) runs separately. Returns {type: count}
+    for the NON-EMPTY categories (empty types write no file — no clutter). Idempotent: overwrites on
+    every run / --resume."""
+    apps = activity.list_apps()
+    counts: dict[str, int] = {}
+    for out_name, sources in _CONSOLIDATE_SOURCES.items():
+        records = [{"app_id": ws.root.name, **rec}
+                   for ws in apps for src in sources
+                   for rec in tools.read_jsonl(ws.root / src)]
+        if records:
+            counts[out_name.removesuffix(".jsonl")] = tools.write_jsonl(
+                activity.findings / out_name, records)
+    takeovers = [{"app_id": ws.root.name, "type": "subdomain-takeover", "evidence": ln,
+                  "source": "subjack"}
+                 for ws in apps for ln in tools.read_lines(ws.canonical("takeover.txt"))]
+    if takeovers:
+        counts["takeover"] = tools.write_jsonl(activity.findings / "takeover.jsonl", takeovers)
+    log.info("  → consolidate — %s",
+             ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "no per-app findings")
+    return counts

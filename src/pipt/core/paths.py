@@ -35,8 +35,8 @@ class AppWorkspace:
       downstream (it may be re-read inside the same stage). Multi-mode tools nest: ``raw/<tool>/<mode>/``.
     - ``wl_custom`` — generated wordlist PRODUCTS only (seed/shortnames/round*); tool scratch → raw/.
     - ``responses`` — the downloaded corpus.
-    - ``findings`` — per-app findings (one file per scanner); the consolidate step (planned) lifts
-      these into the activity-level ``<activity>/findings/``.
+    - ``findings`` — per-app findings (one file per scanner); the ``consolidate`` terminal step lifts
+      these into the activity-level ``<activity>/findings/<type>.jsonl``.
     """
 
     def __init__(self, root: Path) -> None:
@@ -69,7 +69,7 @@ class AppWorkspace:
     def findings(self) -> Path:
         """Per-app findings folder: scans/<app_id>/findings/. Each scanner that produces a finding
         writes its own file here (e.g. tilde_enum.jsonl); a per-app dir keeps the fan-out race-free.
-        The consolidate step (planned, #4) lifts these into the activity-level <activity>/findings/."""
+        The consolidate terminal step lifts these into the activity-level <activity>/findings/."""
         return self.root / "findings"
 
     @property

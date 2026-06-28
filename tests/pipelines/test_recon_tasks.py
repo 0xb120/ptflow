@@ -398,8 +398,11 @@ def test_passive_delta_excludes_crawled_and_static():
 def test_tech_extensions_from_detected_tech():
     mapping = {"php": ["php"], "asp.net": ["asp", "aspx"], "java": ["jsp"]}
     assert tasks.tech_extensions(["PHP", "Nginx"], mapping) == ["php"]   # case-insensitive
-    assert tasks.tech_extensions(["ASP.NET 4.8"], mapping) == ["asp", "aspx"]  # substring match
+    assert tasks.tech_extensions(["ASP.NET 4.8"], mapping) == ["asp", "aspx"]  # version suffix tolerated
     assert tasks.tech_extensions(["Go"], mapping) == []                  # no match
+    # whole-word match: "JavaScript" must NOT trigger the Java ("java") extensions (java ⊂ javascript)
+    assert tasks.tech_extensions(["JavaScript"], mapping) == []
+    assert tasks.tech_extensions(["Apache Tomcat (Java)"], mapping) == ["jsp"]  # real Java still matches
 
 
 def test_parse_ferox_keeps_response_records():
@@ -941,6 +944,17 @@ def test_roles_for_tech_matches_and_dedupes():
     assert tasks.roles_for_tech(["ASP.NET", "Microsoft-IIS"], mapping) == ["an_aspx"]  # 2 keys, 1 role, deduped
     assert tasks.roles_for_tech(["Apache Tomcat (Java)"], mapping) == ["mn_jsp", "mn_do"]  # tuple expands
     assert tasks.roles_for_tech(["Go"], mapping) == []                         # no match
+    # whole-word match: "java" ⊂ "javascript" must NOT select the Java role (the precision-first bug)
+    assert tasks.roles_for_tech(["JavaScript"], mapping) == []
+
+
+def test_roles_for_tech_word_boundary_no_substring_false_positive():
+    # "next" ⊂ "nextcloud" (a PHP app) — must not be mistaken for Next.js → an_apiroutes
+    s2 = tasks.STAGE2_TECH_ROLES
+    assert tasks.roles_for_tech(["JavaScript"], s2) == []          # not Java (an_jsp)
+    assert tasks.roles_for_tech(["Nextcloud"], s2) == []           # not Next.js (an_apiroutes)
+    assert tasks.roles_for_tech(["Next.js"], s2) == ["an_apiroutes"]   # the real Next.js still matches
+    assert tasks.tech_extensions(["JavaScript"], tasks.TECH_EXTENSIONS) == []  # not .jsp/.do/.action
 
 
 def test_stage2_and_deepdive_roles_per_stack():
@@ -1348,10 +1362,37 @@ def test_banner_software_known_services():
 
 def test_corpus_software_mines_lib_and_generator():
     texts = ["/*! jQuery v1.11.0 | (c) jQuery Foundation */",
-             '<meta name="generator" content="WordPress 5.2">']
+             '<meta name="generator" content="WordPress 5.2">',
+             '<script src="/static/jquery-ui-1.13.2.min.js"></script>']  # versioned asset ref in body
     out = dict(tasks._corpus_software(texts))
     assert out.get("jQuery") == "1.11.0"
     assert out.get("WordPress") == "5.2"
+    assert out.get("jQuery UI") == "1.13.2"   # mined from the <script src> filename
+
+
+def test_mine_asset_versions_from_filenames_and_cdn_paths():
+    assert tasks.mine_asset_versions("/static/js/jquery-3.6.0.min.js") == [("jQuery", "3.6.0")]
+    assert tasks.mine_asset_versions("//cdn/npm/vue@2.6.14/dist/vue.min.js") == [("Vue.js", "2.6.14")]
+    assert tasks.mine_asset_versions("ajax/libs/angularjs/1.8.2/angular.min.js") == [("AngularJS", "1.8.2")]
+    # version-adjacency guard: 'jquery' must NOT mis-claim jquery-ui-1.13.2
+    assert tasks.mine_asset_versions("/js/jquery-ui-1.13.2.min.js") == [("jQuery UI", "1.13.2")]
+    # precision-first: unknown product, unversioned ref, and major-only version → nothing
+    assert tasks.mine_asset_versions("/js/superwidget-1.2.3.js") == []
+    assert tasks.mine_asset_versions("/js/jquery.min.js") == []
+    assert tasks.mine_asset_versions("/js/d3.v7.min.js") == []
+
+
+def test_collect_software_mines_versioned_asset_urls():
+    sw = tasks.collect_software(
+        tech=[], server="", services=[], corpus_texts=[],
+        corpus_urls=["https://x/assets/bootstrap-5.1.3.min.css",
+                     "https://x/assets/app.js"],   # no version → ignored
+        app_hosts=["app.test"])
+    by_prod = {r["product"]: r for r in sw}
+    assert by_prod["Bootstrap"]["version"] == "5.1.3"
+    assert by_prod["Bootstrap"]["sources"] == ["corpus"]
+    assert by_prod["Bootstrap"]["where"] == ["app.test"]
+    assert "app" not in by_prod
 
 
 def test_collect_software_dedups_and_attributes_sources():
@@ -1365,6 +1406,36 @@ def test_collect_software_dedups_and_attributes_sources():
     assert by_prod["OpenSSH"]["where"] == ["scanme.test:22"]   # service attributed to its host:port
     assert by_prod["jQuery"]["where"] == ["app.test"]          # app-level sources → the group's hosts
     assert by_prod["Bootstrap"]["sources"] == ["corpus"]
+
+
+def test_map_hosts_to_ips_parses_dnsx_resp_format():
+    # dnsx -a -resp writes '<host> [A] [<ip>]' — the record type and IP are separate bracketed tokens,
+    # so the '[A]' column must never be mistaken for an IP (the _app_service_banners bug).
+    lines = [
+        "app.test [A] [10.0.0.1]",
+        "api.test [A] [10.0.0.2] [10.0.0.3]",   # multiple A records
+        "other.test [A] [10.0.0.9]",            # not in scope → ignored
+        "bare.test 10.0.0.4",                   # no brackets/type → still parsed
+    ]
+    hosts = {"app.test", "api.test", "bare.test"}
+    assert tasks.map_hosts_to_ips(lines, hosts) == {"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"}
+    assert tasks.map_hosts_to_ips(["app.test [A] [10.0.0.1]"], {"app.test"}) == {"10.0.0.1"}
+
+
+def test_app_service_banners_attributes_ip_only_record(tmp_path):
+    # regression: an IP-only nerva record must attach to the app via domain_ip_map.txt — the old
+    # parser took the '[A]' record-type column instead of the bracketed IP, so it never matched.
+    from pipt.core import tools
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    canon = act.asset_discovery_canonical
+    tools.write_jsonl(canon("nerva_full_metadata.jsonl"),
+                      [{"host": "", "ip": "45.33.32.156", "port": 22,
+                        "metadata": {"banner": "SSH-2.0-OpenSSH_6.6.1p1"}}])
+    canon("domain_ip_map.txt").write_text("scanme.test [A] [45.33.32.156]\n", encoding="utf-8")
+    meta = {"hosts": ["http://scanme.test"]}
+    assert tasks._app_service_banners(act, meta) == [("45.33.32.156:22", "SSH-2.0-OpenSSH_6.6.1p1")]
 
 
 def test_parse_search_vulns_no_match_returns_none():
@@ -1404,3 +1475,48 @@ def test_cve_sort_key_prioritizes_exploited_then_cvss():
         {"cve": "CVE-C", "exploited": False, "kev": False, "cvss": None},
     ]
     assert [r["cve"] for r in sorted(rows, key=tasks._cve_sort_key)] == ["CVE-B", "CVE-A", "CVE-C"]
+
+
+# --- consolidate (terminal fan-in) ---
+def test_consolidate_lifts_per_app_findings_by_type(tmp_path):
+    from pipt.core import tools
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    a1, a2 = act.app("app-1").ensure(), act.app("app-2").ensure()
+    # surface (phase 2) + deep (phase 4) of one scanner fold into ONE type file
+    tools.write_jsonl(a1.findings / "cve.jsonl", [{"cve": "CVE-1", "product": "Apache"}])
+    tools.write_jsonl(a1.findings / "cve_full.jsonl", [{"cve": "CVE-2", "product": "jQuery"}])
+    tools.write_jsonl(a2.findings / "dast.jsonl", [{"template": "xss", "url": "http://b/x"}])
+    tools.write_jsonl(a1.canonical("secrets.jsonl"), [{"type": "aws", "secret": "AKIA…"}])
+    a2.canonical("takeover.txt").write_text("github.io b.example.com\n", encoding="utf-8")
+
+    counts = tasks.consolidate(act)
+
+    assert counts == {"cve": 2, "dast": 1, "secrets": 1, "takeover": 1}
+    cve = tools.read_jsonl(act.findings / "cve.jsonl")
+    assert {(r["app_id"], r["cve"]) for r in cve} == {("app-1", "CVE-1"), ("app-1", "CVE-2")}
+    assert tools.read_jsonl(act.findings / "dast.jsonl")[0]["app_id"] == "app-2"  # stamped with app_id
+    assert tools.read_jsonl(act.findings / "takeover.jsonl")[0] == {
+        "app_id": "app-2", "type": "subdomain-takeover",
+        "evidence": "github.io b.example.com", "source": "subjack"}
+    # an empty category writes no file (no clutter)
+    assert not (act.findings / "tilde_enum.jsonl").exists()
+    assert not (act.findings / "default_creds.jsonl").exists()
+
+
+def test_consolidate_no_findings_returns_empty(tmp_path):
+    from pipt.core.paths import Activity
+
+    act = Activity.named("empty", root=tmp_path).ensure()
+    act.app("app-1").ensure()
+    assert tasks.consolidate(act) == {}
+
+
+def test_recon_pipeline_exposes_consolidate(tmp_path):
+    from pipt.core.paths import Activity
+    from pipt.pipelines.recon.pipeline import PIPELINE
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    act.app("app-1").ensure()
+    assert PIPELINE.consolidate(act) == {}   # the pipeline hook delegates to tasks.consolidate

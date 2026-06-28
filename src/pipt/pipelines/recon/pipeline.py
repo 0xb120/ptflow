@@ -81,6 +81,12 @@ class ReconPipeline:
     def cluster(self, activity: Activity) -> list[str]:
         return tasks.cluster(activity)
 
+    def consolidate(self, activity: Activity) -> dict[str, int]:
+        """Deterministic terminal fan-in: lift per-app findings into <activity>/findings/<type>.jsonl
+        (one file per finding type). The orchestrator calls this if present (the dormant agent seam
+        stays in place beside it)."""
+        return tasks.consolidate(activity)
+
     def provider(self) -> HypothesisProvider:
         return StubProvider()
 
