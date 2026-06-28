@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, unquote_plus, urljoin, urlsplit
 
 from pipt.core import scope, tools, workspace
@@ -304,6 +304,15 @@ _SHORTUTIL_BIN = Path.home() / "go" / "bin" / "shortutil"
 SHORTUTIL = str(_SHORTUTIL_BIN) if _SHORTUTIL_BIN.exists() else "shortutil"
 SHORTSCAN_CONC = "20"  # shortscan -c concurrency (its default)
 
+# wpprobe (WordPress plugin/theme vuln scanner, tech_vulnscan) lives in ~/go/bin. Finding-only,
+# best-effort — runs ONLY on app groups whose tech says WordPress. Maps detected plugins/themes +
+# versions to known CVEs via its LOCAL Wordfence DB (provisioned out-of-band: `wpprobe update-db`).
+_WPPROBE_BIN = Path.home() / "go" / "bin" / "wpprobe"
+WPPROBE = str(_WPPROBE_BIN) if _WPPROBE_BIN.exists() else "wpprobe"
+WPPROBE_RATE = "20"     # --rate-limit (req/s) — gentle on live infra (wpprobe default is 50)
+WPPROBE_THREADS = "5"   # -t concurrent threads
+WPPROBE_TIMEOUT = 300   # per-host wall-clock backstop (stealthy mode is fast; keep partial on hit)
+
 # jsluice (offline JS endpoint/secret mining of the response store) lives in ~/go/bin.
 _JSLUICE_BIN = Path.home() / "go" / "bin" / "jsluice"
 JSLUICE = str(_JSLUICE_BIN) if _JSLUICE_BIN.exists() else "jsluice"
@@ -381,7 +390,7 @@ _CORE_TOOLS = {
 _OPTIONAL_TOOLS = {
     "crawley": CRAWLEY, "jsluice": JSLUICE, "shortscan": SHORTSCAN, "shortutil": SHORTUTIL,
     "gitleaks": GITLEAKS, "trufflehog": TRUFFLEHOG, "detect-secrets": DETECT_SECRETS,
-    "arjun": ARJUN, "x8": X8, "search_vulns": SEARCH_VULNS,
+    "arjun": ARJUN, "x8": X8, "search_vulns": SEARCH_VULNS, "wpprobe": WPPROBE,
 }
 
 
@@ -1051,6 +1060,66 @@ def parse_shortscan_findings(out: str) -> list[dict]:
                 "source": "shortscan",
             })
     return findings
+
+
+# wpprobe `scan -o json` schema (Chocapikk/wpprobe): per site
+#   {url, plugins:{<slug>:[{version, severities:[{<severity>:[{auth_type, vulnerabilities:[
+#       {cve, cve_link, title, cvss_score, cvss_vector}]}]}]}]}, themes:{…same…}}
+# A detected component with NO known vuln has no `severities` (just a version) → no finding emitted.
+_WPPROBE_SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def _wpprobe_sort_key(f: dict) -> tuple:
+    """Triage order for wpprobe findings: by severity (critical first), then CVSS desc, then CVE. Pure."""
+    try:
+        cvss = float(f.get("cvss") or 0)
+    except (TypeError, ValueError):
+        cvss = 0.0
+    return (_WPPROBE_SEV_RANK.get((f.get("severity") or "").lower(), 9), -cvss, f.get("cve") or "")
+
+
+def _wpprobe_component_vulns(versions: Any) -> Iterable[tuple]:
+    """Yield (version, severity, auth_type, vuln) for one component's version groups. Guards the outer
+    list; trusts wpprobe's well-formed inner schema (severities → {<sev>:[{auth_type,vulnerabilities}]}).
+    Pure generator."""
+    if not isinstance(versions, list):
+        return
+    for vg in versions:
+        version = vg.get("version")
+        for sev_entry in vg.get("severities") or ():
+            for severity, groups in sev_entry.items():
+                for ag in groups:
+                    for v in ag.get("vulnerabilities") or ():
+                        yield version, severity, ag.get("auth_type"), v
+
+
+def parse_wpprobe(text: str) -> list[dict]:
+    """wpprobe `scan -o json` → one finding record per (component, version, CVE). Handles plugins AND
+    themes, a single-site object (`-u`) or a list (`-f`); guards the outer shapes (no crash on garbage).
+    version-only entries (a detected component with no known vuln) yield nothing — findings-only. Pure."""
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except (json.JSONDecodeError, ValueError):
+        return []
+    out: list[dict] = []
+    for site in data if isinstance(data, list) else [data]:
+        if not isinstance(site, dict):
+            continue
+        url = site.get("url", "")
+        for kind in ("plugin", "theme"):
+            coll = site.get(f"{kind}s")
+            for slug, versions in (coll.items() if isinstance(coll, dict) else []):
+                for version, severity, auth, v in _wpprobe_component_vulns(versions):
+                    if isinstance(v, dict):
+                        out.append({
+                            "type": f"wordpress-{kind}-vuln", "kind": kind,
+                            "component": str(slug), "version": version, "severity": severity,
+                            "auth": auth, "cve": v.get("cve"), "cvss": v.get("cvss_score"),
+                            "title": v.get("title"), "cve_link": v.get("cve_link"),
+                            "target": url, "source": "wpprobe",
+                        })
+    out.sort(key=_wpprobe_sort_key)
+    return out
 
 
 def parse_eyewitness_csv(text: str) -> list[dict]:
@@ -2658,9 +2727,8 @@ def tech_enum(activity: Activity, app_id: str) -> None:
     its tech matched AND its binary is installed. Primary output is SURFACE (fuzz words) →
     wl_custom/shortnames.txt, which content_discovery merges into its wordlist. A scanner may also be
     DUAL-ROLE and emit findings: shortscan's IIS 8.3 short-name enumeration is itself an
-    information-disclosure finding → tilde_enum.jsonl (a dedicated artifact; the general findings
-    model/consolidate is backlog #4). Findings-only scanners (wpprobe, nuclei, …) belong to
-    tech_vulnscan / phase 4.
+    information-disclosure finding → tilde_enum.jsonl (a dedicated artifact; `consolidate` lifts it to
+    <activity>/findings/). Findings-only scanners (wpprobe, nuclei, …) belong to tech_vulnscan / phase 4.
 
     Today: shortscan (IIS/ASP.NET 8.3 short-name enumeration). Reads phase-1 hosts
     across the barrier; needs the wordlist seed for the shortutil rainbow table.
@@ -2672,10 +2740,60 @@ def tech_enum(activity: Activity, app_id: str) -> None:
     if any(k in tech for k in ("iis", "asp.net", "microsoft-iis")):
         surface, findings = _shortscan_surface(activity, ws, app_id)
     n = tools.write_lines(ws.wl_custom / "shortnames.txt", surface)
-    if findings:  # per-app findings/ folder (#4 consolidate will lift these to <activity>/findings/)
+    if findings:  # per-app findings/ folder — consolidate lifts these to <activity>/findings/
         tools.write_jsonl(ws.findings / "tilde_enum.jsonl", findings)
     log.info("  → tech_enum (%s) — %d surface term(s) → shortnames.txt%s", app_id, n,
              f" · {len(findings)} finding(s) → findings/tilde_enum.jsonl" if findings else "")
+
+
+def _wpprobe(ws: AppWorkspace, app_id: str) -> list[dict]:
+    """Run wpprobe over the group's scan hosts (one stealthy scan per distinct-body host) → vuln
+    findings. Best-effort: [] if the binary is absent or there are no hosts. Writes JSON to -o (csv/
+    json by extension), so it bypasses _run; auth headers (PIPT_HTTP_HEADER) reach the logged-in site.
+    Each scan is capped by WPPROBE_TIMEOUT (a runaway must not hang the loop — keep partial on hit)."""
+    if shutil.which(WPPROBE) is None:
+        log.debug("  · skip wpprobe (not installed) for %s", app_id)
+        return []
+    hosts = _scan_hosts(ws)
+    if not hosts:
+        return []
+    log.info("  → wpprobe (%s) — %d host(s)", app_id, len(hosts))
+    findings: list[dict] = []
+    for i, host in enumerate(hosts):
+        out_file = ws.raw("wpprobe") / f"scan{i}.json"
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [WPPROBE, "scan", "-u", host, "-o", str(out_file), "--rate-limit", WPPROBE_RATE,
+               "-t", WPPROBE_THREADS, *_header_flags("-H")]
+        try:
+            tools.run(cmd, timeout=WPPROBE_TIMEOUT, stream_stderr=is_verbose())
+        except subprocess.TimeoutExpired:
+            log.warning("⚠ wpprobe hit the %ds cap for %s (%s) — keeping partial results",
+                        WPPROBE_TIMEOUT, app_id, host)
+        if out_file.exists():
+            findings += parse_wpprobe(out_file.read_text(encoding="utf-8", errors="replace"))
+    return findings
+
+
+def tech_vulnscan(activity: Activity, app_id: str) -> None:
+    """PHASE 4 (findings) — specialized per-stack scanners whose output is FINDINGS-only (the dual of
+    tech_enum, whose output feeds enum). Best-effort dispatch keyed on the cluster's detected tech: a
+    scanner runs only if its tech matched (whole-word, _tech_match) AND its binary is installed.
+
+    Today: wpprobe (WordPress plugin/theme → known-CVE), run ONLY on WordPress app groups → the per-app
+    findings/wpprobe.jsonl (consolidate lifts it to <activity>/findings/). Reads meta tech + hosts; no
+    needs (runs ∥ the other phase-4 stages). Future finding-only scanners (nuclei tech-tags, nikto, …)
+    dispatch here too."""
+    ws = activity.app(app_id)
+    tags = [t.lower() for t in (workspace.read_meta(ws.meta).get("tech") or [])]
+    findings: list[dict] = []
+    if _tech_match("wordpress", tags):
+        findings += _wpprobe(ws, app_id)
+    if findings:
+        tools.write_jsonl(ws.findings / "wpprobe.jsonl", findings)
+    hot = sum(1 for f in findings if (f.get("severity") or "").lower() in ("critical", "high"))
+    log.info("  → tech_vulnscan (%s) — %d finding(s)%s%s", app_id, len(findings),
+             f" ({hot} critical/high)" if hot else "",
+             " → findings/wpprobe.jsonl" if findings else "")
 
 
 def _dur_seconds(spec: str) -> int:
@@ -3855,6 +3973,7 @@ _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "cve.jsonl": ("findings/cve.jsonl", "findings/cve_full.jsonl"),
     "dast.jsonl": ("findings/dast.jsonl", "findings/dast_full.jsonl"),
     "tilde_enum.jsonl": ("findings/tilde_enum.jsonl",),
+    "wpprobe.jsonl": ("findings/wpprobe.jsonl",),
     "secrets.jsonl": ("secrets.jsonl",),
     "default_creds.jsonl": ("default_creds.jsonl",),
 }

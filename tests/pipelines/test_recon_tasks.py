@@ -197,7 +197,7 @@ def test_pipeline_object_shape():
         "fetch_delta", "api_spec", "mine_responses", "request_catalog",
         "dast", "cve_lookup",
         "wordlist", "tech_enum", "content_discovery", "recrawl",
-        "request_catalog_full", "param_fuzz", "dast_full", "cve_lookup_full",
+        "request_catalog_full", "param_fuzz", "dast_full", "cve_lookup_full", "tech_vulnscan",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
     # httpx is the breadth tail; the expensive full scan runs ∥ as a spanning chain → nerva
@@ -1488,14 +1488,17 @@ def test_consolidate_lifts_per_app_findings_by_type(tmp_path):
     tools.write_jsonl(a1.findings / "cve.jsonl", [{"cve": "CVE-1", "product": "Apache"}])
     tools.write_jsonl(a1.findings / "cve_full.jsonl", [{"cve": "CVE-2", "product": "jQuery"}])
     tools.write_jsonl(a2.findings / "dast.jsonl", [{"template": "xss", "url": "http://b/x"}])
+    tools.write_jsonl(a1.findings / "wpprobe.jsonl", [{"component": "give", "cve": "CVE-3"}])
     tools.write_jsonl(a1.canonical("secrets.jsonl"), [{"type": "aws", "secret": "AKIA…"}])
     a2.canonical("takeover.txt").write_text("github.io b.example.com\n", encoding="utf-8")
 
     counts = tasks.consolidate(act)
 
-    assert counts == {"cve": 2, "dast": 1, "secrets": 1, "takeover": 1}
+    assert counts == {"cve": 2, "dast": 1, "wpprobe": 1, "secrets": 1, "takeover": 1}
     cve = tools.read_jsonl(act.findings / "cve.jsonl")
     assert {(r["app_id"], r["cve"]) for r in cve} == {("app-1", "CVE-1"), ("app-1", "CVE-2")}
+    assert tools.read_jsonl(act.findings / "wpprobe.jsonl")[0] == {
+        "app_id": "app-1", "component": "give", "cve": "CVE-3"}
     assert tools.read_jsonl(act.findings / "dast.jsonl")[0]["app_id"] == "app-2"  # stamped with app_id
     assert tools.read_jsonl(act.findings / "takeover.jsonl")[0] == {
         "app_id": "app-2", "type": "subdomain-takeover",
@@ -1520,3 +1523,55 @@ def test_recon_pipeline_exposes_consolidate(tmp_path):
     act = Activity.named("demo", root=tmp_path).ensure()
     act.app("app-1").ensure()
     assert PIPELINE.consolidate(act) == {}   # the pipeline hook delegates to tasks.consolidate
+
+
+# --- tech_vulnscan / wpprobe ---
+def test_parse_wpprobe_extracts_vulns_and_skips_version_only():
+    data = {"url": "http://wp.test", "plugins": {
+        "give": [{"version": "2.20.1", "severities": [{"critical": [{"auth_type": "Unauth",
+            "vulnerabilities": [{"cve": "CVE-2025-22777", "title": "GiveWP PHP Object Injection",
+            "cvss_score": 9.8, "cve_link": "https://x"}]}]}]}],
+        "wordpress-seo": [{"version": "27.1.1"}]}}        # detected, no known vuln → no finding
+    out = tasks.parse_wpprobe(json.dumps(data))
+    assert len(out) == 1
+    f = out[0]
+    assert (f["type"], f["kind"], f["component"], f["version"], f["severity"], f["auth"],
+            f["cve"], f["cvss"], f["target"], f["source"]) == (
+        "wordpress-plugin-vuln", "plugin", "give", "2.20.1", "critical", "Unauth",
+        "CVE-2025-22777", 9.8, "http://wp.test", "wpprobe")
+
+
+def test_parse_wpprobe_themes_sorting_and_tolerance():
+    data = {"url": "http://wp.test",
+            "plugins": {"p": [{"version": "1.0", "severities": [{"medium": [{"auth_type": "Auth",
+                "vulnerabilities": [{"cve": "CVE-M", "cvss_score": 5.0}]}]}]}]},
+            "themes": {"t": [{"version": "2.0", "severities": [{"critical": [{"auth_type": "Unauth",
+                "vulnerabilities": [{"cve": "CVE-C", "cvss_score": 9.0}]}]}]}]}}
+    out = tasks.parse_wpprobe(json.dumps(data))
+    assert [f["cve"] for f in out] == ["CVE-C", "CVE-M"]   # critical (theme) sorts before medium (plugin)
+    assert out[0]["type"] == "wordpress-theme-vuln"
+    assert tasks.parse_wpprobe("") == []
+    assert tasks.parse_wpprobe("not json") == []
+    assert tasks.parse_wpprobe('{"url":"x","plugins":{}}') == []
+
+
+def test_tech_vulnscan_gates_on_wordpress(tmp_path, monkeypatch):
+    from pipt.core import tools, workspace
+    from pipt.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    ws = act.app("app-1").ensure()
+    calls: list = []
+    monkeypatch.setattr(tasks, "_wpprobe", lambda *a: calls.append(a) or [])
+
+    workspace.write_meta(ws.meta, {"app_id": "app-1", "tech": ["nginx", "PHP"]})  # not WordPress
+    tasks.tech_vulnscan(act, "app-1")
+    assert calls == []                                    # gate: wpprobe never runs
+    assert not (ws.findings / "wpprobe.jsonl").exists()
+
+    fake = [{"type": "wordpress-plugin-vuln", "component": "give", "cve": "CVE-1",
+             "severity": "critical", "source": "wpprobe"}]
+    monkeypatch.setattr(tasks, "_wpprobe", lambda *_: fake)
+    workspace.write_meta(ws.meta, {"app_id": "app-1", "tech": ["WordPress", "PHP"]})
+    tasks.tech_vulnscan(act, "app-1")
+    assert tools.read_jsonl(ws.findings / "wpprobe.jsonl") == fake

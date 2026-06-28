@@ -76,6 +76,9 @@ class ReconPipeline:
         # CVE lookup over the EXPANDED enumeration (the phase-3 crawl grew the corpus) — OFFLINE, runs ∥
         # dast_full; reports only the delta vs the phase-2 pass (raw/cve/seen.txt).
         Stage("cve_lookup_full", tasks.cve_lookup_full, per_app=True, phase=4, net=False),
+        # finding-only per-stack vuln scanners (gated on detected tech) — runs ∥ the rest of loop 4.
+        # Today: wpprobe (WordPress plugin/theme → known-CVE) on WordPress groups → findings/wpprobe.jsonl.
+        Stage("tech_vulnscan", tasks.tech_vulnscan, per_app=True, phase=4),
     )
 
     def cluster(self, activity: Activity) -> list[str]:
