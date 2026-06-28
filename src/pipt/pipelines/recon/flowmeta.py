@@ -366,6 +366,20 @@ FLOWMETA: dict[str, StepMeta] = {
                "vede le librerie scaricate fuzzando (responses/discovered, recrawl) che la FASE 2 non aveva",
                "per-app findings → consolidate (fan-in terminale)"),
     ),
+    "tech_vulnscan": StepMeta(
+        summary="FASE 4 (findings) — scanner per-stack FINDINGS-only, gated sulla tech rilevata (il "
+                "duale di tech_enum che invece alimenta l'enum). Oggi: wpprobe (plugin/theme WordPress "
+                "→ CVE note via DB Wordfence locale) SOLO sui gruppi WordPress. ∥ al resto del loop 4.",
+        commands=(
+            "# gate: meta.tech contiene 'wordpress' (match a parola intera) · 1 scan stealthy per host (-body-dedup)",
+            "wpprobe scan -u <host> -o raw/wpprobe/scanN.json --rate-limit 20 -t 5 [-H <auth>]",
+            "# parse_wpprobe: un finding per (componente,versione,CVE) · ordinati per severità/CVSS",
+        ),
+        outputs=("findings/wpprobe.jsonl",),
+        notes=("best-effort: salta se wpprobe assente o tech ≠ wordpress · DB out-of-band (wpprobe update-db)",
+               "cap wall-clock per-host (WPPROBE_TIMEOUT) · auth passthrough (PIPT_HTTP_HEADER)",
+               "per-app findings → consolidate (fan-in terminale)"),
+    ),
 }
 
 _PIVOT = StepMeta(
@@ -383,8 +397,8 @@ _FANIN = StepMeta(
             "dast uniscono superficie (fase 2) + deep (fase 4); takeover.txt → record. nuclei_scope è "
             "già a livello activity. Il seam dell'agente (StubProvider) resta dormiente accanto.",
     outputs=("findings/cve.jsonl", "findings/dast.jsonl", "findings/tilde_enum.jsonl",
-             "findings/secrets.jsonl", "findings/takeover.jsonl", "findings/default_creds.jsonl",
-             "findings/hypotheses.jsonl"),
+             "findings/wpprobe.jsonl", "findings/secrets.jsonl", "findings/takeover.jsonl",
+             "findings/default_creds.jsonl", "findings/hypotheses.jsonl"),
 )
 
 SPEC = MapSpec(

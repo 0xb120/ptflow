@@ -162,7 +162,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       requests_full.jsonl                #   request_catalog_full (PHASE 4): + guessed surface (param_fuzz/dast_full input)
       raw/recrawl/seeds.txt              #   recrawl: new-territory seeds (PIPT_RECRAWL on=crawl [default] · preview=list only)
       params.jsonl                       #   param_fuzz: hidden params, ALL locations {url,param,loc:query|body|json|header}
-      findings/tilde_enum.jsonl  findings/dast.jsonl  findings/dast_full.jsonl  #   per-app findings (shortscan; DAST surface/deep); consolidate lifts up
+      findings/tilde_enum.jsonl  findings/dast.jsonl  findings/dast_full.jsonl  findings/wpprobe.jsonl  #   per-app findings (shortscan; DAST surface/deep; wpprobe WP CVEs); consolidate lifts up
       findings/cve.jsonl  findings/cve_full.jsonl    #   cve_lookup (PHASE 2) / cve_lookup_full (PHASE 4): known CVEs on enumerated software
       raw/cve/seen.txt                   #   cve_lookup: (product,version) covered in PHASE 2 → PHASE 4 reports only the delta
       wl_custom/seed.txt  wl_custom/round*.txt   #   per-app GENERATED wordlists (seed offline; round N = fuzzed delta)
@@ -171,7 +171,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                    #   raw/httpx/{screenshot,osint,discovered}, raw/katana/{crawl,headless},
                    #   raw/subjack/candidates.txt, raw/shortscan/rainbow*.txt,
                    #   raw/api_spec/ (spec probe+store), raw/dast/{input,input_full}.jsonl (nuclei -im jsonl input)
-  findings/cve.jsonl  findings/dast.jsonl  findings/tilde_enum.jsonl  findings/secrets.jsonl  findings/takeover.jsonl  findings/default_creds.jsonl
+  findings/cve.jsonl  findings/dast.jsonl  findings/tilde_enum.jsonl  findings/wpprobe.jsonl  findings/secrets.jsonl  findings/takeover.jsonl  findings/default_creds.jsonl
                                          #   CONSOLIDATE output — per-app findings lifted up by TYPE (each record stamped app_id;
                                          #   cve/dast fold surface+deep). nuclei_scope.jsonl is the whole-scope nuclei finding.
   findings/hypotheses.jsonl              # dormant agent fan-in output (StubProvider seam, kept in place)
@@ -311,9 +311,12 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     `dast_full`** (offline): re-mines the EXPANDED corpus (the phase-3 crawl grew it) for software and
     reports only the **delta** vs the phase-2 pass → `findings/cve_full.jsonl`. See "Request catalog &
     DAST" + "CVE lookup" below.
-  - **Loop 4 — vuln scan** (gated, planned): `tech_vulnscan` — finding-only per-stack scanners
-    (`wpprobe`, nuclei tech-tags, `nikto`, …). Specialized scanners are split between loops by output
-    role: **surface → `tech_enum`** (loop 3, feeds enum); **findings → `tech_vulnscan`** (loop 4).
+  - **Loop 4 — vuln scan** (gated): `tech_vulnscan` — finding-only per-stack scanners, gated on the
+    detected tech, run ∥ the rest of loop 4. Today: `wpprobe` (WordPress plugin/theme → known CVE via
+    its local Wordfence DB) on WordPress groups only → `findings/wpprobe.jsonl` (`consolidate` lifts it).
+    More finding-only scanners (nuclei tech-tags, `nikto`, …) dispatch here. Specialized scanners are
+    split between loops by output role: **surface → `tech_enum`** (loop 3, feeds enum); **findings →
+    `tech_vulnscan`** (loop 4).
 
 ### Fetch once, mine offline
 
@@ -449,8 +452,12 @@ scanner can be **DUAL-ROLE** and emit both; the role just decides which loop its
   race-free). The `consolidate` terminal step lifts per-app `findings/` into the activity-level
   `<activity>/findings/<type>.jsonl` (see "Consolidate" below). Best-effort dispatch keyed on detected tech
   (no-op if tech unmatched / binary absent).
-- `tech_vulnscan` (loop 4, gated, planned) runs scanners whose output is **findings-only** (`wpprobe`,
-  nuclei tech-tags, `nikto`, …).
+- `tech_vulnscan` (loop 4, gated) runs scanners whose output is **findings-only**. Today: `wpprobe`
+  (WordPress plugin/theme enumeration → known CVE via its local Wordfence DB) — dispatched ONLY when
+  the group's tech says WordPress (whole-word `_tech_match`), one stealthy scan per distinct-body host,
+  `parse_wpprobe` → one record per (component, version, CVE) → `findings/wpprobe.jsonl`. Best-effort
+  (skips if the binary is absent / tech unmatched); auth passthrough + a per-host wall-clock cap. Future:
+  nuclei tech-tags, `nikto`, ….
 
 ### Request catalog & DAST — full requests, not bare URLs (the GET-only fix)
 
@@ -637,6 +644,10 @@ its centerpiece. Open it locally in a browser; a git diff of it shows exactly ho
   override `PIPT_SEARCH_VULNS`) against its LOCAL DB. **Build/refresh the DB out-of-band:**
   `search_vulns -u` (prebuilt download) or `--full-update` (rebuild) — never during a run. The step
   skips best-effort if the binary or DB is absent. Offline once built (no target traffic).
+- **WordPress vuln scan (`tech_vulnscan` → `wpprobe`)** uses `wpprobe` (`~/go/bin/wpprobe`,
+  Chocapikk/wpprobe) against its LOCAL Wordfence DB. **Build/refresh out-of-band:** `wpprobe update-db`
+  (and `wpprobe update` for the binary) — never during a run. Runs ONLY on WordPress app groups,
+  best-effort (skips if absent). Makes target requests (stealthy REST enumeration, `--rate-limit`).
 - **Auth passthrough** — set `PIPT_HTTP_HEADER` to one or more `Name: value` session headers/cookies
   (separated by newlines or `;;`) to reach the authenticated surface; threaded into katana/httpx/nuclei
   (`-H`), arjun (`--headers`), x8 (`-H`). Set it *before* launching (like `PIPT_PROFILE`).
@@ -665,6 +676,25 @@ its centerpiece. Open it locally in a browser; a git diff of it shows exactly ho
 
 The architecture sections above say *what* the recon pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **`tech_vulnscan` is the findings-only dual of `tech_enum`, gated on detected tech; first scanner is
+  `wpprobe` for WordPress.** A per-app phase-4 stage that dispatches finding-only per-stack scanners
+  keyed on the cluster's `tech` (whole-word `_tech_match`), run ∥ the rest of loop 4. `wpprobe` (one
+  stealthy scan per distinct-body host) maps detected WP plugins/themes+versions to known CVEs via its
+  LOCAL Wordfence DB; `parse_wpprobe` emits one record per (component, version, CVE) →
+  `findings/wpprobe.jsonl`, lifted by `consolidate`. *Why phase 4 / findings-only:* it's the documented
+  split — surface-generating scanners feed enum in loop 3 (`tech_enum`), finding-only scanners run in
+  loop 4; wpprobe produces findings, not fuzz surface. *Why gate on tech, when wpprobe self-checks for
+  WordPress:* the operator asked for it scoped to WordPress groups, and the gate avoids a wasted scan +
+  GitHub self-update call on every non-WP group. *Why offline DB / out-of-band provisioning:* same as
+  `search_vulns` — `wpprobe update-db` builds the local Wordfence DB; the stage never builds it during a
+  run (best-effort skip if absent). *Why one scan per distinct-body host* (not best_host, not all): same
+  `_scan_hosts` dedup the other active scanners use — staging vs test may run different plugins. *Why a
+  per-host wall-clock cap* (`WPPROBE_TIMEOUT`): the arjun/x8/feroxbuster lesson — a slow target must not
+  hang the loop; keep partial. *Rejected:* `-f` batch over the group's hosts (its multi-site JSON shape
+  is ambiguous vs the clean single-object `-u`); bruteforce/hybrid mode (noisy on live infra — stealthy
+  REST enumeration is the polite default); emitting a finding for a detected-but-not-vulnerable plugin
+  (that's enumeration surface, not a finding — `tech_vulnscan` is findings-only).
 
 - **`consolidate` is the deterministic terminal fan-in, organized by finding TYPE — not the agent.**
   An optional `Pipeline` hook (`tasks.consolidate`, called via `getattr` like `preflight`) lifts
