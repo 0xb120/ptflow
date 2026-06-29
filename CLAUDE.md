@@ -615,22 +615,27 @@ aborting the run.
 
 ## Pipeline flow map (auto-generated, always current)
 
-`docs/pipeline-flow.html` is a self-contained, always-up-to-date map of the recon pipeline's flow —
-bands, parallelism, barriers, per-step commands and outputs, with the content-discovery fixpoint as
-its centerpiece. Open it locally in a browser; a git diff of it shows exactly how the flow changed.
+`flowmeta.main()` writes THREE self-contained, always-up-to-date views of the recon pipeline's flow.
+A git diff of any of them shows exactly how the flow changed:
+- **`docs/pipeline-flow.html`** — the detailed band "spec sheet" (bands, parallelism, barriers,
+  per-step commands/outputs/notes, with the content-discovery fixpoint as its centerpiece).
+- **`docs/pipeline-map.html`** — a conceptual **flowchart** (Mermaid) you can pan/zoom and scroll on
+  both axes; each node shows the step + its commands. Mermaid loads from a CDN (needs a connection).
+- **`docs/pipeline-map.md`** — the same flowchart as a GitHub-renderable ```mermaid block.
 
-- **Structure is derived from code, not hand-drawn.** `core/flowmap.py` (generic, pipeline-agnostic)
-  lays out the DAG from the `Stage` objects (`needs`/`phase`/`per_app`/`spanning`) via longest-path
-  layering — stages at the same dependency depth render side by side (parallel). Output is
-  deterministic (no timestamps).
+- **Structure is derived from code, not hand-drawn.** `core/flowmap.py` lays out the band spec sheet
+  via longest-path layering; `core/mermaidmap.py` emits the Mermaid flowchart (both generic,
+  pipeline-agnostic, from the `Stage` objects — `needs`/`phase`/`per_app`/`spanning`/`cluster_scope`/
+  `net` — plus the `MapSpec`). Output is deterministic (no timestamps).
 - **Per-step prose/commands/outputs live in `pipelines/recon/flowmeta.py`** (`FLOWMETA` + `SPEC`).
   This is the ONE thing you maintain by hand: **when you add or change a step, add/adjust its
   `StepMeta`.** `tests/pipelines/test_flowmap.py::test_flowmeta_covers_every_stage` fails the dev gate
-  if any `Stage` lacks a `StepMeta`, so the map can't silently drift.
-- **A hook regenerates it automatically.** `.claude/settings.json` runs `.claude/hooks/regen-flowmap.sh`
+  if any `Stage` lacks a `StepMeta`, so the maps can't silently drift.
+- **A hook regenerates them automatically.** `.claude/settings.json` runs `.claude/hooks/regen-flowmap.sh`
   (PostToolUse · Edit/Write/MultiEdit) which re-runs the generator whenever a file under
-  `src/pipt/pipelines/` changes. Regenerate by hand any time with:
-  `uv run python -m pipt.pipelines.recon.flowmeta`.
+  `src/pipt/pipelines/` changes (where commands and execution order live). Regenerate by hand any time
+  with: `uv run python -m pipt.pipelines.recon.flowmeta`. (Edits to the generators themselves in
+  `core/` aren't watched by the hook — regenerate manually after those.)
 
 ## Recon environment gotchas
 
