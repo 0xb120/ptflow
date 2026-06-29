@@ -1,4 +1,4 @@
-from pipt.core import flowmap
+from pipt.core import flowmap, mermaidmap
 from pipt.pipelines.recon import flowmeta
 from pipt.pipelines.recon.pipeline import PIPELINE
 
@@ -44,3 +44,38 @@ def test_main_writes_file(tmp_path):
     text = dest.read_text(encoding="utf-8")
     assert "content_discovery" in text
     assert "pipt · pipeline recon" in text
+
+
+def test_main_also_writes_concept_maps(tmp_path):
+    """The regen hook keeps all three artifacts in sync — main() writes the concept maps beside
+    pipeline-flow.html so a command/order change regenerates them too."""
+    dest = tmp_path / "map.html"
+    flowmeta.main(str(dest))
+    assert (tmp_path / "pipeline-map.html").exists()
+    assert (tmp_path / "pipeline-map.md").exists()
+
+
+def test_mermaid_graph_has_every_stage_and_structure():
+    graph = mermaidmap.mermaid_graph(PIPELINE.stages, flowmeta.SPEC)
+    for s in PIPELINE.stages:
+        assert s.name in graph, s.name
+    # structural nodes + a barrier between the per-app loops, derived from the Stage objects
+    assert "CLUSTER" in graph
+    assert "FANIN" in graph
+    assert "BARRIERA" in graph
+    assert graph.startswith("flowchart TD")
+
+
+def test_mermaid_markdown_avoids_html_tags_in_labels():
+    """The Markdown flavour renders on GitHub's stricter Mermaid, so node labels use <br> only —
+    no <b>/<code>/<span> (which would show as raw tags)."""
+    md = mermaidmap.render_markdown(PIPELINE.stages, flowmeta.SPEC)
+    assert "```mermaid" in md
+    assert "<code>" not in md
+    assert "<b>" not in md
+
+
+def test_mermaid_render_is_deterministic():
+    a = mermaidmap.render_html(PIPELINE.stages, flowmeta.SPEC)
+    b = mermaidmap.render_html(PIPELINE.stages, flowmeta.SPEC)
+    assert a == b

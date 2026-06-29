@@ -18,6 +18,7 @@ from pathlib import Path
 
 from pipt.core.flowmap import MapSpec, StepMeta, render
 from pipt.core.log import get_logger
+from pipt.core.mermaidmap import render_html, render_markdown
 from pipt.pipelines.recon.pipeline import PIPELINE
 
 log = get_logger()
@@ -418,11 +419,16 @@ _DEFAULT_OUT = Path(__file__).resolve().parents[4] / "docs" / "pipeline-flow.htm
 
 
 def main(out: str | None = None) -> None:
-    """Render the recon flow map to `out` (default docs/pipeline-flow.html). Deterministic."""
+    """Render the recon flow artifacts (all deterministic) into the docs dir of `out`:
+    `pipeline-flow.html` (the detailed band spec sheet — `out` itself, default that path) plus the
+    code-derived companions `pipeline-map.html` (pan/zoom flowchart) and `pipeline-map.md`."""
     dest = Path(out) if out else _DEFAULT_OUT
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    docs = dest.parent
+    docs.mkdir(parents=True, exist_ok=True)
     dest.write_text(render(PIPELINE.stages, SPEC), encoding="utf-8")
-    log.info("flow map → %s (%d stages)", dest, len(PIPELINE.stages))
+    (docs / "pipeline-map.html").write_text(render_html(PIPELINE.stages, SPEC), encoding="utf-8")
+    (docs / "pipeline-map.md").write_text(render_markdown(PIPELINE.stages, SPEC), encoding="utf-8")
+    log.info("flow map + concept map → %s (%d stages)", docs, len(PIPELINE.stages))
 
 
 if __name__ == "__main__":
