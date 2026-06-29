@@ -483,6 +483,12 @@ artifacts so write-once holds and each DAST pass reads exactly its scope.
   `requests.jsonl`, scheme-normalized (`_working_schemes`, incl. the http fallback) + in-scope-filtered,
   deduped by request shape (`request_key` = method + `path_template`; `merge_requests` unions
   params/sources). The `raw` is scheme-agnostic (path + Host), so only the `url` field is re-schemed.
+  **Dead-endpoint drop:** GET shapes whose path the corpus only ever saw as **404/410** (`dead_url_keys`
+  over the `-srd` index statuses — offline, no new traffic) are removed, so DAST/param_fuzz don't burn
+  payloads on malformed passive/archive URLs (`/about</a>`, `/)`) or phantom JS routes (`/catalog/filter`
+  → 404). GET-only + body-less: a discovered POST/form/XHR/JSON shape (its status never recorded) is
+  always kept. A path is dead only if EVERY observation was 404/410 — one 2xx/3xx (or 401/403/405 =
+  exists) keeps it, so a parameterized endpoint that 404s for the crawled value but 200s for another stays.
 - **`request_catalog_full`** (phase 4, offline, net=False) re-runs that assembly with the guessed surface
   folded in (`requests_recrawl.jsonl` + content_discovery 2xx + the re-extracted fuzz corpus, incl.
   feroxbuster-found shapes) → `requests_full.jsonl`. It reads phase-1 + phase-3 artifacts across the
@@ -520,6 +526,12 @@ topped up from the query set (cap `PARAM_MAX_BODY_ENDPOINTS`); HEADER over a sma
 arjun has no header mode; cap `PARAM_MAX_HEADER_ENDPOINTS`). The flat `(tool, location)` matrix runs in a
 bounded pool (`PARAM_FANOUT`), each best-effort under the per-tool wall-clock cap. Politeness: low
 `-t`/`-W`/`-c`, `--rate-limit`/`-d`, `--one-worker-per-host`. Wordlist = `params` role, custom-first.
+A param reflection-discovered on **≥`PARAM_GLOBAL_RATIO` (75%) of the endpoints tested at its location**
+(and on ≥`PARAM_GLOBAL_MIN_HITS`) is a **site-wide reflection artifact**, not N hidden params —
+`collapse_global_params` folds it to ONE host-level record (`scope:"site-wide"`) so `build_fuzz_requests`
+doesn't spray a fuzz request onto every endpoint (and DAST doesn't re-fire the same low-value hit per
+endpoint). Verified: ginandjuice echoes `?category=` into a `Set-Cookie` header on every path, so x8
+flagged `category` on all 50 query endpoints → now one record. Endpoint-specific params are untouched.
 
 **DAST runs in two passes** (shared `_run_dast`), both **`nuclei -dast -im jsonl`** fuzzing
 query/path/header/cookie/**body** per template `part`, `-fa low` for live-infra politeness, best-effort
@@ -531,6 +543,14 @@ query/path/header/cookie/**body** per template `part`, `-fa low` for live-infra 
   `requests.jsonl`, keyed by `request_key`) + `build_fuzz_requests` (the discovered hidden params
   injected into concrete requests per location) → `findings/dast_full.jsonl` (input
   `raw/dast/input_full.jsonl`). It does NOT re-DAST the surface phase 2 already covered.
+
+Both passes **dedup their findings by INJECTION POINT** (`dedup_dast_findings`) before writing — one
+record per `(template-id, host, path, fuzzing_position, fuzzing_method)` (path WITHOUT the query, since
+the payload lives there). nuclei emits one hit per fuzzed request, so a template that fires across many
+synthesized variants of the same endpoint (the param-sprayed catalog, http+https of one host) would
+otherwise count as N findings for ONE issue. Per-pass dedup suffices: `dast_full` fuzzes only the
+`request_key`-disjoint delta, so the same injection point can't recur across the two passes. Non-fuzzing
+records key on `(template-id, matched-at)` so unrelated hits never merge.
 
 Whole-scope full-template nuclei stays `nuclei_scope` (breadth, ∥ everything); these are the per-app
 fuzzing passes. Per-app findings → `consolidate` (terminal fan-in) lifts them. arjun/x8/api_spec provenance in
@@ -681,6 +701,70 @@ A git diff of any of them shows exactly how the flow changed:
 
 The architecture sections above say *what* the recon pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **A param "found" on ~every tested endpoint is collapsed as a SITE-WIDE reflection, not sprayed.**
+  Run-analysis traced the phase-4 `?category=`-on-everything spray to its source: `param_fuzz` reported
+  `category` on exactly 50 endpoints (= `PARAM_MAX_ENDPOINTS`, *all* selected), all from **x8** with
+  `reason:"Reflected"`. The cause is a REAL global target behavior — ginandjuice echoes `?category=`
+  into a `Set-Cookie` header on **every** path (verified by canary: `/about?category=X` →
+  `set-cookie: category=X`; the value does NOT hit the body, so it's a header reflection; unknown random
+  params do NOT echo, so it's specific to the app's real param). Reflection-based discovery (x8) sees the
+  echo everywhere → flags the param on all tested endpoints → `build_fuzz_requests` synthesizes one
+  request per endpoint → DAST re-fires `cookie-injection`/`crlf-injection` per request. ONE issue,
+  multiplied. `collapse_global_params` folds a `(param, loc)` found on ≥75% of the endpoints tested at
+  that location (and ≥5 hits) into one host-level record (`scope:"site-wide"`). *Why at param_fuzz, not
+  DAST:* fixing it at the source cuts the synthesized-request explosion AND the downstream DAST
+  inflation — the DAST injection-point dedup is the safety net, this is the cure. *Why 75% + a min-hits
+  floor:* a real hidden param is endpoint-specific (productId on 2, searchTerm on 3); only an artifact
+  approaches "all". The min-hits floor stops a tiny tested set (3/3) from tripping the ratio. *Why keep
+  one record (not drop entirely):* it IS a real low-sev finding (cookie/header injection) — worth one
+  host-level note, just not 50. *Verified:* ginandjuice params 65→16 (category 50→1), zero 14→3 (a
+  mojibake noise param on 12/15 header endpoints collapsed), vulnweb 45→45 (all endpoint-specific —
+  untouched, no over-collapse). *Rejected:* dropping the param outright (loses a real finding); a
+  per-param allowlist (brittle); keying on response-similarity instead of the hit-ratio (heavier, and
+  the ratio is already a clean signal). *Open:* x8's reflection detector itself could suppress this with
+  better calibration — out of our control; the collapse is the pragmatic guard.
+
+- **DAST findings are deduped by INJECTION POINT, not emitted one-per-fuzzed-request.** A run-analysis
+  showed `findings/dast.jsonl` reporting 80 hits that were really 2 templates (`cookie-injection` info +
+  `crlf-injection` low) re-firing across many synthesized variants of the same endpoints. `nuclei -dast`
+  emits one record per fuzzed request, so the param-sprayed catalog (and http+https of one host)
+  multiplies one issue into a pile. `dedup_dast_findings` keeps one record per
+  `(template-id, host, path, fuzzing_position, fuzzing_method)` — path WITHOUT the query (the payload is
+  in it), first full record wins (keeps a concrete `matched-at`). *Why per-pass (in `_run_dast`) not in
+  `consolidate`:* `dast_full` fuzzes only the `request_key`-disjoint delta, so a given injection point
+  appears in exactly one pass — per-pass dedup is complete, and `consolidate` just concatenates. *Why
+  not key on the param NAME:* nuclei v3.8 exposes `fuzzing_position` but not the fuzzed param name as a
+  field, and parsing it out of `matched-at` is payload-/position-specific and fragile; `(host, path,
+  position)` is the robust injection-point identity. *Why not drop the path (collapse a template to one
+  per host):* that over-merges real per-endpoint bugs (SQLi on `/catalog/product` ≠ on `/blog/post`) —
+  precision over a smaller count. *Result with the dead-drop:* ginandjuice dast_full 80 → 18 on a fresh
+  run. The surviving cookie/crlf are low-value reflections; **hard-suppressing those info/low templates
+  is a SEPARATE opt-in lever, deliberately not done here** (dedup ≠ severity policy). *Rejected:*
+  emitting raw nuclei output (the misleading 82); a severity/template allowlist baked into the dedup
+  (conflates two concerns).
+
+- **The request catalog drops dead (404/410) GET endpoints, decided OFFLINE from the `-srd` index
+  statuses.** A run-analysis showed ~20–60% of a catalog was malformed passive/archive URLs
+  (`/about</a>`, `/)`, gau Wayback junk) and phantom JS routes (`/catalog/filter` → 404) that DAST then
+  fuzzed for nothing — and the only "findings" were `cookie-injection`/`crlf-injection` reflections
+  firing on those 404 pages. `dead_url_keys` reads the status already recorded in every katana/httpx
+  `-srd` index line (`<file> <url> (<code> <reason>)`) and drops GET shapes whose path was seen ONLY as
+  404/410. *Why offline:* the statuses are already on disk from the crawl/fetch_delta/content_discovery
+  downloads — so `request_catalog`/`request_catalog_full` stay `net=False` (no probe, no invariant
+  change). *Why GET-only + body-less:* we only ever recorded GET statuses (gau/katana/ferox are GET); a
+  discovered POST/form/XHR/JSON shape has no recorded status, so dropping it on a GET 404 could kill a
+  real endpoint — keep all non-GET. *Why "only-ever-404" not "any-404":* a parameterized endpoint can
+  404 for the crawled value yet 200 for another (`/catalog/product?productId=3` 200, bare 404), so one
+  non-dead observation (2xx/3xx, or 401/403/405 = exists) keeps the path — precision over recall.
+  *Verified:* on the analyzed run it dropped 51 (ginandjuice), 13 (testaspnet), 263 (zero — a parked
+  44-byte page whose 413-URL catalog was almost all stale passive 404s) while keeping `/catalog`,
+  `/catalog/product`, `/blog/post`. *Coverage caveat:* a catalog URL never fetched (no index entry) has
+  unknown status and is kept — an active liveness probe would close that, but it'd add traffic and break
+  the offline invariant, so it's deferred. *Rejected:* keying on the full URL incl. query (the phase-4
+  `?category=`-sprayed variants never exactly match the fetched value → garbage survives); an httpx
+  liveness probe at catalog time (network + invariant break); syntactic-only garbage filtering (misses
+  well-formed-but-dead URLs like `/ads.txt`, and the user's criterion is the 404 itself).
 
 - **`tech_vulnscan` is the findings-only dual of `tech_enum`, gated on detected tech; first scanner is
   `wpprobe` for WordPress.** A per-app phase-4 stage that dispatches finding-only per-stack scanners

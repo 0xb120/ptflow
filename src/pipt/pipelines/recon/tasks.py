@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qsl, unquote_plus, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urljoin, urlsplit
 
 from pipt.core import scope, tools, workspace
 from pipt.core.log import get_logger, is_verbose
@@ -209,6 +209,11 @@ PARAM_MAX_ENDPOINTS = 50   # cap distinct endpoint shapes fuzzed per app (logged
 PARAM_MAX_BODY_ENDPOINTS = 25    # body + json discovery cap (POST/PUT/PATCH or body-bearing endpoints)
 PARAM_MAX_HEADER_ENDPOINTS = 15  # header discovery cap (x8 only — arjun has no header-discovery mode)
 PARAM_FANOUT = 3                 # concurrent (tool, location) param jobs per app
+# a param reflection-discovered on ~EVERY tested endpoint for its location is a SITE-WIDE reflection
+# artifact (e.g. a target that echoes any `?p=` into a Set-Cookie on every path), not N distinct hidden
+# params — collapse it to one host-level record instead of spraying a fuzz request onto each endpoint.
+PARAM_GLOBAL_RATIO = 0.75   # found on ≥ this fraction of the endpoints tested at a location → collapse
+PARAM_GLOBAL_MIN_HITS = 5   # …but only above this many hits, so a tiny tested set can't trip the ratio
 
 # per-app DAST (PHASE 2 surface + PHASE 4 deep) — nuclei -dast over the request catalog (full requests
 # → fuzz query/path/header/cookie/body, not just GET query). Phase 2 hits the explorable surface
@@ -2489,6 +2494,39 @@ def _all_store_indices(ws: AppWorkspace) -> list[Path]:
     return sorted(ws.responses.rglob("index.txt"))
 
 
+_DEAD_STATUS = frozenset({404, 410})           # Not Found / Gone → confirmed-dead endpoint
+_STORE_STATUS_RE = re.compile(r"\((\d{3})\b")  # the '(<code> <reason>)' suffix of a -srd index line
+
+
+def _url_pathkey(url: str) -> str:
+    """host + path, scheme/port/query/fragment stripped and percent-encoding NORMALIZED (unquote) — the
+    key for per-endpoint status lookup (404-ness is a property of the path, not of the scheme, the query
+    values, or whether the path was written `/about</a>` or `/about%3C/a%3E`). Normalizing matters
+    because the -srd index stores the decoded form while the catalog often carries the encoded one."""
+    rest = url.split("://", 1)[-1].split("#", 1)[0].split("?", 1)[0]
+    host, _, path = rest.partition("/")
+    return f"{host.split(':', 1)[0]}/{unquote(path)}"
+
+
+def dead_url_keys(index_lines: Iterable[str]) -> set[str]:
+    """Host+path keys (`_url_pathkey`) seen in the -srd store indices ONLY as 404/410 — confirmed-dead
+    endpoints. Index lines are '<file> <url> (<status> <reason>)'. A path with ANY non-dead observation
+    (2xx/3xx, or 401/403/405 = exists-but-protected) is alive and kept; only paths whose every recorded
+    fetch was 404/410 are returned. Pure — feeds the catalog's dead-endpoint drop so DAST/param-fuzz
+    don't waste payloads on URLs that 404 (malformed passive/archive URLs, phantom JS routes)."""
+    alive: dict[str, bool] = {}
+    for ln in index_lines:
+        parts = ln.split()
+        if len(parts) < 3:                                  # need file, url, (status …)  # noqa: PLR2004
+            continue
+        m = _STORE_STATUS_RE.search(" ".join(parts[2:]))
+        if not m:
+            continue
+        key = _url_pathkey(parts[1])
+        alive[key] = alive.get(key, False) or int(m.group(1)) not in _DEAD_STATUS
+    return {k for k, ok in alive.items() if not ok}
+
+
 def _jsonl_str(out: str) -> list[dict]:
     """Parse NDJSON from a command's stdout (jsluice), skipping unparseable lines."""
     recs: list[dict] = []
@@ -3216,6 +3254,36 @@ def merge_params(records: list[dict]) -> list[dict]:
     return list(by_key.values())
 
 
+def collapse_global_params(records: list[dict], tested: Mapping[str, int], *,
+                           ratio: float = PARAM_GLOBAL_RATIO,
+                           min_hits: int = PARAM_GLOBAL_MIN_HITS) -> list[dict]:
+    """Collapse a param that x8/arjun report on ~EVERY tested endpoint for its location into ONE
+    host-level record — a site-wide reflection artifact, not N distinct injection points. A target that
+    reflects an arbitrary param into a response element present everywhere (verified: ginandjuice echoes
+    `?category=` into a `Set-Cookie` on every path) makes reflection-based discovery flag that param on
+    all `tested[loc]` endpoints; build_fuzz_requests would then spray a fuzz request onto each and DAST
+    would re-fire the same low-value finding per endpoint. When a (param, loc) is found on ≥ `ratio` of
+    the endpoints TESTED at that location AND on ≥ `min_hits` of them (so a tiny tested set can't trip
+    the ratio), its records collapse to the FIRST one, marked {"scope": "site-wide", "endpoints": N}.
+    Endpoint-specific params (the real hidden ones) are untouched. Order-preserving, pure.
+
+    Operates on merge_params' output (already deduped by (url, param, loc)), so the per-(param, loc)
+    record count IS the distinct-endpoint hit count."""
+    hits: Counter[tuple] = Counter((r.get("param"), r.get("loc")) for r in records)
+    glob_keys = {k for k, c in hits.items()
+                 if (d := tested.get(k[1] or "query", 0)) and c >= min_hits and c / d >= ratio}
+    out: list[dict] = []
+    emitted: set[tuple] = set()
+    for r in records:
+        k = (r.get("param"), r.get("loc"))
+        if k not in glob_keys:
+            out.append(r)
+        elif k not in emitted:
+            emitted.add(k)
+            out.append({**r, "scope": "site-wide", "endpoints": hits[k]})
+    return out
+
+
 def merge_params_wordlist(custom: list[str], glob: list[str]) -> list[str]:
     """The arjun/x8 wordlist: per-app custom param candidates FIRST, then the global params role,
     deduped (custom-first preserved). Pure."""
@@ -3369,9 +3437,10 @@ def recrawl(activity: Activity, app_id: str) -> None:
              app_id, len(seeds), n)
 
 
-def _assemble_catalog(ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[dict], int]:
-    """Assemble a per-app request catalog → (catalog records, count mined from corpus). Pure-ish (reads
-    disk only). Three contributions, all deduped by request shape (`merge_requests`):
+def _assemble_catalog(ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[dict], int, int]:
+    """Assemble a per-app request catalog → (catalog records, count mined from corpus, count dropped as
+    dead/404). Pure-ish (reads disk only). Three contributions, all deduped by request shape
+    (`merge_requests`):
     1. the crawl/headless/API-spec request records (method/body/forms/xhr/spec);
     2. SHAPES MINED from the downloaded corpus — `jsluice_requests` (fetch/XHR method+body, the JS API
        surface) + `html_form_requests` (POST/GET forms, incl. the UNLINKED pages feroxbuster found —
@@ -3385,7 +3454,11 @@ def _assemble_catalog(ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[
     the fuzz-downloaded corpus, which only exists once content_discovery/recrawl have run): False builds
     the EXPLORABLE-surface catalog (phase 1, requests.jsonl), True the full catalog (phase 4,
     requests_full.jsonl). The corpus mining scales with what's on disk — the gate just keeps the surface
-    catalog stable even on a --resume rerun after the guessed artifacts already exist."""
+    catalog stable even on a --resume rerun after the guessed artifacts already exist.
+
+    Finally, GET shapes whose endpoint the corpus only ever saw as 404/410 are dropped (`dead_url_keys`)
+    — malformed passive/archive URLs and phantom JS routes that would just burn DAST/param-fuzz payloads.
+    GET-only + body-less: a discovered POST/form/XHR/JSON shape (status never recorded) is always kept."""
     in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
     schemes = _working_schemes(ws)
     # mine request SHAPES from the already-downloaded corpus (idempotent extract → ensure it's present)
@@ -3405,7 +3478,12 @@ def _assemble_catalog(ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[
         request_recs += tools.read_jsonl(ws.canonical("requests_recrawl.jsonl"))  # re-seed crawl (if on)
         get_urls += [r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
                      if r.get("url") and 200 <= (r.get("status") or 0) < 300]  # noqa: PLR2004
-    return catalog_records(request_recs, get_urls, in_scope, schemes), len(mined)
+    catalog = catalog_records(request_recs, get_urls, in_scope, schemes)
+    dead = dead_url_keys(ln for idx in _all_store_indices(ws) for ln in tools.read_lines(idx))
+    kept = [r for r in catalog
+            if not (r.get("method", "GET").upper() == "GET" and not r.get("body")
+                    and _url_pathkey(r.get("url") or "") in dead)]
+    return kept, len(mined), len(catalog) - len(kept)
 
 
 def request_catalog(activity: Activity, app_id: str) -> None:
@@ -3417,11 +3495,11 @@ def request_catalog(activity: Activity, app_id: str) -> None:
     Offline (net=False); needs crawl_headless/mine_responses/api_spec so the records + extracted corpus
     are present. A bare URL list can only fuzz GET query — this catalog is what unlocks POST/JSON/body."""
     ws = activity.app(app_id)
-    catalog, n_mined = _assemble_catalog(ws, include_guessed=False)
+    catalog, n_mined, n_dead = _assemble_catalog(ws, include_guessed=False)
     n = tools.write_jsonl(ws.canonical("requests.jsonl"), catalog)
     methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
-    log.info("  → request_catalog (%s) — %d surface request shape(s) [%s] (mined %d from corpus) → requests.jsonl",
-             app_id, n, methods, n_mined)
+    log.info("  → request_catalog (%s) — %d surface request shape(s) [%s] (mined %d from corpus,"
+             " dropped %d dead/404) → requests.jsonl", app_id, n, methods, n_mined, n_dead)
 
 
 def request_catalog_full(activity: Activity, app_id: str) -> None:
@@ -3432,11 +3510,11 @@ def request_catalog_full(activity: Activity, app_id: str) -> None:
     responses/recrawl/ — re-extracted idempotently). Offline (net=False); reads phase-1 + phase-3
     artifacts across the barriers, so it sees the COMPLETE corpus. Feeds param_fuzz + dast_full."""
     ws = activity.app(app_id)
-    catalog, n_mined = _assemble_catalog(ws, include_guessed=True)
+    catalog, n_mined, n_dead = _assemble_catalog(ws, include_guessed=True)
     n = tools.write_jsonl(ws.canonical("requests_full.jsonl"), catalog)
     methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
-    log.info("  → request_catalog_full (%s) — %d request shape(s) [%s] (mined %d from corpus) → requests_full.jsonl",
-             app_id, n, methods, n_mined)
+    log.info("  → request_catalog_full (%s) — %d request shape(s) [%s] (mined %d from corpus,"
+             " dropped %d dead/404) → requests_full.jsonl", app_id, n, methods, n_mined, n_dead)
 
 
 def param_fuzz(activity: Activity, app_id: str) -> None:
@@ -3487,11 +3565,14 @@ def param_fuzz(activity: Activity, app_id: str) -> None:
             futs.append(pool.submit(_run_x8, tf, ws.raw("x8") / f"{loc}.json", params_wl, app_id, mode=loc))
         for fut in futs:
             records += fut.result()
-    params = merge_params(records)
+    merged = merge_params(records)
+    params = collapse_global_params(merged, {loc: len(t) for loc, t in jobs})
     n = tools.write_jsonl(ws.canonical("params.jsonl"), params)
     by_loc = " ".join(f"{loc}:{c}" for loc, c in sorted(Counter(p.get("loc") for p in params).items()))
-    log.info("    param_fuzz (%s) → %d param(s) on %d endpoint(s) [%s] → params.jsonl",
-             app_id, n, len({p["url"] for p in params}), by_loc)
+    n_global = sum(1 for p in params if p.get("scope") == "site-wide")
+    collapsed = f", {n_global} site-wide collapsed" if n_global else ""
+    log.info("    param_fuzz (%s) → %d param(s) on %d endpoint(s) [%s]%s → params.jsonl",
+             app_id, n, len({p["url"] for p in params}), by_loc, collapsed)
 
 
 # --- DAST (PHASE 2 surface + PHASE 4 deep) — nuclei -dast over the request catalog --------------
@@ -3542,6 +3623,32 @@ def dast_requests(catalog: Iterable[dict], params: Iterable[dict], *, cap: int) 
     return merged
 
 
+def dedup_dast_findings(records: Iterable[dict]) -> list[dict]:
+    """Collapse nuclei -dast findings to one record per distinct INJECTION POINT. nuclei emits one hit
+    per fuzzed request, so a template that fires on many synthesized variants of the same endpoint (the
+    param-sprayed catalog, http+https of one host, …) yields a pile of records for ONE issue — that's
+    what inflated the count. A fuzzing hit is keyed by (template, host, path, fuzz position, method): the
+    payload lives in the query/body so the path is taken WITHOUT it. Non-fuzzing hits key on
+    (template, matched-at) so unrelated findings are never merged. First full record per key wins
+    (its matched-at keeps a concrete example); order-preserving, pure."""
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for r in records:
+        tid = r.get("template-id") or r.get("template_id") or ""
+        at = r.get("matched-at") or r.get("matched_at") or r.get("url") or ""
+        if r.get("is_fuzzing_result"):
+            sp = urlsplit(at)
+            key: tuple = (tid, sp.netloc, sp.path, r.get("fuzzing_position") or "",
+                          r.get("fuzzing_method") or "")
+        else:
+            key = (tid, at)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 def _run_dast(ws: AppWorkspace, requests_: list[dict], *, input_name: str, out_name: str,
               label: str) -> None:
     """Run nuclei -dast over a prepared request set → findings/<out_name>. Shared by dast (phase-2
@@ -3568,8 +3675,11 @@ def _run_dast(ws: AppWorkspace, requests_: list[dict], *, input_name: str, out_n
            "-fa", DAST_AGGRESSION, "-rl", NUCLEI_RL, "-c", NUCLEI_CONC, "-timeout", NUCLEI_TIMEOUT,
            "-retries", NUCLEI_RETRIES, "-j", "-silent", "-duc", *_header_flags("-H")]
     out = tools.run(cmd, stream_stderr=is_verbose())
-    n = tools.write_jsonl(ws.findings / out_name, _jsonl_str(out))
-    log.info("    %s (%s) → %d finding(s) → findings/%s", stage, label, n, out_name)
+    findings = _jsonl_str(out)
+    deduped = dedup_dast_findings(findings)
+    n = tools.write_jsonl(ws.findings / out_name, deduped)
+    extra = f" (deduped from {len(findings)})" if len(findings) != n else ""
+    log.info("    %s (%s) → %d finding(s)%s → findings/%s", stage, label, n, extra, out_name)
 
 
 def dast(activity: Activity, app_id: str) -> None:

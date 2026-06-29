@@ -1134,6 +1134,54 @@ def test_catalog_records_folds_urls_reschemes_and_filters_scope():
     assert all("evil" not in u for u in urls)  # out-of-scope dropped
 
 
+def test_url_pathkey_strips_scheme_port_query_fragment():
+    assert tasks._url_pathkey("https://a.com:443/x/y?q=1#f") == "a.com/x/y"
+    assert tasks._url_pathkey("http://a.com/x/y?q=1") == "a.com/x/y"
+    assert tasks._url_pathkey("https://a.com") == "a.com/"            # root → host + '/'
+    assert tasks._url_pathkey("https://a.com/about</a>") == "a.com/about</a>"  # garbage path preserved
+    # percent-encoding normalized so the encoded catalog form matches the decoded index form
+    assert tasks._url_pathkey("https://a.com/about%3C/a%3E") == tasks._url_pathkey("https://a.com/about</a>")
+
+
+def test_dead_url_keys_only_paths_seen_exclusively_as_404():
+    lines = [
+        "/store/f1.txt https://a.com/live (200 OK)",
+        "/store/f2.txt https://a.com/gone (404 Not Found)",
+        "/store/f3.txt https://a.com/gone (410 Gone)",          # still only-dead
+        "/store/f4.txt https://a.com/sometimes (404 Not Found)",
+        "/store/f5.txt https://a.com/sometimes?x=1 (200 OK)",   # one 200 on the path → alive
+        "/store/f6.txt https://a.com/protected (403 Forbidden)",  # exists → alive (not 404/410)
+        "malformed line without status",
+    ]
+    assert tasks.dead_url_keys(lines) == {"a.com/gone"}        # only the exclusively-404/410 path
+
+
+def test_assemble_catalog_drops_dead_get_keeps_post(tmp_path):
+    from pipt.core.paths import AppWorkspace
+
+    ws = AppWorkspace(tmp_path / "app").ensure()
+    ws.responses.mkdir(parents=True, exist_ok=True)
+    ws.hosts.write_text("https://a.com\n")
+    (ws.responses / "index.txt").write_text(
+        "/s/1 https://a.com/dead (404 Not Found)\n"
+        "/s/2 https://a.com/login (200 OK)\n")
+    # crawl records: a dead GET, an alive GET, and a POST whose path was only seen as 404
+    ws.canonical("requests_crawl.jsonl").write_text("\n".join([
+        json.dumps({"method": "GET", "url": "https://a.com/dead",
+                    "raw": "GET /dead HTTP/1.1\r\nHost: a.com\r\n\r\n", "sources": ["katana"]}),
+        json.dumps({"method": "GET", "url": "https://a.com/login",
+                    "raw": "GET /login HTTP/1.1\r\nHost: a.com\r\n\r\n", "sources": ["katana"]}),
+        json.dumps({"method": "POST", "url": "https://a.com/dead", "body": "u=1",
+                    "raw": "POST /dead HTTP/1.1\r\nHost: a.com\r\n\r\nu=1", "sources": ["katana"]}),
+    ]) + "\n")
+    catalog, _mined, n_dead = tasks._assemble_catalog(ws, include_guessed=False)
+    shapes = {(r["method"], tasks._url_pathkey(r["url"])) for r in catalog}
+    assert ("GET", "a.com/dead") not in shapes        # dead GET dropped
+    assert ("GET", "a.com/login") in shapes           # alive GET kept
+    assert ("POST", "a.com/dead") in shapes           # body-bearing POST kept despite dead path
+    assert n_dead == 1
+
+
 def test_select_body_targets_splits_json_and_urlencoded_and_dedups():
     catalog = [
         {"method": "POST", "url": "https://a/login",
@@ -1170,6 +1218,32 @@ def test_merge_params_keeps_locations_distinct():
     assert q["reason"] == "refl"
 
 
+def test_collapse_global_params_collapses_site_wide_reflection():
+    # 'category' found on 8/8 query endpoints (≥75%, ≥5 hits) → site-wide reflection, collapse to 1
+    recs = [{"url": f"https://a/p{i}", "param": "category", "loc": "query",
+             "method": "GET", "sources": ["x8"], "reason": "Reflected"} for i in range(8)]
+    # 'productId' on 2 endpoints (endpoint-specific) → untouched
+    recs += [{"url": f"https://a/item{i}", "param": "productId", "loc": "query",
+              "method": "GET", "sources": ["x8"], "reason": "Text"} for i in range(2)]
+    out = tasks.collapse_global_params(recs, {"query": 8})
+    cats = [r for r in out if r["param"] == "category"]
+    pids = [r for r in out if r["param"] == "productId"]
+    assert len(cats) == 1                            # 8 → 1 site-wide record
+    assert cats[0]["scope"] == "site-wide"
+    assert cats[0]["endpoints"] == 8
+    assert len(pids) == 2                            # endpoint-specific kept…
+    assert all("scope" not in r for r in pids)       # …and not marked site-wide
+
+
+def test_collapse_global_params_min_hits_guards_tiny_tested_set():
+    # 3/3 = 100% ratio but below min_hits → NOT collapsed (a tiny tested set must not trip it)
+    recs = [{"url": f"https://a/p{i}", "param": "q", "loc": "query",
+             "method": "GET", "sources": ["x8"], "reason": "Reflected"} for i in range(3)]
+    out = tasks.collapse_global_params(recs, {"query": 3})
+    assert len(out) == 3
+    assert all("scope" not in r for r in out)
+
+
 # --- DAST (nuclei -dast over the request catalog) ---
 def test_build_fuzz_requests_injects_params_per_location():
     params = [
@@ -1203,6 +1277,27 @@ def test_dast_requests_merges_catalog_and_synth_then_caps():
     assert any("hidden" in u and "secret=" in u for u in urls)   # discovered hidden param injected
     many = [{"url": f"https://a/p{i}", "param": "x", "loc": "query"} for i in range(20)]
     assert len(tasks.dast_requests([], many, cap=5)) == 5         # cap bites
+
+
+def test_dedup_dast_findings_collapses_same_injection_point():
+    def fz(tid, at, pos="query"):
+        return {"template-id": tid, "matched-at": at, "is_fuzzing_result": True,
+                "fuzzing_position": pos, "fuzzing_method": "GET"}
+    recs = [
+        fz("cookie-injection", "https://a/x?category=cookie_injection"),
+        fz("cookie-injection", "https://a/x?category=&err=cookie_injection"),  # same path+pos → dup
+        fz("cookie-injection", "https://a/y?category=cookie_injection"),       # diff path → kept
+        fz("sqli", "https://a/x?id=1'", pos="query"),                          # diff template → kept
+        fz("cookie-injection", "https://a/x?h=1", pos="header"),               # diff position → kept
+        {"template-id": "tech-detect", "matched-at": "https://a/", "is_fuzzing_result": False},
+        {"template-id": "tech-detect", "matched-at": "https://a/", "is_fuzzing_result": False},  # dup
+    ]
+    out = tasks.dedup_dast_findings(recs)
+    keys = [(r["template-id"], r["matched-at"]) for r in out]
+    assert len(out) == 5                                          # 7 → 5 (two collapsed)
+    assert keys[0] == ("cookie-injection", "https://a/x?category=cookie_injection")  # first wins
+    assert ("cookie-injection", "https://a/y?category=cookie_injection") in keys     # distinct path
+    assert sum(1 for r in out if r["template-id"] == "tech-detect") == 1             # non-fuzz deduped
 
 
 # --- API spec discovery (OpenAPI/Swagger expansion) ---
