@@ -163,6 +163,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       raw/recrawl/seeds.txt              #   recrawl: new-territory seeds (PIPT_RECRAWL on=crawl [default] · preview=list only)
       params.jsonl                       #   param_fuzz: hidden params, ALL locations {url,param,loc:query|body|json|header}
       findings/tilde_enum.jsonl  findings/dast.jsonl  findings/dast_full.jsonl  findings/wpprobe.jsonl  #   per-app findings (shortscan; DAST surface/deep; wpprobe WP CVEs); consolidate lifts up
+      findings/xss.jsonl  findings/xss_full.jsonl  findings/sqli.jsonl  findings/sqli_full.jsonl   #   dedicated scanners (dalfox XSS / sqlmap SQLi), surface+deep; consolidate folds by type
       findings/cve.jsonl  findings/cve_full.jsonl    #   cve_lookup (PHASE 2) / cve_lookup_full (PHASE 4): known CVEs on enumerated software
       raw/cve/seen.txt                   #   cve_lookup: (product,version) covered in PHASE 2 → PHASE 4 reports only the delta
       wl_custom/seed.txt  wl_custom/round*.txt   #   per-app GENERATED wordlists (seed offline; round N = fuzzed delta)
@@ -171,7 +172,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                    #   raw/httpx/{screenshot,osint,discovered}, raw/katana/{crawl,headless},
                    #   raw/subjack/candidates.txt, raw/shortscan/rainbow*.txt,
                    #   raw/api_spec/ (spec probe+store), raw/dast/{input,input_full}.jsonl (nuclei -im jsonl input)
-  findings/cve.jsonl  findings/dast.jsonl  findings/tilde_enum.jsonl  findings/wpprobe.jsonl  findings/secrets.jsonl  findings/takeover.jsonl  findings/default_creds.jsonl
+  findings/cve.jsonl  findings/dast.jsonl  findings/xss.jsonl  findings/sqli.jsonl  findings/tilde_enum.jsonl  findings/wpprobe.jsonl  findings/secrets.jsonl  findings/takeover.jsonl  findings/default_creds.jsonl
                                          #   CONSOLIDATE output — per-app findings lifted up by TYPE (each record stamped app_id;
                                          #   cve/dast fold surface+deep). nuclei_scope.jsonl is the whole-scope nuclei finding.
   findings/hypotheses.jsonl              # dormant agent fan-in output (StubProvider seam, kept in place)
@@ -295,7 +296,9 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     before any fuzzing; no hidden-param discovery (that's guessing → phase 4). `cve_lookup` runs **∥
     `dast`** (same phase, offline `net=False`): known-CVE correlation of the enumerated software (web
     server + tech + non-HTTP service banners + corpus libs) against `search_vulns`' local DB →
-    `findings/cve.jsonl`. See "CVE lookup" below.
+    `findings/cve.jsonl`. See "CVE lookup" below. `xss` (dalfox) ∥ `sqli` (sqlmap) also run here —
+    **dedicated scanners** over the surface catalog's full requests → `findings/xss.jsonl` /
+    `findings/sqli.jsonl`. See "Dedicated vuln scanners" below.
   - **Loop 3 — guessing / surface expansion** (`phase=3`): `wordlist` (offline seed from JS/body/seed)
     → `tech_enum` (surface-generating per-stack scanners) → `content_discovery` — feroxbuster forced
     browsing run as a bounded **fixpoint** (fuzz → download → mine → fuzz the new token delta), which
@@ -309,8 +312,10 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     runs nuclei `-dast` over the **delta** (full catalog minus the surface catalog) + synthesized
     requests for the discovered params → `findings/dast_full.jsonl`. `cve_lookup_full` runs **∥
     `dast_full`** (offline): re-mines the EXPANDED corpus (the phase-3 crawl grew it) for software and
-    reports only the **delta** vs the phase-2 pass → `findings/cve_full.jsonl`. See "Request catalog &
-    DAST" + "CVE lookup" below.
+    reports only the **delta** vs the phase-2 pass → `findings/cve_full.jsonl`. `xss_full` (dalfox) ∥
+    `sqli_full` (sqlmap) run the dedicated scanners over the **same delta** (`request_catalog_full` +
+    `param_fuzz`) → `findings/xss_full.jsonl` / `findings/sqli_full.jsonl` — the dalfox/sqlmap analog of
+    `dast_full`. See "Request catalog & DAST" + "CVE lookup" + "Dedicated vuln scanners" below.
   - **Loop 4 — vuln scan** (gated): `tech_vulnscan` — finding-only per-stack scanners, gated on the
     detected tech, run ∥ the rest of loop 4. Today: `wpprobe` (WordPress plugin/theme → known CVE via
     its local Wordfence DB) on WordPress groups only → `findings/wpprobe.jsonl` (`consolidate` lifts it).
@@ -557,8 +562,44 @@ fuzzing passes. Per-app findings → `consolidate` (terminal fan-in) lifts them.
 their `raw/` dirs.
 
 **Auth passthrough** (`PIPT_HTTP_HEADER`, `_header_flags`/`_auth_headers`) threads operator session
-headers/cookies into katana/httpx/nuclei (`-H`), arjun (`--headers`) and x8 (`-H`) so the crawl/fetch/
-fuzz/DAST reach the **authenticated** surface (where most POST/JSON lives).
+headers/cookies into katana/httpx/nuclei (`-H`), arjun (`--headers`), x8 (`-H`), dalfox (`-H`) and
+sqlmap (`--headers`) so the crawl/fetch/fuzz/DAST reach the **authenticated** surface (where most
+POST/JSON lives).
+
+### Dedicated vuln scanners — dalfox (XSS) ∥ sqlmap (SQLi), surface + delta
+
+nuclei `-dast`'s generic templates are weak detectors (run-analysis: on a deliberately-vulnerable target
+they fired only `cookie-injection`/`crlf-injection` and missed the real SQLi/XSS). `xss`/`sqli` (phase 2)
+and `xss_full`/`sqli_full` (phase 4) are the **dedicated** complement — the same surface/delta split as
+`dast`/`dast_full`, sharing `_surface_request_set`/`_delta_request_set`. Both tools consume the catalog's
+**`raw`** request (one process per request, Burp/ZAP raw via dalfox `file --rawdata` / sqlmap `-r`), so
+**every param location** is tested (query/body/json/header/cookie), not GET-only — the payoff of the
+full-request catalog over a URL list.
+
+- **No gf-style candidate routing** (deliberately rejected — reconftw's `gf xss`/`gf sqli` guess the vuln
+  class from the param NAME, on GET URLs, missing and wasting both ways). The ONLY filter is `_has_params`
+  (a request must have something to fuzz); **each tool's own engine decides** — dalfox by reflection +
+  context, sqlmap by its `--smart` heuristic (thorough tests only on a positive heuristic) + boolean/
+  error/union/time-based. sqlmap thus catches the blind/time-based SQLi nuclei's error-based template misses.
+- **Bounded + best-effort**: candidates capped at `VULN_MAX_REQUESTS`, a `VULN_FANOUT`-wide process pool,
+  a per-request `VULN_TOOL_TIMEOUT` (TimeoutExpired → that one request yields nothing, the stage keeps the
+  rest — the arjun/x8/feroxbuster livelock lesson). Skip cleanly if the binary is absent.
+- **Parsers** (pure, unit-tested): `parse_dalfox` (dalfox `--format jsonl` PoC records → `type:xss`,
+  severity/param/payload/evidence/cwe/`matched-at`) and `parse_sqlmap` (the stable `Parameter:`/`Type:`/
+  `Title:`/`Payload:` result block → one `type:sqli` record per (param, technique) + back-end DBMS).
+- Per-app `findings/xss{,_full}.jsonl` + `findings/sqli{,_full}.jsonl` → `consolidate` lifts them by TYPE
+  (`xss` folds surface+deep, `sqli` likewise — same as cve/dast). Tools: dalfox `~/go/bin/dalfox`; sqlmap
+  `/opt/sqlmap-dev/sqlmap.py` (override `PIPT_SQLMAP`, invoked via `sys.executable`).
+- **OAST / blind XSS** (OPT-IN `PIPT_OAST`, best-effort): dalfox `-b` fires blind payloads at an
+  interactsh callback — the hit lands on the interactsh SERVER, not dalfox's output. So `_run_dalfox`
+  runs an `interactsh-client` (`~/go/bin`, **≥1.3** — older can't decrypt) for the pass via the
+  teardown-tracked `tools.spawn`/`tools.stop`, gives EACH request a unique callback subdomain
+  (`-b https://b<i>.<domain>` — the per-request runner = per-request correlation), then `_oast_drain`
+  stops the client and `correlate_oast` matches each interaction's `full-id` (`<marker>.<unique-id>`)
+  back to its request → a `poc_kind:"blind"` finding (deduped by marker+protocol; bare-domain interactsh
+  noise ignored). **Synchronous callbacks only** — a truly-stored/delayed XSS fires after the run, out of
+  scope (a persistent receiver would break files-as-only-state). Self-host via `PIPT_INTERACTSH_SERVER`/
+  `PIPT_INTERACTSH_TOKEN`, else the public oast servers (a RoE/privacy note: callbacks transit PD infra).
 
 ### CVE lookup — known CVEs on enumerated software (offline correlation, two passes)
 
@@ -610,6 +651,8 @@ idempotent (overwrites each run / `--resume`). Sources (`_CONSOLIDATE_SOURCES` +
 
 - `findings/cve.jsonl` ← per-app `findings/cve.jsonl` + `findings/cve_full.jsonl` (surface+deep folded)
 - `findings/dast.jsonl` ← per-app `findings/dast.jsonl` + `findings/dast_full.jsonl`
+- `findings/xss.jsonl` ← per-app `findings/xss.jsonl` + `findings/xss_full.jsonl` (dalfox surface+deep)
+- `findings/sqli.jsonl` ← per-app `findings/sqli.jsonl` + `findings/sqli_full.jsonl` (sqlmap surface+deep)
 - `findings/tilde_enum.jsonl` ← per-app `findings/tilde_enum.jsonl`
 - `findings/secrets.jsonl` ← per-app `secrets.jsonl`
 - `findings/default_creds.jsonl` ← per-app `default_creds.jsonl`
@@ -665,6 +708,15 @@ A git diff of any of them shows exactly how the flow changed:
 - Trusted resolvers: `/opt/resolvers/resolvers-trusted.txt`.
 - **DAST (`dast` step)** uses `nuclei -dast` with the fuzzing templates at `~/nuclei-templates/dast`
   (override `PIPT_NUCLEI_DAST_TEMPLATES`); the step skips best-effort if the dir or nuclei is absent.
+- **Dedicated scanners (`xss`/`sqli`/`xss_full`/`sqli_full`)** use **dalfox** (`~/go/bin/dalfox`) and
+  **sqlmap** (`/opt/sqlmap-dev/sqlmap.py`, override `PIPT_SQLMAP`, run via `sys.executable` — it's a
+  python script, not a PATH binary). Both make target requests; best-effort (skip if absent). No DB to
+  provision. Tunables (`VULN_MAX_REQUESTS`/`VULN_FANOUT`/`VULN_TOOL_TIMEOUT`/`SQLMAP_LEVEL`/`SQLMAP_RISK`)
+  at the top of `tasks.py`.
+- **OAST / blind XSS (`PIPT_OAST=on`, opt-in)** uses **`interactsh-client`** (`~/go/bin`, **≥1.3** — the
+  1.2.x decrypt format is incompatible with today's public oast servers, verified: interactions arrive
+  but unmarshal as binary garbage). Default public servers; self-host with `PIPT_INTERACTSH_SERVER`/
+  `PIPT_INTERACTSH_TOKEN`. Catches only synchronous callbacks (see "Dedicated vuln scanners"); off by default.
 - **CVE lookup (`cve_lookup`/`cve_lookup_full`)** uses `search_vulns` (`~/.local/bin/search_vulns`,
   override `PIPT_SEARCH_VULNS`) against its LOCAL DB. **Build/refresh the DB out-of-band:**
   `search_vulns -u` (prebuilt download) or `--full-update` (rebuild) — never during a run. The step
@@ -701,6 +753,49 @@ A git diff of any of them shows exactly how the flow changed:
 
 The architecture sections above say *what* the recon pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **OAST/blind-XSS is within-run + best-effort (synchronous callbacks only), correlated per-request via
+  the per-request runner.** dalfox `-b` fires blind payloads at an interactsh callback, but the hit lands
+  on the interactsh SERVER, not dalfox's output. `_run_dalfox` (PIPT_OAST on) runs an `interactsh-client`
+  for the pass (teardown-tracked `tools.spawn`/`stop`), gives each request a unique callback subdomain
+  `b<i>.<domain>`, then `_oast_drain` → `correlate_oast` matches each interaction's `full-id`
+  (`<marker>.<unique-id>`) back to the request. *Why per-request subdomains, not one callback:* dalfox
+  `-b` is one URL per invocation and we already run one process per request, so a unique prefix gives
+  per-request attribution for free (verified: interactsh preserves the prefix in `full-id`); one shared
+  callback would only say "some request fired". *Why synchronous-only:* a truly-stored XSS fires when an
+  admin later views the payload — minutes/days after a ~40-min run; receiving that needs a PERSISTENT
+  callback+correlation service living past the run, which breaks files-as-only-state. We capture what
+  fires during the run (the scan's own request triggers a server-side render) and explicitly punt the
+  rest. *Why opt-in:* it adds the interactsh dependency + (default) routes callbacks through PD's public
+  oast servers (a RoE/privacy consideration); self-host via `PIPT_INTERACTSH_SERVER`. *Tool floor:*
+  interactsh-client **≥1.3** — 1.2.x can't decrypt the current public servers (interactions arrive but
+  unmarshal as binary garbage; verified before/after the upgrade). *Verified end-to-end:* register →
+  callback → decode → correlate → `poc_kind:"blind"` finding on the right request. *Rejected:* one
+  shared callback (no per-param attribution); a persistent stored-XSS receiver (architectural misfit);
+  relying on nuclei's interactsh alone (it covers some OOB but not blind-XSS-specific payloads).
+
+- **Dedicated scanners (dalfox/sqlmap) complement nuclei -dast, fed the catalog's raw requests, with NO
+  gf-style routing.** A run-analysis proved nuclei `-dast`'s generic templates miss real bugs (only
+  `cookie-injection`/`crlf-injection` fired on a deliberately-vulnerable target; the reflected XSS was
+  quote-filtered, the SQLi was blind/no-error). `xss`/`sqli` (phase 2) + `xss_full`/`sqli_full` (phase 4)
+  add dalfox + sqlmap on the same surface/delta split as `dast`/`dast_full` (shared
+  `_surface_request_set`/`_delta_request_set`). *Why no gf routing:* reconftw pipes `gf xss`/`gf sqli`
+  (regex on the param NAME) into the tools — a guess that both misses (a SQLi on `category` isn't in the
+  list) and wastes (an `id` that's safe), and operates on GET URLs only. Instead the ONLY filter is
+  `_has_params` and **each tool's own engine decides** (dalfox reflection+context · sqlmap `--smart`).
+  *Why feed `raw` (not URL lists):* both ingest a Burp/ZAP raw request (dalfox `file --rawdata`, sqlmap
+  `-r`), so every param location is tested (query/body/json/header/cookie) — the payoff of the
+  full-request catalog; sqlmap's time-based detection catches the blind SQLi nuclei missed. *Why one
+  process per request:* raw mode is one request per invocation; bounded by `VULN_MAX_REQUESTS` + a
+  `VULN_FANOUT` pool + per-request `VULN_TOOL_TIMEOUT` (a slow target can't hang the loop — the
+  arjun/x8/feroxbuster lesson). *Why parse stdout (sqlmap) not a session file:* the `Parameter:/Type:/
+  Title:/Payload:` block is stable and version-proof; on timeout that request just yields nothing
+  (best-effort). *Verified:* both run end-to-end on ginandjuice (consume `raw`, parse, write
+  `findings/{xss,sqli}{,_full}.jsonl`); `consolidate` folds surface+deep by type. *Rejected:* gf-pattern
+  routing (the user explicitly called it "falsato"); evidence-based candidate selection (reflection for
+  XSS, dynamism for SQLi) — deferred, the user chose "every parameterized request is a candidate" for now;
+  ghauri/crlfuzz (a later best-effort layer). *Open:* detection TUNING (sqlmap level/risk, ensuring the
+  real SQLi endpoints are in the candidate cap) — the integration is done; efficacy is the next lever.
 
 - **A param "found" on ~every tested endpoint is collapsed as a SITE-WIDE reflection, not sprayed.**
   Run-analysis traced the phase-4 `?category=`-on-everything spray to its source: `param_fuzz` reported

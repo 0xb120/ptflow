@@ -18,6 +18,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections import Counter
@@ -349,6 +350,42 @@ X8 = str(_X8_BIN) if _X8_BIN.exists() else "x8"
 _NUCLEI_DAST_TEMPLATES = Path.home() / "nuclei-templates" / "dast"
 NUCLEI_DAST_TEMPLATES = os.environ.get("PIPT_NUCLEI_DAST_TEMPLATES") or str(_NUCLEI_DAST_TEMPLATES)
 
+# dedicated vuln scanners (PHASE 2 surface + PHASE 4 deep) — dalfox (XSS) ∥ sqlmap (SQLi) over the
+# request catalog's FULL requests (the `raw` field — Burp/ZAP format both tools ingest natively), ONE
+# process per request so EVERY param location is tested (query/body/json/header/cookie), not GET-only.
+# No candidate heuristic (gf-style param-NAME routing deliberately rejected): every parameterized
+# request is a candidate and each tool's OWN engine decides — dalfox by reflection+context, sqlmap by
+# its --smart heuristic + boolean/error/union/time tests. Surface (phase 2) + delta (phase 4), mirroring
+# dast/dast_full. Best-effort; per-request wall-clock cap (the arjun/x8/feroxbuster livelock lesson).
+_DALFOX_BIN = Path.home() / "go" / "bin" / "dalfox"
+DALFOX = str(_DALFOX_BIN) if _DALFOX_BIN.exists() else "dalfox"
+_SQLMAP_SCRIPT = os.environ.get("PIPT_SQLMAP") or "/opt/sqlmap-dev/sqlmap.py"
+SQLMAP_CMD = [sys.executable, _SQLMAP_SCRIPT]   # sqlmap is a python script, not a PATH binary
+VULN_MAX_REQUESTS = 40      # cap candidate (parameterized) requests per app per pass per tool
+VULN_FANOUT = 3             # concurrent scanner processes per app (each is itself network-heavy)
+VULN_TOOL_TIMEOUT = 180     # per-request wall-clock cap (s) — a slow target must not hang the loop
+DALFOX_WORKERS = "30"       # dalfox -w (concurrent payloads per request)
+DALFOX_HTTP_TIMEOUT = "10"  # dalfox --timeout (per HTTP request)
+SQLMAP_LEVEL = "1"          # sqlmap --level (1 = query/cookie; polite on live infra)
+SQLMAP_RISK = "1"           # sqlmap --risk (1 = safe payloads only)
+SQLMAP_THREADS = "4"        # sqlmap --threads
+
+# OAST / blind XSS (OPT-IN, best-effort) — dalfox -b fires blind payloads at an interactsh callback; the
+# hit lands on the interactsh SERVER, not dalfox's output. So with PIPT_OAST on we run an interactsh-client
+# for the dalfox pass, give EACH request a unique callback subdomain (<marker>.<domain> — the per-request
+# runner gives per-request correlation), then drain the interactions and match each hit's full-id marker
+# back to its request. Catches only SYNCHRONOUS callbacks (the scan's own request triggers the render); a
+# truly-stored/delayed XSS fires after the run — out of scope (would need a persistent service, against
+# files-as-only-state). interactsh-client >= 1.3 required (older can't decrypt the public servers' data).
+_INTERACTSH_BIN = Path.home() / "go" / "bin" / "interactsh-client"
+INTERACTSH = str(_INTERACTSH_BIN) if _INTERACTSH_BIN.exists() else "interactsh-client"
+OAST_ENABLED = os.environ.get("PIPT_OAST", "").lower() in {"1", "on", "true", "yes"}
+OAST_SERVER = os.environ.get("PIPT_INTERACTSH_SERVER", "")  # self-hosted server(s); else public default
+OAST_TOKEN = os.environ.get("PIPT_INTERACTSH_TOKEN", "")    # auth token for a protected/self-hosted server
+OAST_REG_TIMEOUT = 25   # s to wait for interactsh-client to register + print its callback domain
+OAST_DRAIN_GRACE = 8    # s after the dalfox pool before draining (let synchronous callbacks land + poll)
+OAST_POLL = "3"         # interactsh-client -pi (poll interval, seconds)
+
 # CVE lookup (PHASE 2 surface + PHASE 4 deep) — search_vulns correlates the ENUMERATED software
 # (web server + app tech + non-HTTP service banners + corpus-mined libs) against its LOCAL vuln DB
 # (NVD+GHSA+ExploitDB+EPSS), fully OFFLINE (net=False — no target traffic). The DB is built/refreshed
@@ -395,7 +432,8 @@ _CORE_TOOLS = {
 _OPTIONAL_TOOLS = {
     "crawley": CRAWLEY, "jsluice": JSLUICE, "shortscan": SHORTSCAN, "shortutil": SHORTUTIL,
     "gitleaks": GITLEAKS, "trufflehog": TRUFFLEHOG, "detect-secrets": DETECT_SECRETS,
-    "arjun": ARJUN, "x8": X8, "search_vulns": SEARCH_VULNS, "wpprobe": WPPROBE,
+    "arjun": ARJUN, "x8": X8, "search_vulns": SEARCH_VULNS, "wpprobe": WPPROBE, "dalfox": DALFOX,
+    "interactsh-client": INTERACTSH,
 }
 
 
@@ -3682,6 +3720,23 @@ def _run_dast(ws: AppWorkspace, requests_: list[dict], *, input_name: str, out_n
     log.info("    %s (%s) → %d finding(s)%s → findings/%s", stage, label, n, extra, out_name)
 
 
+def _surface_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
+    """The EXPLORABLE-surface request set (phase 2): the surface catalog (requests.jsonl), deduped by
+    shape and capped. Shared by `dast` and the surface vuln scanners (xss/sqli)."""
+    return dast_requests(tools.read_jsonl(ws.canonical("requests.jsonl")), [], cap=cap)
+
+
+def _delta_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
+    """The GUESSED-surface DELTA request set (phase 4): full-catalog shapes NOT already in the surface
+    catalog (by request_key) + the synthesized requests for the discovered hidden params (params.jsonl),
+    deduped and capped. Shared by `dast_full` and the deep vuln scanners (xss_full/sqli_full) so the
+    "delta, not the whole catalog" rule lives in ONE place."""
+    surface_keys = {request_key(r) for r in tools.read_jsonl(ws.canonical("requests.jsonl"))}
+    delta = [r for r in tools.read_jsonl(ws.canonical("requests_full.jsonl"))
+             if request_key(r) not in surface_keys]
+    return dast_requests(delta, tools.read_jsonl(ws.canonical("params.jsonl")), cap=cap)
+
+
 def dast(activity: Activity, app_id: str) -> None:
     """PHASE 2 — DAST the EXPLORABLE SURFACE (low-hanging fruit): nuclei -dast over the surface catalog
     (requests.jsonl), fuzzing the OBSERVED params (query/body/form/xhr the crawl actually saw). Fast,
@@ -3689,9 +3744,8 @@ def dast(activity: Activity, app_id: str) -> None:
     yet (that's guessing → phase 4). Output → findings/dast.jsonl. Reads requests.jsonl across the
     barrier (phase 1)."""
     ws = activity.app(app_id)
-    requests_ = dast_requests(tools.read_jsonl(ws.canonical("requests.jsonl")), [],
-                              cap=DAST_MAX_REQUESTS)
-    _run_dast(ws, requests_, input_name="input.jsonl", out_name="dast.jsonl", label=app_id)
+    _run_dast(ws, _surface_request_set(ws, cap=DAST_MAX_REQUESTS),
+              input_name="input.jsonl", out_name="dast.jsonl", label=app_id)
 
 
 def dast_full(activity: Activity, app_id: str) -> None:
@@ -3702,12 +3756,257 @@ def dast_full(activity: Activity, app_id: str) -> None:
     crawl-surface endpoint. Output → findings/dast_full.jsonl. Needs request_catalog_full + param_fuzz.
     """
     ws = activity.app(app_id)
-    surface_keys = {request_key(r) for r in tools.read_jsonl(ws.canonical("requests.jsonl"))}
-    delta = [r for r in tools.read_jsonl(ws.canonical("requests_full.jsonl"))
-             if request_key(r) not in surface_keys]
-    requests_ = dast_requests(delta, tools.read_jsonl(ws.canonical("params.jsonl")),
-                              cap=DAST_MAX_REQUESTS)
-    _run_dast(ws, requests_, input_name="input_full.jsonl", out_name="dast_full.jsonl", label=app_id)
+    _run_dast(ws, _delta_request_set(ws, cap=DAST_MAX_REQUESTS),
+              input_name="input_full.jsonl", out_name="dast_full.jsonl", label=app_id)
+
+
+# --- dedicated vuln scanners (PHASE 2 surface + PHASE 4 deep) — dalfox (XSS) ∥ sqlmap (SQLi) ----------
+# Both consume the catalog's `raw` (one request per process, Burp/ZAP raw), so EVERY param location is
+# tested, not GET-only. NO gf-style name routing: every parameterized request is a candidate, each tool's
+# own engine decides (dalfox reflection+context · sqlmap --smart heuristic). Best-effort, capped, with a
+# per-request wall-clock cap (TimeoutExpired → that request yields nothing, the stage keeps the rest).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")  # strip terminal control sequences from tool stdout
+
+
+def _has_params(r: dict) -> bool:
+    """A request worth handing to dalfox/sqlmap — it has something to fuzz: enumerated params, a query
+    string, or a body. A bare param-less GET is useless to either tool."""
+    return bool(r.get("params")) or "?" in (r.get("url") or "") or bool(r.get("body"))
+
+
+def _vuln_candidates(requests_: Iterable[dict], *, cap: int) -> list[dict]:
+    """The parameterized subset of a request set, capped — the scanner candidate list (no name-based
+    routing: presence of a fuzzable param is the ONLY filter)."""
+    return [r for r in requests_ if _has_params(r)][:cap]
+
+
+def parse_dalfox(out: str) -> list[dict]:
+    """dalfox --format jsonl stdout → XSS findings. Each PoC record:
+    {type:R|V|G, inject_type, poc_type, method, data:<PoC url>, param, payload, evidence, cwe, severity,
+    message_str}. Normalized to a finding stamped type:'xss'. Pure (skips non-json/banner lines)."""
+    out_recs: list[dict] = []
+    for j in _jsonl_str(out):
+        if not isinstance(j, dict) or not j.get("data"):
+            continue
+        out_recs.append({"type": "xss", "poc_kind": j.get("type"), "inject_type": j.get("inject_type"),
+                         "severity": str(j.get("severity") or "").lower(), "param": j.get("param"),
+                         "method": j.get("method"), "payload": j.get("payload"),
+                         "evidence": j.get("evidence"), "cwe": j.get("cwe"),
+                         "matched-at": j.get("data"), "sources": ["dalfox"]})
+    return out_recs
+
+
+def parse_sqlmap(out: str, *, url: str | None = None) -> list[dict]:
+    """sqlmap stdout → SQLi findings. Parses the stable 'Parameter: <p> (<loc>)' result block(s), one
+    finding per (param, technique) from each Type/Title/Payload triple, stamped with the back-end DBMS.
+    Pure; tolerant of empty/garbled output (returns [] when no injection block is present)."""
+    text = _ANSI_RE.sub("", out or "")
+    dm = re.search(r"back-end DBMS(?:\s+is)?:?\s*([^\n]+)", text)
+    dbms = dm.group(1).strip() if dm else None
+    findings: list[dict] = []
+    for pm in re.finditer(r"^Parameter:\s*(?P<param>.+?)\s*\((?P<loc>[^)]+)\)\s*$(?P<body>.*?)"
+                          r"(?=^Parameter:|\Z)", text, re.DOTALL | re.MULTILINE):
+        param, loc = pm.group("param").strip(), pm.group("loc").strip()
+        findings.extend(
+            {"type": "sqli", "param": param, "location": loc,
+             "technique": tm.group("t").strip(), "title": tm.group("title").strip(),
+             "payload": tm.group("p").strip(), "dbms": dbms,
+             "matched-at": url, "sources": ["sqlmap"]}
+            for tm in re.finditer(r"Type:\s*(?P<t>[^\n]+)\n\s*Title:\s*(?P<title>[^\n]+)\n\s*"
+                                  r"Payload:\s*(?P<p>[^\n]+)", pm.group("body")))
+    return findings
+
+
+_OAST_DOMAIN_RE = re.compile(r"[a-z0-9]{20,}\.oast\.\w+")  # interactsh-client's registered callback host
+
+
+def correlate_oast(interactions: Iterable[dict], marker_map: Mapping[str, dict],
+                   *, unique_id: str) -> list[dict]:
+    """Match interactsh interactions back to the dalfox request that fired them → blind-XSS findings.
+    Each interaction's `full-id` is `<marker>.<unique-id>` (the per-request callback subdomain we set as
+    dalfox's -b); strip the trailing `.<unique-id>` to recover the marker → marker_map[marker] is the
+    request. Bare-domain hits (full-id == unique-id) are interactsh background noise → ignored. Deduped
+    by (marker, protocol) so repeated DNS polls of one callback are one finding. Pure."""
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    suffix = "." + unique_id
+    for it in interactions:
+        fid = str(it.get("full-id") or "")
+        if not fid.endswith(suffix):           # bare domain (no marker) or unrelated → noise
+            continue
+        marker = fid[: -len(suffix)]
+        r = marker_map.get(marker)
+        if r is None:
+            continue
+        key = (marker, it.get("protocol"))
+        if key in seen:                        # repeated polls of the same callback → one finding
+            continue
+        seen.add(key)
+        out.append({"type": "xss", "poc_kind": "blind", "severity": "high",
+                    "method": r.get("method"), "matched-at": r.get("url"), "params": r.get("params"),
+                    "oast_protocol": it.get("protocol"), "remote_address": it.get("remote-address"),
+                    "timestamp": it.get("timestamp"), "sources": ["dalfox", "interactsh"]})
+    return out
+
+
+def _oast_start(ws: AppWorkspace, stage: str) -> tuple[subprocess.Popen, str, Path] | None:
+    """Start an interactsh-client OAST daemon for a dalfox pass (best-effort). Returns
+    (proc, callback_domain, interactions_jsonl) or None if OAST is off / the client is absent / it never
+    registered within OAST_REG_TIMEOUT. The callback domain is parsed from the client's stderr log."""
+    if not OAST_ENABLED or shutil.which(INTERACTSH) is None:
+        return None
+    oast_dir = ws.raw("dalfox")
+    oast_dir.mkdir(parents=True, exist_ok=True)
+    jsonl = oast_dir / f"{stage}_oast.jsonl"
+    errlog = oast_dir / f"{stage}_oast.log"
+    jsonl.write_text("", encoding="utf-8")
+    cmd = [INTERACTSH, "-json", "-o", str(jsonl), "-pi", OAST_POLL,
+           *(["-s", OAST_SERVER] if OAST_SERVER else []), *(["-t", OAST_TOKEN] if OAST_TOKEN else [])]
+    proc = tools.spawn(cmd, stderr_path=errlog)
+    for _ in range(OAST_REG_TIMEOUT):
+        time.sleep(1)
+        m = _OAST_DOMAIN_RE.search(errlog.read_text(encoding="utf-8", errors="replace"))
+        if m:
+            log.info("  → OAST (%s) — interactsh callback %s", stage, m.group(0))
+            return proc, m.group(0), jsonl
+        if proc.poll() is not None:            # client exited → couldn't register
+            break
+    log.warning("⚠ OAST (%s): interactsh-client did not register in %ds — blind XSS off this pass",
+                stage, OAST_REG_TIMEOUT)
+    tools.stop(proc)
+    return None
+
+
+def _oast_drain(oast: tuple[subprocess.Popen, str, Path], marker_map: dict[str, dict]) -> list[dict]:
+    """Stop the interactsh-client and correlate the interactions it captured → blind-XSS findings."""
+    proc, domain, jsonl = oast
+    time.sleep(OAST_DRAIN_GRACE)               # let synchronous callbacks land + one more poll cycle
+    tools.stop(proc)
+    return correlate_oast(tools.read_jsonl(jsonl), marker_map, unique_id=domain.split(".", 1)[0])
+
+
+def _run_dalfox(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label: str) -> None:
+    """Run dalfox over each candidate request's `raw` (file --rawdata), one process per request so body/
+    json/header params are tested too. JSONL PoCs parsed from stdout → findings/<out_name>. With PIPT_OAST
+    on, an interactsh-client runs alongside and each request gets a unique callback subdomain (dalfox -b)
+    so a SYNCHRONOUS blind-XSS callback correlates back to its request. Best-effort: skips if dalfox is
+    absent or there are no parameterized requests."""
+    stage = out_name.removesuffix(".jsonl")
+    if shutil.which(DALFOX) is None:
+        log.debug("  · skip %s (dalfox not installed) for %s", stage, label)
+        return
+    if not requests_:
+        log.debug("  · skip %s (no parameterized requests) for %s", stage, label)
+        return
+    reqdir = ws.raw("dalfox")
+    reqdir.mkdir(parents=True, exist_ok=True)
+    auth = _header_flags("-H")
+    oast = _oast_start(ws, stage)                       # None unless PIPT_OAST on + client present
+    domain = oast[1] if oast else None
+    marker_map: dict[str, dict] = {}                    # callback marker → request (per-request blind XSS)
+    log.info("  → %s (%s) — dalfox over %d parameterized request(s)%s", stage, label, len(requests_),
+             " [+OAST]" if domain else "")
+
+    def one(i_r: tuple[int, dict]) -> list[dict]:
+        i, r = i_r
+        reqfile = reqdir / f"{stage}_{i}.txt"
+        reqfile.write_text(r.get("raw") or "", encoding="utf-8")
+        cmd = [DALFOX, "file", str(reqfile), "--rawdata", "--format", "jsonl", "--no-color",
+               "--skip-bav", "-w", DALFOX_WORKERS, "--timeout", DALFOX_HTTP_TIMEOUT, *auth]
+        if domain:
+            marker = f"b{i}"                             # unique per-request callback subdomain
+            marker_map[marker] = r
+            cmd += ["-b", f"https://{marker}.{domain}"]
+        if (r.get("url") or "").startswith("http://"):
+            cmd.append("--http")          # raw mode defaults to https; force http where that's the scheme
+        try:
+            return parse_dalfox(tools.run(cmd, stdin="", timeout=VULN_TOOL_TIMEOUT,
+                                          stream_stderr=is_verbose()))
+        except subprocess.TimeoutExpired:
+            log.warning("⚠ %s: dalfox hit the %ds cap on %s", stage, VULN_TOOL_TIMEOUT, r.get("url"))
+            return []
+
+    findings: list[dict] = []
+    with ThreadPoolExecutor(max_workers=VULN_FANOUT) as pool:
+        for res in pool.map(one, enumerate(requests_)):
+            findings += res
+    blind = _oast_drain(oast, marker_map) if oast else []
+    findings += blind
+    n = tools.write_jsonl(ws.findings / out_name, findings)
+    log.info("    %s (%s) → %d finding(s)%s → findings/%s", stage, label, n,
+             f" ({len(blind)} blind via OAST)" if blind else "", out_name)
+
+
+def _run_sqlmap(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label: str) -> None:
+    """Run sqlmap over each candidate request's `raw` (-r), one process per request, --batch --smart so
+    sqlmap's OWN heuristic prunes inert params (no name routing). Injection block parsed from stdout →
+    findings/<out_name>. Best-effort: skips if the sqlmap script or parameterized requests are absent.
+    On the per-request timeout that request yields nothing (sqlmap prints its result block at the end)."""
+    stage = out_name.removesuffix(".jsonl")
+    if not Path(_SQLMAP_SCRIPT).exists():
+        log.debug("  · skip %s (sqlmap not found at %s) for %s", stage, _SQLMAP_SCRIPT, label)
+        return
+    if not requests_:
+        log.debug("  · skip %s (no parameterized requests) for %s", stage, label)
+        return
+    reqdir = ws.raw("sqlmap")
+    reqdir.mkdir(parents=True, exist_ok=True)
+    auth = _auth_headers()
+    log.info("  → %s (%s) — sqlmap over %d parameterized request(s)", stage, label, len(requests_))
+
+    def one(i_r: tuple[int, dict]) -> list[dict]:
+        i, r = i_r
+        reqfile = reqdir / f"{stage}_{i}.txt"
+        reqfile.write_text(r.get("raw") or "", encoding="utf-8")
+        cmd = [*SQLMAP_CMD, "-r", str(reqfile), "--batch", "--smart", "--level", SQLMAP_LEVEL,
+               "--risk", SQLMAP_RISK, "--threads", SQLMAP_THREADS, "--disable-coloring",
+               "--output-dir", str(reqdir / f"out_{i}")]
+        if auth:
+            cmd += ["--headers", "\n".join(auth)]
+        try:
+            # stdin="" → EOF, so sqlmap doesn't block reading STDIN for a targets list (it does when
+            # stdin is a live TTY). Default verbosity (NOT -v 0, which suppresses the injection block
+            # parse_sqlmap keys on).
+            return parse_sqlmap(tools.run(cmd, stdin="", timeout=VULN_TOOL_TIMEOUT,
+                                          stream_stderr=is_verbose()), url=r.get("url"))
+        except subprocess.TimeoutExpired:
+            log.warning("⚠ %s: sqlmap hit the %ds cap on %s", stage, VULN_TOOL_TIMEOUT, r.get("url"))
+            return []
+
+    findings: list[dict] = []
+    with ThreadPoolExecutor(max_workers=VULN_FANOUT) as pool:
+        for res in pool.map(one, enumerate(requests_)):
+            findings += res
+    n = tools.write_jsonl(ws.findings / out_name, findings)
+    log.info("    %s (%s) → %d finding(s) → findings/%s", stage, label, n, out_name)
+
+
+def xss(activity: Activity, app_id: str) -> None:
+    """PHASE 2 — dalfox over the EXPLORABLE-surface parameterized requests → findings/xss.jsonl."""
+    ws = activity.app(app_id)
+    _run_dalfox(ws, _vuln_candidates(_surface_request_set(ws, cap=DAST_MAX_REQUESTS), cap=VULN_MAX_REQUESTS),
+                out_name="xss.jsonl", label=app_id)
+
+
+def xss_full(activity: Activity, app_id: str) -> None:
+    """PHASE 4 — dalfox over the GUESSED-surface DELTA + discovered-param requests → findings/xss_full.jsonl."""
+    ws = activity.app(app_id)
+    _run_dalfox(ws, _vuln_candidates(_delta_request_set(ws, cap=DAST_MAX_REQUESTS), cap=VULN_MAX_REQUESTS),
+                out_name="xss_full.jsonl", label=app_id)
+
+
+def sqli(activity: Activity, app_id: str) -> None:
+    """PHASE 2 — sqlmap over the EXPLORABLE-surface parameterized requests → findings/sqli.jsonl."""
+    ws = activity.app(app_id)
+    _run_sqlmap(ws, _vuln_candidates(_surface_request_set(ws, cap=DAST_MAX_REQUESTS), cap=VULN_MAX_REQUESTS),
+                out_name="sqli.jsonl", label=app_id)
+
+
+def sqli_full(activity: Activity, app_id: str) -> None:
+    """PHASE 4 — sqlmap over the GUESSED-surface DELTA + discovered-param requests → findings/sqli_full.jsonl."""
+    ws = activity.app(app_id)
+    _run_sqlmap(ws, _vuln_candidates(_delta_request_set(ws, cap=DAST_MAX_REQUESTS), cap=VULN_MAX_REQUESTS),
+                out_name="sqli_full.jsonl", label=app_id)
 
 
 # --- CVE lookup (PHASE 2 surface + PHASE 4 deep) — search_vulns over the ENUMERATED software --------
@@ -4082,6 +4381,8 @@ def cve_lookup_full(activity: Activity, app_id: str) -> None:
 _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "cve.jsonl": ("findings/cve.jsonl", "findings/cve_full.jsonl"),
     "dast.jsonl": ("findings/dast.jsonl", "findings/dast_full.jsonl"),
+    "xss.jsonl": ("findings/xss.jsonl", "findings/xss_full.jsonl"),
+    "sqli.jsonl": ("findings/sqli.jsonl", "findings/sqli_full.jsonl"),
     "tilde_enum.jsonl": ("findings/tilde_enum.jsonl",),
     "wpprobe.jsonl": ("findings/wpprobe.jsonl",),
     "secrets.jsonl": ("secrets.jsonl",),

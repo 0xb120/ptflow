@@ -213,6 +213,37 @@ FLOWMETA: dict[str, StepMeta] = {
             "dedup per punto-di-iniezione: niente conteggio gonfiato (lo stesso template su N varianti = 1)",
         ),
     ),
+    "xss": StepMeta(
+        summary="FASE 2 — XSS dedicato (dalfox) sulla superficie esplorabile: scanner specializzato a "
+                "complemento di nuclei -dast (template generici deboli). Ogni request parametrizzato è "
+                "candidato (NIENTE routing per nome stile gf); dalfox decide per riflessione+contesto.",
+        commands=(
+            "# candidati = request parametrizzati del catalogo superficie (cap VULN_MAX_REQUESTS=40)",
+            "dalfox file <raw> --rawdata --format jsonl --skip-bav -w 30 --timeout 10 [--http] [-H auth]",
+            "# 1 processo per request (raw Burp/ZAP) → testa query/body/json/header, non solo GET",
+            "# PIPT_OAST=on: interactsh-client per il pass + -b https://b<i>.<domain> (callback per-request)",
+            "#   → correlate_oast: full-id <marker>.<uid> → request → finding poc_kind:blind (solo sincroni)",
+        ),
+        outputs=("findings/xss.jsonl",),
+        notes=("best-effort (salta se dalfox assente / nessun request parametrizzato)",
+               "cap wall-clock per-request VULN_TOOL_TIMEOUT (no hang) · pool VULN_FANOUT",
+               "consuma il `raw` del catalogo: stesso vantaggio full-request del DAST, non liste di URL",
+               "OAST opt-in (PIPT_OAST): blind XSS via interactsh ≥1.3, solo callback SINCRONI nella run"),
+    ),
+    "sqli": StepMeta(
+        summary="FASE 2 — SQLi dedicato (sqlmap) sulla superficie esplorabile: sqlmap -r sul `raw` di ogni "
+                "request parametrizzato, --smart lascia decidere al motore (no routing per nome). Prende "
+                "le SQLi blind/time-based che i template error-based di nuclei mancano.",
+        commands=(
+            "# candidati = request parametrizzati del catalogo superficie (cap VULN_MAX_REQUESTS=40)",
+            "sqlmap -r <raw> --batch --smart --level 1 --risk 1 --threads 4 --disable-coloring [-H auth]",
+            "# 1 processo per request · --smart = test pesanti solo su euristica positiva (politeness)",
+        ),
+        outputs=("findings/sqli.jsonl",),
+        notes=("best-effort (salta se lo script sqlmap assente / nessun request parametrizzato)",
+               "cap wall-clock per-request VULN_TOOL_TIMEOUT (su timeout quel request non dà nulla)",
+               "parse del blocco 'Parameter:/Type:/Title:/Payload:' → 1 finding per (param, tecnica) + DBMS"),
+    ),
     "cve_lookup": StepMeta(
         summary="FASE 2 — CVE NOTE sui software ENUMERATI della superficie esplorabile (∥ dast). "
                 "Correlazione OFFLINE (net=False, zero traffico): web server + tech wappalyzer + banner "
@@ -366,6 +397,30 @@ FLOWMETA: dict[str, StepMeta] = {
             "dedup per punto-di-iniezione (il delta è path-disgiunto dalla superficie → niente dup cross-fase)",
             "il full-template whole-scope è nuclei_scope (breadth) · per-app findings → consolidate (pianificato)",
         ),
+    ),
+    "xss_full": StepMeta(
+        summary="FASE 4 — XSS dedicato (dalfox) sulla superficie INDOVINATA: il duale di dast_full. Fuzza "
+                "solo il DELTA (catalogo full meno superficie, per request_key) + i request sintetizzati dai "
+                "param scoperti — non ri-scansiona ciò che la FASE 2 ha già coperto.",
+        commands=(
+            "# candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)",
+            "dalfox file <raw> --rawdata --format jsonl --skip-bav -w 30 --timeout 10 [--http] [-H auth]",
+        ),
+        outputs=("findings/xss_full.jsonl",),
+        notes=("needs request_catalog_full + param_fuzz · best-effort · cap wall-clock per-request",
+               "stesso runner di xss (FASE 2), sul delta indovinato + param nascosti",
+               "OAST opt-in (PIPT_OAST) anche qui: blind XSS via interactsh, callback per-request"),
+    ),
+    "sqli_full": StepMeta(
+        summary="FASE 4 — SQLi dedicato (sqlmap) sulla superficie INDOVINATA: il duale di dast_full. -r sul "
+                "`raw` del DELTA (full meno superficie) + i request dei param scoperti; --smart decide.",
+        commands=(
+            "# candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)",
+            "sqlmap -r <raw> --batch --smart --level 1 --risk 1 --threads 4 --disable-coloring [-H auth]",
+        ),
+        outputs=("findings/sqli_full.jsonl",),
+        notes=("needs request_catalog_full + param_fuzz · best-effort · cap wall-clock per-request",
+               "stesso runner di sqli (FASE 2), sul delta indovinato + param nascosti"),
     ),
     "cve_lookup_full": StepMeta(
         summary="FASE 4 — CVE NOTE sull'enumerazione ESPANSA (∥ dast_full). Il crawl di FASE 3 "

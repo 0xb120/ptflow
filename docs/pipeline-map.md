@@ -61,6 +61,8 @@ P1 ==> BAR2
 subgraph P2["FASE 2 · DAST surface"]
 direction TB
 dast["dast<br># input: requests.jsonl (parametri osservati), dedup per shape, cap DAST_MAX_REQUESTS=1500<br>#   → raw/dast/input.jsonl ({request:{endpoint,raw}})<br>nuclei -dast -im jsonl -l input.jsonl -t &lt;dast templates&gt; -fa low -rl &lt;profilo&gt; -c &lt;profilo&gt;<br>       -timeout 10 -retries 2 -j -silent -duc [-H auth]<br># dedup_dast_findings: 1 record per (template, host, path, fuzz position) — collassa i re-fire<br>#   dello stesso punto di iniezione (varianti sintetizzate, http+https) su UN solo finding"]
+xss["xss<br># candidati = request parametrizzati del catalogo superficie (cap VULN_MAX_REQUESTS=40)<br>dalfox file &lt;raw&gt; --rawdata --format jsonl --skip-bav -w 30 --timeout 10 [--http] [-H auth]<br># 1 processo per request (raw Burp/ZAP) → testa query/body/json/header, non solo GET<br># PIPT_OAST=on: interactsh-client per il pass + -b https://b&lt;i&gt;.&lt;domain&gt; (callback per-request)<br>#   → correlate_oast: full-id &lt;marker&gt;.&lt;uid&gt; → request → finding poc_kind:blind (solo sincroni)"]
+sqli["sqli<br># candidati = request parametrizzati del catalogo superficie (cap VULN_MAX_REQUESTS=40)<br>sqlmap -r &lt;raw&gt; --batch --smart --level 1 --risk 1 --threads 4 --disable-coloring [-H auth]<br># 1 processo per request · --smart = test pesanti solo su euristica positiva (politeness)"]
 cve_lookup["cve_lookup  ·  net=False<br># software = collect_software(tech, Server header, banner nerva, lib del corpus) — solo con versione<br>search_vulns -q '&lt;Prodotto Versione&gt;' -f json --ignore-general-product-vulns --use-created-product-ids<br># --use-created-product-ids: product ID alla versione ESATTA (no ladder) · cache memo process-wide · offline DB locale"]
 end
 BAR2 ==> P2
@@ -85,12 +87,18 @@ direction TB
 request_catalog_full["request_catalog_full  ·  net=False<br># _assemble_catalog(include_guessed=True): requests_crawl/headless/api + requests_recrawl<br>#   + shape minati dal corpus completo + endpoint URL-only (incl. content_discovery 2xx) come GET<br># dedup per shape (request_key = metodo + path-template) → merge_requests · scheme raggiungibile · in-scope<br># DROP delle shape GET dead/404 (dead_url_keys, sul corpus ora esteso da content_discovery/recrawl)"]
 param_fuzz["param_fuzz<br># query: ogni shape (dedup path-template, cap 50) · body+json: endpoint con body (form/xhr/POST,<br>#   cap 25, + probe sui GET) · header: subset (cap 15, solo x8). wordlist params custom-first.<br>arjun -i targets_&lt;loc&gt;.txt -oJ &lt;loc&gt;.json -m GET|POST|JSON -t 5 -T 15 --rate-limit 20 -q [--headers auth]<br>x8 -u targets_&lt;loc&gt;.txt -w params -O json -o &lt;loc&gt;.json [-X POST] [-t json] [--headers] [-H auth]<br># matrice (tool, location) in un pool cappato (PARAM_FANOUT=3); cap wall-clock per-tool 600s<br># collapse_global_params: un param trovato su ≥75% degli endpoint testati (≥5) = riflesso<br>#   SITE-WIDE → 1 record host-level {scope:site-wide}, non sprayato su ogni endpoint"]
 dast_full["dast_full<br># delta = shape in requests_full.jsonl NON già in requests.jsonl (request_key) + build_fuzz_requests(params)<br>#   dedup per shape, cap DAST_MAX_REQUESTS=1500 → raw/dast/input_full.jsonl ({request:{endpoint,raw}})<br>nuclei -dast -im jsonl -l input_full.jsonl -t &lt;dast templates&gt; -fa low -rl &lt;profilo&gt; -c &lt;profilo&gt;<br>       -timeout 10 -retries 2 -j -silent -duc [-H auth]<br># dedup_dast_findings: 1 record per (template, host, path, fuzz position), come in dast"]
+xss_full["xss_full<br># candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)<br>dalfox file &lt;raw&gt; --rawdata --format jsonl --skip-bav -w 30 --timeout 10 [--http] [-H auth]"]
+sqli_full["sqli_full<br># candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)<br>sqlmap -r &lt;raw&gt; --batch --smart --level 1 --risk 1 --threads 4 --disable-coloring [-H auth]"]
 cve_lookup_full["cve_lookup_full  ·  net=False<br># stessa correlazione offline di cve_lookup, sul corpus ora esteso<br>search_vulns -q '&lt;Prodotto Versione&gt;' -f json --ignore-general-product-vulns<br># delta = (prodotto,versione) NON in raw/cve/seen.txt · cache memo condivisa con la passata FASE 2"]
 tech_vulnscan["tech_vulnscan<br># gate: meta.tech contiene 'wordpress' (match a parola intera) · 1 scan stealthy per host (-body-dedup)<br>wpprobe scan -u &lt;host&gt; -o raw/wpprobe/scanN.json --rate-limit 20 -t 5 [-H &lt;auth&gt;]<br># parse_wpprobe: un finding per (componente,versione,CVE) · ordinati per severità/CVSS"]
 end
 request_catalog_full --> param_fuzz
 request_catalog_full --> dast_full
 param_fuzz --> dast_full
+request_catalog_full --> xss_full
+param_fuzz --> xss_full
+request_catalog_full --> sqli_full
+param_fuzz --> sqli_full
 BAR4 ==> P4
 FANIN[["④ FAN-IN · consolidate<br>findings/&lt;tipo&gt;.jsonl"]]
 P4 ==> FANIN
@@ -109,9 +117,9 @@ classDef phase4 fill:#3a1a08,stroke:#f08a4c,color:#fbe2d2;
 class provision_wl,expand,resolve,portscan,httpx breadth
 class portscan_full,nerva,nuclei_scope,screenshot span
 class passive_probe,crawl,crawl_headless,subenum,takeover,fetch_delta,api_spec,mine_responses,request_catalog phase1
-class dast,cve_lookup phase2
+class dast,xss,sqli,cve_lookup phase2
 class wordlist,tech_enum,content_discovery,recrawl phase3
-class request_catalog_full,param_fuzz,dast_full,cve_lookup_full,tech_vulnscan phase4
+class request_catalog_full,param_fuzz,dast_full,xss_full,sqli_full,cve_lookup_full,tech_vulnscan phase4
 class CLUSTER pivot
 class BAR2,BAR3,BAR4 bar
 class FANIN fanin

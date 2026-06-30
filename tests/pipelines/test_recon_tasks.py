@@ -195,9 +195,10 @@ def test_pipeline_object_shape():
     assert app == [
         "passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
         "fetch_delta", "api_spec", "mine_responses", "request_catalog",
-        "dast", "cve_lookup",
+        "dast", "xss", "sqli", "cve_lookup",
         "wordlist", "tech_enum", "content_discovery", "recrawl",
-        "request_catalog_full", "param_fuzz", "dast_full", "cve_lookup_full", "tech_vulnscan",
+        "request_catalog_full", "param_fuzz", "dast_full", "xss_full", "sqli_full",
+        "cve_lookup_full", "tech_vulnscan",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
     # httpx is the breadth tail; the expensive full scan runs ∥ as a spanning chain → nerva
@@ -1298,6 +1299,80 @@ def test_dedup_dast_findings_collapses_same_injection_point():
     assert keys[0] == ("cookie-injection", "https://a/x?category=cookie_injection")  # first wins
     assert ("cookie-injection", "https://a/y?category=cookie_injection") in keys     # distinct path
     assert sum(1 for r in out if r["template-id"] == "tech-detect") == 1             # non-fuzz deduped
+
+
+# --- dedicated vuln scanners (dalfox / sqlmap) ---
+def test_has_params_detects_fuzzable_input():
+    assert tasks._has_params({"params": [{"name": "x", "loc": "query"}]})  # enumerated param
+    assert tasks._has_params({"url": "http://a/?x=1"})                     # query string
+    assert tasks._has_params({"body": "a=1"})                              # body
+    assert not tasks._has_params({"url": "http://a/static", "params": []})  # nothing to fuzz
+
+
+def test_parse_dalfox_normalizes_poc_and_skips_noise():
+    out = ('hello banner line (not json)\n'
+           '{"type":"R","inject_type":"inHTML-URL","poc_type":"plain","method":"GET",'
+           '"data":"http://a/?q=PAYLOAD","param":"q","payload":"\'><svg>","evidence":"line 1",'
+           '"cwe":"CWE-79","severity":"Medium","message_str":"Reflected"}\n')
+    recs = tasks.parse_dalfox(out)
+    assert len(recs) == 1                       # banner line skipped, one PoC parsed
+    r = recs[0]
+    assert r["type"] == "xss"
+    assert r["param"] == "q"
+    assert r["severity"] == "medium"            # lowercased
+    assert r["matched-at"] == "http://a/?q=PAYLOAD"
+    assert r["sources"] == ["dalfox"]
+
+
+def test_parse_sqlmap_extracts_injection_points():
+    out = (
+        "sqlmap identified the following injection point(s) with a total of 50 HTTP(s) requests:\n"
+        "---\n"
+        "Parameter: productId (GET)\n"
+        "    Type: boolean-based blind\n"
+        "    Title: AND boolean-based blind - WHERE or HAVING clause\n"
+        "    Payload: productId=3 AND 1234=1234\n"
+        "\n"
+        "    Type: time-based blind\n"
+        "    Title: MySQL >= 5.0.12 AND time-based blind\n"
+        "    Payload: productId=3 AND SLEEP(5)\n"
+        "---\n"
+        "[INFO] the back-end DBMS is MySQL\n"
+    )
+    recs = tasks.parse_sqlmap(out, url="http://a/p?productId=3")
+    assert len(recs) == 2                                    # one per technique
+    assert {r["technique"] for r in recs} == {"boolean-based blind", "time-based blind"}
+    assert all(r["type"] == "sqli" for r in recs)
+    assert all(r["param"] == "productId" for r in recs)
+    assert all(r["location"] == "GET" for r in recs)
+    assert all(r["dbms"] == "MySQL" for r in recs)
+    assert recs[0]["matched-at"] == "http://a/p?productId=3"
+
+
+def test_parse_sqlmap_empty_when_not_injectable():
+    assert tasks.parse_sqlmap("all tested parameters do not appear to be injectable") == []
+
+
+def test_correlate_oast_matches_marker_dedups_and_ignores_noise():
+    uid = "d91abc44a9sslssmf88gnx5ua1t34kri8"
+    marker_map = {
+        "b3": {"url": "https://a/x?q=1", "method": "GET", "params": [{"name": "q", "loc": "query"}]},
+        "b7": {"url": "https://a/y", "method": "POST", "params": []},
+    }
+    interactions = [
+        {"full-id": f"b3.{uid}", "protocol": "dns", "remote-address": "1.2.3.4", "timestamp": "t1"},
+        {"full-id": f"b3.{uid}", "protocol": "dns", "remote-address": "1.2.3.4", "timestamp": "t2"},
+        {"full-id": f"b3.{uid}", "protocol": "http", "remote-address": "1.2.3.4", "timestamp": "t3"},
+        {"full-id": uid, "protocol": "dns"},            # bare domain → interactsh noise, ignored
+        {"full-id": f"bX.{uid}", "protocol": "dns"},    # unknown marker → ignored
+    ]
+    out = tasks.correlate_oast(interactions, marker_map, unique_id=uid)
+    assert len(out) == 2                                # b3/dns + b3/http; dup dns dropped; noise ignored
+    assert {r["oast_protocol"] for r in out} == {"dns", "http"}
+    assert out[0]["type"] == "xss"
+    assert out[0]["poc_kind"] == "blind"
+    assert out[0]["matched-at"] == "https://a/x?q=1"
+    assert out[0]["sources"] == ["dalfox", "interactsh"]
 
 
 # --- API spec discovery (OpenAPI/Swagger expansion) ---
