@@ -5,13 +5,14 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import pty
 import shlex
 import shutil
 import signal
 import subprocess
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
 from pipt.core.log import get_logger
@@ -137,10 +138,29 @@ def require(*tools: str) -> None:
         raise ToolNotFoundError(msg)
 
 
+@contextlib.contextmanager
+def _stdin_channel(stdin: str | None, *, stdin_tty: bool) -> Iterator[tuple[int | None, str | None]]:
+    """Resolve Popen's `stdin=` and the `communicate(input=)` payload, managing a pty when
+    `stdin_tty`. Yields `(popen_stdin, input_data)`. For `stdin_tty` a pty slave is the child's
+    stdin (so os.isatty(0) is True); both pty fds are closed on exit — the child keeps its own
+    dup as fd 0, and the idle master never receives data under --batch."""
+    if not stdin_tty:
+        yield (subprocess.PIPE if stdin is not None else None), stdin
+        return
+    master, slave = pty.openpty()
+    try:
+        yield slave, None
+    finally:
+        for fd in (slave, master):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
 def run(  # noqa: PLR0913
     cmd: Command,
     *,
     stdin: str | None = None,
+    stdin_tty: bool = False,
     check: bool = False,
     timeout: int | None = None,
     cwd: Path | None = None,
@@ -150,6 +170,12 @@ def run(  # noqa: PLR0913
     """Run a command, return stdout. When `stream_stderr` is set, the tool's
     stderr is inherited (printed live to the terminal) instead of suppressed —
     used by verbose mode to surface tool progress/logs.
+
+    `stdin_tty` hands the child a pty slave as stdin (mutually exclusive with `stdin`):
+    some tools gate behaviour on `os.isatty(0)` and, finding a plain pipe, silently
+    change mode — sqlmap in particular switches to reading targets from STDIN, so
+    `sqlmap -r <file>` then parses the request but tests NOTHING. A pty slave makes
+    isatty() True (the child never reads it under --batch), so -r is honoured.
 
     The child runs in its own session/process group and is tracked while live, so
     terminate_all() can kill it (and its grandchildren) at a teardown/abort — see the
@@ -163,29 +189,30 @@ def run(  # noqa: PLR0913
         msg = f"aborted before spawning: {cmd_str}"
         raise AbortedError(msg)
     log.debug("$ %s", cmd_str)
-    proc = subprocess.Popen(
-        list(cmd),
-        stdin=subprocess.PIPE if stdin is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=None if stream_stderr else subprocess.DEVNULL,
-        text=True,
-        errors="replace",  # a stray non-UTF-8 byte (e.g. a Windows-1252 quote in urlfinder/gau
-                           # OSINT output) → U+FFFD, never a UnicodeDecodeError that kills the stage
-        cwd=cwd,
-        start_new_session=True,  # own process group → killpg reaches grandchildren
-    )
-    _register(proc)
-    try:
-        out, _ = proc.communicate(input=stdin, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_group(proc, signal.SIGKILL)
-        proc.communicate()  # reap the killed group
-        raise
-    finally:
-        _unregister(proc)
-        if reap_group:  # sweep stragglers (e.g. headless chrome) even on a clean exit; pgid == pid
-            with contextlib.suppress(ProcessLookupError, OSError):
-                os.killpg(proc.pid, signal.SIGKILL)
+    with _stdin_channel(stdin, stdin_tty=stdin_tty) as (stdin_arg, input_data):
+        proc = subprocess.Popen(
+            list(cmd),
+            stdin=stdin_arg,
+            stdout=subprocess.PIPE,
+            stderr=None if stream_stderr else subprocess.DEVNULL,
+            text=True,
+            errors="replace",  # a stray non-UTF-8 byte (e.g. a Windows-1252 quote in urlfinder/gau
+                               # OSINT output) → U+FFFD, never a UnicodeDecodeError that kills the stage
+            cwd=cwd,
+            start_new_session=True,  # own process group → killpg reaches grandchildren
+        )
+        _register(proc)
+        try:
+            out, _ = proc.communicate(input=input_data, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc, signal.SIGKILL)
+            proc.communicate()  # reap the killed group
+            raise
+        finally:
+            _unregister(proc)
+            if reap_group:  # sweep stragglers (e.g. headless chrome) even on a clean exit; pgid == pid
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
     rc = proc.returncode
     if check and rc != 0:
         raise subprocess.CalledProcessError(rc, list(cmd), output=out)
