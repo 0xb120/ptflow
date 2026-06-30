@@ -46,6 +46,8 @@ Options:
 | `-v`, `--verbose` | Surface the exact command and full stdout/stderr of every tool on the console. The complete run log is **always** persisted to `<activity>/logs/run.log` regardless of this flag. |
 | `--resume` | Skip stages that a prior run of this activity already finished (`.state/<stage>.done` markers). Markers are invalidated automatically if the scope changes. |
 | `--observe [API_URL]` | Stream this run to the Prefect UI (run graph + task states + per-stage logs). `API_URL` defaults to the local server (`http://127.0.0.1:4200/api`); start it first with `pipt serve`. |
+| `--config PATH` | TOML file of operator knobs (profile, oast, tool paths, wordlists, …) instead of scattered env vars. See [`pipt.toml.example`](pipt.toml.example) and [Environment variables](#environment-variables). |
+| `--set KEY=VALUE` | Override one config knob, repeatable — highest precedence (e.g. `--set oast=on --set profile=home`). |
 
 Exit codes: **`0`** all stages OK · **`1`** one or more stages failed (CI/automation signal) · **`130`** interrupted with Ctrl-C — partial results are saved; resume with `--resume`.
 
@@ -56,6 +58,10 @@ uv run pipt run example demo ./scope.txt -v
 # the real recon toolchain against an authorized scope
 echo "https://ginandjuice.shop/" > scope.txt
 uv run pipt run recon ginandjuice ./scope.txt -v
+
+# with a config file of operator knobs + a one-off override (precedence: --set > env > file > default)
+cp pipt.toml.example pipt.toml      # then edit it
+uv run pipt run recon ginandjuice ./scope.txt --config pipt.toml --set oast=on
 ```
 
 ### `pipt serve` — Prefect server + UI (observability)
@@ -84,9 +90,17 @@ uv run pytest tests/core/test_orchestrator.py                 # run one test fil
 
 ## Environment variables
 
-All tunables are environment variables, read by the **`recon`** pipeline (the `example` pipeline
-ignores them). Set them **before** launching the run — `PIPT_PROFILE` / `PIPT_NET_LIMIT` are
-resolved at import time, so exporting them mid-run has no effect.
+These operator knobs (read by the **`recon`** pipeline; the `example` pipeline ignores them) can be set
+in a **config file** (`--config pipt.toml`, see [`pipt.toml.example`](pipt.toml.example)) or as `PIPT_*`
+environment variables. **Precedence: `--set KEY=VALUE` (CLI, repeatable) > `PIPT_*` env var > config
+file > default.** The CLI applies the resolved values **before** the pipeline is imported and snapshots
+the effective config (secrets redacted) to `<activity>/config.toml` for reproducibility (re-feedable
+with `--config`). The table below lists each `PIPT_*` var; the equivalent config-key is in
+[`pipt.toml.example`](pipt.toml.example) (e.g. `PIPT_HTTP_HEADER` → `http_header`, `PIPT_SQLMAP` →
+`tools.sqlmap`, `PIPT_WL_<ROLE>` → `wordlists.roles.<role>`). If you use env vars **directly** (not via
+config), set them **before** launching — `PIPT_PROFILE` / `PIPT_NET_LIMIT` are resolved at import time.
+The ~119 internal tuning constants (caps/timeouts/thresholds) are **not** exposed here — they stay as
+expert defaults in the code; `profile` is the bundle for the rate-sensitive ones.
 
 ### Load & rate
 
@@ -102,12 +116,16 @@ resolved at import time, so exporting them mid-run has no effect.
 | `PIPT_HTTP_HEADER` | `Name: value` headers, multiple separated by newlines or `;;` | Operator session headers/cookies threaded into katana/httpx/nuclei (`-H`), arjun (`--headers`) and x8 (`-H`) so the crawl/fetch/fuzz/DAST reach the **authenticated** surface. |
 | `PIPT_RECRAWL` | `on` (default) · `preview` · `off` | The `recrawl` stage: `on` crawls fuzzing-discovered entry points into new territory; `preview` writes/logs the seeds (`raw/recrawl/seeds.txt`) **without** crawling; `off` skips it. |
 | `PIPT_DEEP_DIVE` | truthy to enable · default off | Opt-in stage-3 content-discovery **deep dive** (huge Assetnote *manual* lists at full depth, on a few high-value hosts only). Off by default — it costs hours/host. |
+| `PIPT_OAST` | truthy to enable · default off | Opt-in **blind-XSS via OAST**: dalfox `-b` fires blind payloads at an `interactsh-client` (≥1.3) run alongside the dalfox passes; each request gets a unique callback so a **synchronous** hit correlates per-request. Off by default (adds the interactsh dependency and, by default, routes callbacks through the public oast servers — a RoE/privacy note). |
+| `PIPT_INTERACTSH_SERVER` | public oast servers | Self-hosted interactsh server(s) for OAST, so callbacks don't transit third-party infra. |
+| `PIPT_INTERACTSH_TOKEN` | — | Auth token for a protected/self-hosted interactsh server. |
 
 ### Tool & path overrides
 
 | Variable | Default | What it does |
 |----------|---------|--------------|
 | `PIPT_NUCLEI_DAST_TEMPLATES` | `~/nuclei-templates/dast` | Directory of nuclei `-dast` fuzzing templates. The DAST steps skip (best-effort) if it (or nuclei) is absent. |
+| `PIPT_SQLMAP` | `/opt/sqlmap-dev/sqlmap.py` | Path to the `sqlmap.py` script for the `sqli`/`sqli_full` scanners (run via the venv interpreter). Best-effort: the step skips if absent. (dalfox, for `xss`/`xss_full`, is resolved from `~/go/bin`.) |
 | `PIPT_SEARCH_VULNS` | `~/.local/bin/search_vulns` | Path to the `search_vulns` binary used by the CVE-lookup steps (offline, local DB). Build/refresh the DB out-of-band: `search_vulns -u`. |
 | `PIPT_EYEWITNESS` | auto (`eyewitness` on PATH › `/opt/EyeWitness` venv) | Full EyeWitness launch command override for the optional `screenshot` EyeWitness pass. |
 

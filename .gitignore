@@ -5,3 +5,6 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 dist/
+
+# operator run config (may hold session cookies/tokens); the template pipt.toml.example IS tracked
+pipt.toml
