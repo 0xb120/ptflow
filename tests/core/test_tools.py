@@ -142,6 +142,17 @@ def test_terminate_all_noop_when_idle():
     assert tools.terminate_all() == 0
 
 
+def test_run_stdin_tty_makes_child_stdin_a_tty():
+    # sqlmap (and kin) gate on os.isatty(0): a plain pipe makes `sqlmap -r` silently switch to
+    # reading targets from STDIN and test NOTHING. stdin_tty hands the child a pty slave so
+    # isatty(0) is True. This regression-guards that fix.
+    import sys
+
+    out = tools.run([sys.executable, "-c", "import os,sys; print(os.isatty(sys.stdin.fileno()))"],
+                    stdin_tty=True)
+    assert out.strip() == "True"
+
+
 def test_terminate_all_kills_running_process():
     import threading
 

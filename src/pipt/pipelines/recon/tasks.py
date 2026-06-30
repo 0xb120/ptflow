@@ -4042,13 +4042,19 @@ def _run_sqlmap(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
         cmd = [*SQLMAP_CMD, "-r", str(reqfile), "--batch", "--smart", "--level", SQLMAP_LEVEL,
                "--risk", SQLMAP_RISK, "--threads", SQLMAP_THREADS, "--disable-coloring",
                "--output-dir", str(reqdir / f"out_{i}")]
+        # The `raw` request carries only `Host:` (no scheme), so sqlmap defaults to http — on an
+        # https-only target that means a 302→https round-trip on EVERY probe (minutes/request) and
+        # tests the wrong endpoint. Force https from the catalog url's scheme; http needs no flag.
+        if str(r.get("url") or "").lower().startswith("https"):
+            cmd.append("--force-ssl")
         if auth:
             cmd += ["--headers", "\n".join(auth)]
         try:
-            # stdin="" → EOF, so sqlmap doesn't block reading STDIN for a targets list (it does when
-            # stdin is a live TTY). Default verbosity (NOT -v 0, which suppresses the injection block
-            # parse_sqlmap keys on).
-            return parse_sqlmap(tools.run(cmd, stdin="", timeout=VULN_TOOL_TIMEOUT,
+            # stdin_tty: sqlmap gates on os.isatty(0) — given a plain pipe it silently reads targets
+            # from STDIN and IGNORES `-r` (tests nothing). A pty slave keeps -r honoured; --batch means
+            # it never blocks reading it. Default verbosity (NOT -v 0, which suppresses the injection
+            # block parse_sqlmap keys on).
+            return parse_sqlmap(tools.run(cmd, stdin_tty=True, timeout=VULN_TOOL_TIMEOUT,
                                           stream_stderr=is_verbose()), url=r.get("url"))
         except subprocess.TimeoutExpired:
             log.warning("⚠ %s: sqlmap hit the %ds cap on %s", stage, VULN_TOOL_TIMEOUT, r.get("url"))
