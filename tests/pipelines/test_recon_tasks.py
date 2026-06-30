@@ -1106,6 +1106,72 @@ def test_merge_requests_dedups_by_shape_and_unions_sources_and_params():
     assert {("id", "query"), ("ref", "query")} == {(p["name"], p["loc"]) for p in merged["params"]}
 
 
+def test_request_params_captures_observed_values():
+    q = {(p["name"], p.get("value")) for p in tasks.request_params("https://a/x?id=3&q=")}
+    assert q == {("id", "3"), ("q", "")}                    # observed value kept, blank kept as ''
+    j = {(p["name"], p.get("value")) for p in
+         tasks.request_params("https://a/x", body='{"a":"v","b":2}', content_type="application/json")}
+    assert ("a", "v") in j
+
+
+def test_normalize_request_folds_query_params_into_url_and_raw():
+    # the bug: params advertised but absent from raw → a bare GET fed to sqlmap/dalfox has nothing to fuzz
+    rec = {"method": "GET", "url": "https://a/catalog", "headers": {}, "body": "",
+           "params": [{"name": "category", "loc": "query", "value": ""},      # blank → seeded
+                      {"name": "id", "loc": "query", "value": "7"}],          # observed → reused
+           "raw": "GET /catalog HTTP/1.1\r\nHost: a\r\n\r\n", "sources": ["x"]}
+    out = tasks.normalize_request(rec)
+    assert "category=1" in out["url"]        # blank value seeded
+    assert "id=7" in out["url"]              # observed value reused
+    assert "category=1" in out["raw"]        # raw realigned to the params
+    assert "id=7" in out["raw"]
+    assert tasks._has_params(out)
+
+
+def test_normalize_request_folds_body_params_and_sets_content_type():
+    rec = {"method": "POST", "url": "https://a/cart", "headers": {}, "body": "",
+           "params": [{"name": "productId", "loc": "body", "value": ""}],
+           "raw": "POST /cart HTTP/1.1\r\nHost: a\r\n\r\n", "sources": ["x"]}
+    out = tasks.normalize_request(rec)
+    assert out["body"] == "productId=1"
+    assert "Content-Type: application/x-www-form-urlencoded\r\n" in out["raw"]
+    assert out["raw"].endswith("\r\n\r\nproductId=1")
+
+
+def test_normalize_request_leaves_paramless_record_untouched():
+    rec = {"method": "GET", "url": "https://a/page", "params": [],
+           "raw": "GET /page HTTP/1.1\r\nHost: a\r\nCookie: s=1\r\n\r\n", "sources": ["katana"]}
+    assert tasks.normalize_request(rec) is rec              # authoritative raw preserved verbatim
+
+
+def test_merge_requests_realigns_raw_when_paramless_variant_wins():
+    # bare /catalog (no params, first) + a form variant carrying category/searchTerm → merged raw must
+    # carry the unioned params (this is the regression: first-wins kept the param-less raw)
+    bare = {"method": "GET", "url": "https://a/catalog", "headers": {}, "body": "", "params": [],
+            "raw": "GET /catalog HTTP/1.1\r\nHost: a\r\n\r\n", "sources": ["url"]}
+    form = {"method": "GET", "url": "https://a/catalog?category=&searchTerm=", "headers": {}, "body": "",
+            "params": [{"name": "category", "loc": "query", "value": ""},
+                       {"name": "searchTerm", "loc": "query", "value": ""}],
+            "raw": "GET /catalog?category=&searchTerm= HTTP/1.1\r\nHost: a\r\n\r\n",
+            "sources": ["html-form"]}
+    [merged] = tasks.merge_requests([bare, form])
+    assert {("category", "query"), ("searchTerm", "query")} == {(p["name"], p["loc"]) for p in merged["params"]}
+    assert "category=" in merged["raw"]
+    assert "searchTerm=" in merged["raw"]
+    assert tasks._has_params(merged)
+
+
+def test_merge_requests_upgrades_blank_param_value_with_observed():
+    a = {"method": "GET", "url": "https://a/p/1", "headers": {}, "body": "",
+         "params": [{"name": "productId", "loc": "query", "value": ""}],
+         "raw": "GET /p/1 HTTP/1.1\r\nHost: a\r\n\r\n", "sources": ["a"]}
+    b = {"method": "GET", "url": "https://a/p/2?productId=3", "headers": {}, "body": "",
+         "params": [{"name": "productId", "loc": "query", "value": "3"}],
+         "raw": "GET /p/2?productId=3 HTTP/1.1\r\nHost: a\r\n\r\n", "sources": ["b"]}
+    [merged] = tasks.merge_requests([a, b])                 # same (GET,/p/*) shape → one record
+    assert "productId=3" in merged["raw"]                  # observed value won over the blank
+
+
 def test_auth_headers_parses_env(monkeypatch):
     monkeypatch.setenv("PIPT_HTTP_HEADER", "Cookie: s=1;;Authorization: Bearer x\nBad")
     assert tasks._auth_headers() == ["Cookie: s=1", "Authorization: Bearer x"]    # 'Bad' (no ':') dropped

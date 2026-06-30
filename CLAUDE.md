@@ -506,7 +506,9 @@ artifacts so write-once holds and each DAST pass reads exactly its scope.
   + **shapes mined from the crawl corpus** + the URL-only sources (passive/crawley/jsluice, as GET) →
   `requests.jsonl`, scheme-normalized (`_working_schemes`, incl. the http fallback) + in-scope-filtered,
   deduped by request shape (`request_key` = method + `path_template`; `merge_requests` unions
-  params/sources). The `raw` is scheme-agnostic (path + Host), so only the `url` field is re-schemed.
+  params/sources, then **`normalize_request` realigns** each merged record's `url`/`body`/`raw` to its
+  unioned params — see the realignment design note). The `raw` is scheme-agnostic (path + Host), so only
+  the `url` field is re-schemed.
   **Dead-endpoint drop:** GET shapes whose path the corpus only ever saw as **404/410** (`dead_url_keys`
   over the `-srd` index statuses — offline, no new traffic) are removed, so DAST/param_fuzz don't burn
   payloads on malformed passive/archive URLs (`/about</a>`, `/)`) or phantom JS routes (`/catalog/filter`
@@ -772,6 +774,38 @@ A git diff of any of them shows exactly how the flow changed:
 
 The architecture sections above say *what* the recon pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **The catalog REALIGNS `raw` to the unioned params after the merge (`normalize_request`), and seeds a
+  non-blank value.** A run-analysis (`pipt-recon-20260630`) found the phase-2 surface scanners testing
+  nothing: sqlmap exited in ~1s with "no testable parameter", DAST produced 2 low-value records, and the
+  dedicated dalfox/sqlmap found 0 SQLi / 0 XSS on three deliberately-vulnerable targets — including
+  ginandjuice, whose known SQLi/XSS live on `/catalog?category=`. Root cause: `merge_requests` dedups by
+  `request_key` (method + path_template, query-insensitive) with **first-wins** on `url`/`raw` but
+  **union** on `params`. When the param-LESS variant of a shape won (a bare `/catalog` from a URL-only
+  source beating the html-form variant carrying `category`/`searchTerm`), the merged record advertised
+  params that its `raw` — what nuclei `-im jsonl` / dalfox `--rawdata` / sqlmap `-r` actually fuzz — never
+  contained. `build_raw_request` only ever read the URL's existing query string, never the `params` list.
+  Blast radius on that run: query params missing from `raw` in 4/6 (ginandjuice), 3/8 (vulnweb), 8/8 (zero)
+  surface GET shapes. Fix: `merge_requests` now calls `normalize_request` on each merged record — it folds
+  every `loc=query` param into the URL query, every `loc=body`/`json` param into the body, and rebuilds
+  `raw` to match. Each param gets its **observed value** (now captured by `request_params`/`_qs_pairs` as a
+  `value` field that survives the merge, preferring a non-blank one) or **`PARAM_SEED_VALUE`** (`"1"`) — a
+  non-empty token fuzzes better than a bare `name=` (sqlmap's heuristic/boolean tests, dalfox's reflection
+  probes). *Why realign at the merge, not in the scanners:* one choke point feeds `dast`/`xss`/`sqli` +
+  their `_full` passes + the persisted `requests.jsonl`, so the catalog on disk is itself correct +
+  debuggable; idempotent, so re-merging in `dast_requests` (catalog + `build_fuzz_requests`) also seeds the
+  synthesized param requests. *Why leave a param-LESS record untouched:* it returns the rec unchanged,
+  preserving an authoritative `raw` (e.g. katana's own, with its real headers) — only records advertising
+  query/body/json params are rebuilt, and those were broken anyway. *Why a value at all (fix #2):* an empty
+  `?category=` is a weaker seed; observed values (`productId=3`) are reused, the rest get `1`. *Verified:*
+  on the analyzed run's records `/catalog` → `GET /catalog?category=1&searchTerm=1`, `/vulnerabilities` →
+  `?ref=1`, while `?postId=4`/`?productId=3` keep their observed values. *Rejected:* fixing it inside each
+  scanner runner (three+ call sites, and the persisted catalog would stay wrong); rebuilding `raw` from the
+  `headers` dict for every record (would drop headers only present in katana's authoritative raw — so
+  untouched-when-paramless instead); dropping the value seed (empty `name=` under-tests sqlmap/dalfox).
+  *Open:* the efficacy TUNING this unblocks but doesn't itself solve — sqlmap level/risk, ensuring the real
+  injection points sit within `VULN_MAX_REQUESTS`, and the `category` site-wide-collapse interaction that
+  can move a real injection point off its endpoint.
 
 - **OAST/blind-XSS is within-run + best-effort (synchronous callbacks only), correlated per-request via
   the per-request runner.** dalfox `-b` fires blind payloads at an interactsh callback, but the hit lands
