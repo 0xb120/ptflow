@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qsl, unquote, unquote_plus, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urljoin, urlsplit, urlunsplit
 
 from pipt.core import scope, tools, workspace
 from pipt.core.log import get_logger, is_verbose
@@ -1232,26 +1232,99 @@ def build_raw_request(method: str, url: str, headers: Mapping[str, str] | None =
     return "\r\n".join(lines) + "\r\n\r\n" + body
 
 
+def _qs_pairs(qs: str) -> list[tuple[str, str]]:
+    """(name, value) pairs of a query/urlencoded string, first value per name kept, blanks kept
+    ('a=1&b=&a=2' → [('a','1'),('b','')]). Pure — the param surface WITH the observed values."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for k, v in parse_qsl(qs, keep_blank_values=True):
+        if k and k not in seen:
+            seen.add(k)
+            out.append((k, v))
+    return out
+
+
 def _qs_names(qs: str) -> list[str]:
     """Parameter names of a query/urlencoded-body string ('a=1&b=2' → ['a','b']), deduped. Pure."""
-    return tools.dedupe([k for k, _ in parse_qsl(qs, keep_blank_values=True) if k])
+    return [k for k, _ in _qs_pairs(qs)]
 
 
 def request_params(url: str, body: str = "", content_type: str = "") -> list[dict]:
-    """Known parameters of a request with their LOCATION: query (URL), body (urlencoded) or json (JSON
-    object keys; content-type or body shape decides). Names only (values dropped). Pure — the param
-    surface the DAST/param steps reason about."""
-    out: list[dict] = [{"name": n, "loc": "query"}
-                       for n in _qs_names(urlsplit(url if "://" in url else f"http://{url}").query)]
+    """Known parameters of a request with their LOCATION and observed VALUE: query (URL), body
+    (urlencoded) or json (JSON object keys; content-type or body shape decides). The value (blank when
+    none was seen) is kept so normalize_request can re-seed a request with a realistic token instead of
+    an empty `name=`. Pure — the param surface the DAST/param steps reason about."""
+    out: list[dict] = [{"name": n, "loc": "query", "value": v}
+                       for n, v in _qs_pairs(urlsplit(url if "://" in url else f"http://{url}").query)]
     b = body.strip()
     if b:
         if "json" in content_type.lower() or b[:1] in "{[":
             obj = _try_json(b)
             if isinstance(obj, dict):
-                out += [{"name": str(k), "loc": "json"} for k in obj]
+                out += [{"name": str(k), "loc": "json", "value": v} for k, v in obj.items()]
         else:
-            out += [{"name": n, "loc": "body"} for n in _qs_names(b)]
+            out += [{"name": n, "loc": "body", "value": v} for n, v in _qs_pairs(b)]
     return out
+
+
+# Placeholder value for a known param with no observed value: a non-empty token fuzzes better than a
+# bare `name=` (sqlmap's heuristic/boolean tests and dalfox's reflection probes need something in the
+# slot; nuclei -dast fuzzes regardless). Observed values are reused when present (see normalize_request).
+PARAM_SEED_VALUE = "1"
+
+
+def _seeded(value: object, fallback: str = PARAM_SEED_VALUE) -> str:
+    """An observed value as a string, or the seed when it's blank/None. Pure."""
+    s = "" if value is None else str(value)
+    return s or fallback
+
+
+def normalize_request(rec: dict) -> dict:
+    """Realign a catalog request's url/body/raw so EVERY known param (rec['params']) is actually present
+    in the request the scanners fuzz. This closes the gap where merge_requests unions params across
+    duplicate shapes but keeps a param-LESS variant's url/raw (first-wins): the merged record then
+    advertised params nuclei/dalfox/sqlmap never saw — a bare `GET /catalog` fed to sqlmap exits with
+    'no testable parameter', and the real injection point (ginandjuice's `category`) was never tested.
+
+    Query params are folded into the URL query, body params into a urlencoded body, json params into a
+    JSON body; each gets its observed value when known, else PARAM_SEED_VALUE. A request with no
+    query/body/json params is returned UNCHANGED, preserving an authoritative `raw` (e.g. katana's own).
+    Pure."""
+    params = rec.get("params") or []
+    q = [p for p in params if p.get("loc") == "query"]
+    b = [p for p in params if p.get("loc") == "body"]
+    j = [p for p in params if p.get("loc") == "json"]
+    if not (q or b or j):
+        return rec
+    method = (rec.get("method") or "GET").upper()
+    url = rec.get("url") or ""
+    parts = urlsplit(url if "://" in url else f"http://{url}")
+    # query: keep existing pairs (re-seeding blanks), then append known query params not already present
+    qval = {p["name"]: p.get("value") for p in q}
+    pairs = [(k, v or _seeded(qval.get(k))) for k, v in _qs_pairs(parts.query)]
+    have = {k for k, _ in pairs}
+    pairs += [(p["name"], _seeded(p.get("value"))) for p in q if p["name"] not in have]
+    new_url = urlunsplit((parts.scheme, parts.netloc, parts.path or "/", urlencode(pairs), parts.fragment))
+    headers = dict(rec.get("headers") or {})
+    body = rec.get("body") or ""
+    if j:                                              # json body wins when json params are present
+        obj = _try_json(body) if body.strip()[:1] in "{[" else None
+        obj = dict(obj) if isinstance(obj, dict) else {}
+        for p in j:
+            if not obj.get(p["name"]):
+                obj[p["name"]] = p.get("value") if p.get("value") not in (None, "") else PARAM_SEED_VALUE
+        body = json.dumps(obj)
+        headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+        headers["Content-Type"] = "application/json"
+    elif b:
+        bval = {p["name"]: p.get("value") for p in b}
+        bpairs = [(k, v or _seeded(bval.get(k))) for k, v in _qs_pairs(body)]
+        bhave = {k for k, _ in bpairs}
+        bpairs += [(p["name"], _seeded(p.get("value"))) for p in b if p["name"] not in bhave]
+        body = urlencode(bpairs)
+        headers = {k: v for k, v in headers.items() if k.lower() not in ("content-type", "content-length")}
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    return {**rec, "url": new_url, "body": body, "raw": build_raw_request(method, new_url, headers, body)}
 
 
 def _form_field_names(form: dict) -> list[str]:
@@ -1328,23 +1401,31 @@ def request_key(rec: dict) -> tuple:
 
 
 def merge_requests(records: Iterable[dict]) -> list[dict]:
-    """Dedup catalog requests by request_key (first wins): union `sources`, union `params` by
-    (name,loc). Deterministic order. Pure — the catalog merge across crawl/headless/specs/params."""
+    """Dedup catalog requests by request_key (first wins for url/headers/body): union `sources`, union
+    `params` by (name,loc) preferring a NON-BLANK observed value, then realign each merged record's
+    url/body/raw to its unioned params via normalize_request — otherwise first-wins keeps a param-less
+    variant's raw and the unioned params would never reach the fuzzers. Deterministic order. Pure — the
+    catalog merge across crawl/headless/specs/params."""
     by_key: dict[tuple, dict] = {}
     for r in records:
         key = request_key(r)
         if key not in by_key:
             by_key[key] = {**r, "sources": sorted(set(r.get("sources") or [])),
-                           "params": list(r.get("params") or [])}
+                           "params": [dict(p) for p in (r.get("params") or [])]}
             continue
         cur = by_key[key]
         cur["sources"] = sorted(set(cur["sources"]) | set(r.get("sources") or []))
-        seen = {(p.get("name"), p.get("loc")) for p in cur["params"]}
+        idx = {(p.get("name"), p.get("loc")): p for p in cur["params"]}
         for p in r.get("params") or []:
-            if (p.get("name"), p.get("loc")) not in seen:
-                cur["params"].append(p)
-                seen.add((p.get("name"), p.get("loc")))
-    return sorted(by_key.values(), key=lambda r: (r.get("url") or "", r.get("method") or ""))
+            k = (p.get("name"), p.get("loc"))
+            if k not in idx:
+                np = dict(p)
+                cur["params"].append(np)
+                idx[k] = np
+            elif not idx[k].get("value") and p.get("value"):
+                idx[k]["value"] = p.get("value")        # upgrade a blank value with an observed one
+    return [normalize_request(r) for r in
+            sorted(by_key.values(), key=lambda r: (r.get("url") or "", r.get("method") or ""))]
 
 
 def _url_to_get_request(url: str, source: str) -> dict:
