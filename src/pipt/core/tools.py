@@ -90,6 +90,42 @@ def terminate_all(*, grace: float = 3.0) -> int:
     return len(procs)
 
 
+def spawn(cmd: Command, *, stderr_path: Path | None = None) -> subprocess.Popen:
+    """Launch a long-lived BACKGROUND process (e.g. an interactsh-client OAST daemon) tracked for
+    teardown — terminate_all() kills it on abort, like a foreground run(). Own session/process group
+    (killpg reaches grandchildren). stdout → DEVNULL; stderr → stderr_path if given (so the caller can
+    poll it, e.g. for a registered callback domain), else DEVNULL. The caller MUST stop() it."""
+    if _aborting.is_set():
+        msg = f"aborted before spawning: {shlex.join(list(cmd))}"
+        raise AbortedError(msg)
+    log.debug("$ (bg) %s", shlex.join(list(cmd)))
+    errf = stderr_path.open("w", encoding="utf-8") if stderr_path else None
+    try:
+        proc = subprocess.Popen(list(cmd), stdout=subprocess.DEVNULL,
+                                stderr=errf if errf is not None else subprocess.DEVNULL,
+                                text=True, start_new_session=True)
+    finally:
+        if errf is not None:
+            errf.close()  # the child holds its own dup'd fd
+    _register(proc)
+    return proc
+
+
+def stop(proc: subprocess.Popen, *, grace: float = 2.0) -> None:
+    """Terminate a spawn()ed background process group (SIGTERM, brief grace, then SIGKILL) and untrack
+    it. Idempotent / safe on an already-exited process."""
+    if proc.poll() is None:
+        _kill_group(proc, signal.SIGTERM)
+        end = time.monotonic() + grace
+        while time.monotonic() < end and proc.poll() is None:
+            time.sleep(0.1)
+        if proc.poll() is None:
+            _kill_group(proc, signal.SIGKILL)
+    with contextlib.suppress(Exception):
+        proc.communicate(timeout=1)  # reap the group
+    _unregister(proc)
+
+
 class ToolNotFoundError(RuntimeError):
     """A required external tool is not on PATH."""
 

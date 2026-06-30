@@ -54,6 +54,11 @@ class ReconPipeline:
         # nuclei -dast over the surface catalog (observed params) — fast, high-signal findings on the
         # real attack surface BEFORE sinking hours into fuzzing. Reads requests.jsonl across the barrier.
         Stage("dast", tasks.dast, per_app=True, phase=2),
+        # dedicated vuln scanners over the explorable surface (full requests, every param location) —
+        # dalfox (XSS) ∥ sqlmap (SQLi), each tool's own engine decides (no gf-style name routing). The
+        # high-signal complement to nuclei -dast's generic templates. Best-effort; run ∥ dast/cve_lookup.
+        Stage("xss", tasks.xss, per_app=True, phase=2),
+        Stage("sqli", tasks.sqli, per_app=True, phase=2),
         # CVE lookup over the explorable-surface enumerated software (web server + tech + service banners
         # + corpus libs) — OFFLINE correlation (net=False, no target traffic), runs ∥ dast (same phase,
         # no needs). Records the covered (product,version) set so the phase-4 pass reports only the delta.
@@ -72,6 +77,12 @@ class ReconPipeline:
         Stage("request_catalog_full", tasks.request_catalog_full, per_app=True, phase=4, net=False),
         Stage("param_fuzz", tasks.param_fuzz, needs=("request_catalog_full",), per_app=True, phase=4),
         Stage("dast_full", tasks.dast_full, needs=("request_catalog_full", "param_fuzz"),
+              per_app=True, phase=4),
+        # dedicated vuln scanners over the GUESSED-surface delta + discovered params (the dalfox/sqlmap
+        # analog of dast_full): fuzz only what phase 2 didn't already cover. Need the full catalog + params.
+        Stage("xss_full", tasks.xss_full, needs=("request_catalog_full", "param_fuzz"),
+              per_app=True, phase=4),
+        Stage("sqli_full", tasks.sqli_full, needs=("request_catalog_full", "param_fuzz"),
               per_app=True, phase=4),
         # CVE lookup over the EXPANDED enumeration (the phase-3 crawl grew the corpus) — OFFLINE, runs ∥
         # dast_full; reports only the delta vs the phase-2 pass (raw/cve/seen.txt).
