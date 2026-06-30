@@ -355,8 +355,12 @@ NUCLEI_DAST_TEMPLATES = os.environ.get("PIPT_NUCLEI_DAST_TEMPLATES") or str(_NUC
 # process per request so EVERY param location is tested (query/body/json/header/cookie), not GET-only.
 # No candidate heuristic (gf-style param-NAME routing deliberately rejected): every parameterized
 # request is a candidate and each tool's OWN engine decides — dalfox by reflection+context, sqlmap by
-# its --smart heuristic + boolean/error/union/time tests. Surface (phase 2) + delta (phase 4), mirroring
-# dast/dast_full. Best-effort; per-request wall-clock cap (the arjun/x8/feroxbuster livelock lesson).
+# its boolean/error/union/time tests. NOT --smart: its basic heuristic only fires on a reflected DBMS
+# error, so a boolean/UNION SQLi that leaks NO error (e.g. ginandjuice `category`) is skipped untested
+# — verified. We run the full per-param tests + --text-only (compare visible text only) so detection
+# survives a content-DYNAMIC page, where the default page-comparison is "not stable" and misses the
+# injection — verified: --smart→0, --text-only L1/R1→boolean+UNION in ~14s. Surface (phase 2) + delta
+# (phase 4), mirroring dast/dast_full. Best-effort; per-request wall-clock cap (arjun/x8 livelock lesson).
 _DALFOX_BIN = Path.home() / "go" / "bin" / "dalfox"
 DALFOX = str(_DALFOX_BIN) if _DALFOX_BIN.exists() else "dalfox"
 _SQLMAP_SCRIPT = os.environ.get("PIPT_SQLMAP") or "/opt/sqlmap-dev/sqlmap.py"
@@ -4019,10 +4023,12 @@ def _run_dalfox(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
 
 
 def _run_sqlmap(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label: str) -> None:
-    """Run sqlmap over each candidate request's `raw` (-r), one process per request, --batch --smart so
-    sqlmap's OWN heuristic prunes inert params (no name routing). Injection block parsed from stdout →
-    findings/<out_name>. Best-effort: skips if the sqlmap script or parameterized requests are absent.
-    On the per-request timeout that request yields nothing (sqlmap prints its result block at the end)."""
+    """Run sqlmap over each candidate request's `raw` (-r), one process per request. --text-only (NOT
+    --smart): --smart's basic heuristic only fires on a reflected DBMS error, so it skips a boolean/UNION
+    SQLi that leaks none (ginandjuice `category`); --text-only compares visible text so detection holds on
+    a content-dynamic ("not stable") page. Injection block parsed from stdout → findings/<out_name>.
+    Best-effort: skips if the sqlmap script or parameterized requests are absent. On the per-request
+    timeout that request yields nothing (sqlmap prints its result block at the end)."""
     stage = out_name.removesuffix(".jsonl")
     if not Path(_SQLMAP_SCRIPT).exists():
         log.debug("  · skip %s (sqlmap not found at %s) for %s", stage, _SQLMAP_SCRIPT, label)
@@ -4039,7 +4045,7 @@ def _run_sqlmap(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
         i, r = i_r
         reqfile = reqdir / f"{stage}_{i}.txt"
         reqfile.write_text(r.get("raw") or "", encoding="utf-8")
-        cmd = [*SQLMAP_CMD, "-r", str(reqfile), "--batch", "--smart", "--level", SQLMAP_LEVEL,
+        cmd = [*SQLMAP_CMD, "-r", str(reqfile), "--batch", "--text-only", "--level", SQLMAP_LEVEL,
                "--risk", SQLMAP_RISK, "--threads", SQLMAP_THREADS, "--disable-coloring",
                "--output-dir", str(reqdir / f"out_{i}")]
         # The `raw` request carries only `Host:` (no scheme), so sqlmap defaults to http — on an
