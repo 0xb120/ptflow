@@ -30,6 +30,7 @@ uv sync --all-groups                                   # install (incl. dev/lint
 uv run pipt run <pipeline> <activity> <scope.txt> [--root DIR] [-v] [--resume]
                                                        # output → <root>/<activity>/ (root defaults to cwd)
                                                        # --resume: skip stages a prior run finished (same scope)
+                  [--config pipt.toml] [--set KEY=VALUE ...]   # operator knobs (see "Run config")
 uv run ruff check . && uv run ty check src/ && uv run pytest   # the full dev gate
 uv run pytest tests/core/test_orchestrator.py          # one file
 uv run pytest tests/core/test_scope.py::test_classify  # one test
@@ -46,6 +47,24 @@ uv run pytest tests/core/test_scope.py::test_classify  # one test
     masquerade as a clean empty result — the failure shows on the console even without `-v`.
 - Ruff runs with `select = ["ALL"]`; respect the `ignore`/`per-file-ignores` in `pyproject.toml`
   rather than adding blanket `# noqa`. `ty` is the type checker (not mypy).
+
+### Run config (operator knobs)
+
+The **operator-facing** knobs (the ~14 `PIPT_*` env vars: `profile`, `oast`, `net_limit`, `http_header`,
+`recrawl`, `deep_dive`, tool paths, wordlist dir/roles, interactsh server/token) can be set in an
+optional TOML file (`--config pipt.toml`; see `pipt.toml.example` for the annotated template) instead of
+scattered env vars. Resolution is `core/runconfig.py` (pure `resolve()` + thin `apply()`/`snapshot()`),
+loaded by the CLI's `_run`. **Precedence: `--set KEY=VALUE` (CLI, repeatable) > `PIPT_*` env var >
+config file > code default.** The CLI writes the resolved knobs into `os.environ` **before** importing
+the pipeline (its constants read `PIPT_*` at import) — so `orchestrate`/`load_pipeline` are imported
+*inside* `cli._run`, after `runconfig.apply()`; the existing env reads stay the single consumption point
+(no constant re-plumbed). The effective values (secrets — `http_header`/`interactsh.token` — redacted)
+are snapshotted to `<activity>/config.toml` for reproducibility (re-feedable with `--config`). Enums
+(`profile`, `recrawl`) are validated and unknown keys warned (config errors exit 2). **Deliberately NOT
+in config:** the ~119 internal tuning constants (caps/rates/timeouts/thresholds) — they stay as expert
+defaults in code, with `profile` (`wide`/`home`) the bundle for the rate-sensitive ones. Env vars keep
+working unchanged (config is additive/optional). `core/config.py` (the `Config`/`CONFIG` structural
+dataclass: `fanout`/`retries`) is a SEPARATE concern — don't conflate it with `runconfig`.
 
 ## Observability (Prefect UI)
 

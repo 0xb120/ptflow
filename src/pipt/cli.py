@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
+from pipt.core import runconfig
 from pipt.core.log import setup_logging
-from pipt.core.orchestrator import orchestrate
-from pipt.pipelines import load_pipeline
+
+# NB: orchestrator/pipelines are imported INSIDE main() — their constants read PIPT_* at import, so the
+# run config must populate os.environ first (see _run).
 
 _UI_URL = "http://127.0.0.1:4200"
 _DEFAULT_API_URL = f"{_UI_URL}/api"
@@ -49,6 +53,14 @@ def main(argv: list[str] | None = None) -> int:
         "--observe", nargs="?", const=_DEFAULT_API_URL, default=None, metavar="API_URL",
         help="send this run to the Prefect UI (default: the local server) — start it with `pipt serve`",
     )
+    run.add_argument(
+        "--config", default=None, metavar="PATH",
+        help="TOML file of operator knobs (profile, oast, tool paths, …); see pipt.toml.example",
+    )
+    run.add_argument(
+        "--set", action="append", default=None, metavar="KEY=VALUE", dest="overrides",
+        help="override one config knob, repeatable (e.g. --set oast=on --set profile=home)",
+    )
 
     sub.add_parser("serve", help="start the Prefect server + UI for observability (foreground)")
 
@@ -58,17 +70,34 @@ def main(argv: list[str] | None = None) -> int:
         return _serve()
 
     if args.cmd == "run":
-        setup_logging(verbose=args.verbose)
-        base, failures = orchestrate(
-            load_pipeline(args.pipeline), args.activity, args.scope, root=args.root,
-            resume=args.resume, observe=args.observe,
-        )
-        print(base)  # noqa: T201
-        if failures < 0:
-            return 130  # interrupted (SIGINT) — partial results saved; resume with --resume
-        return 1 if failures else 0  # non-zero exit when any stage failed (CI/automation signal)
+        return _run(args)
 
     return 1
+
+
+def _run(args: argparse.Namespace) -> int:
+    setup_logging(verbose=args.verbose)
+    # Resolve operator config (--set > env > file) and write it into os.environ BEFORE importing the
+    # pipeline — its module-level constants read PIPT_* at import time.
+    try:
+        resolved = runconfig.resolve(runconfig.load_config(args.config), os.environ, args.overrides)
+    except runconfig.ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)  # noqa: T201
+        return 2
+    runconfig.apply(resolved)
+
+    from pipt.core.orchestrator import orchestrate  # noqa: PLC0415 — must follow runconfig.apply()
+    from pipt.pipelines import load_pipeline  # noqa: PLC0415 — (constants read PIPT_* at import)
+
+    base, failures = orchestrate(
+        load_pipeline(args.pipeline), args.activity, args.scope, root=args.root,
+        resume=args.resume, observe=args.observe,
+    )
+    runconfig.snapshot(Path(base), resolved)  # reproducibility: effective knobs next to the run
+    print(base)  # noqa: T201
+    if failures < 0:
+        return 130  # interrupted (SIGINT) — partial results saved; resume with --resume
+    return 1 if failures else 0  # non-zero exit when any stage failed (CI/automation signal)
 
 
 if __name__ == "__main__":

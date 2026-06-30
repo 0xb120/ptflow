@@ -75,18 +75,16 @@ def test_cli_resume_reruns_cleanly(tmp_path):
 
 
 def test_cli_run_returns_nonzero_on_failure(tmp_path, monkeypatch):
-    from pipt import cli
-
-    monkeypatch.setattr(cli, "orchestrate", lambda *_a, **_k: (tmp_path, 3))  # 3 stage failures
+    # orchestrate is imported inside cli._run (after run config is applied), so patch it at the source
+    monkeypatch.setattr("pipt.core.orchestrator.orchestrate", lambda *_a, **_k: (tmp_path, 3))
     scope_file = _scope(tmp_path)
     assert main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path)]) == 1
 
 
 def test_cli_observe_forwards_api_url_to_orchestrate(tmp_path, monkeypatch):
-    from pipt import cli
-
     captured: dict = {}
-    monkeypatch.setattr(cli, "orchestrate", lambda *_a, **k: captured.update(k) or (tmp_path, 0))
+    monkeypatch.setattr("pipt.core.orchestrator.orchestrate",
+                        lambda *_a, **k: captured.update(k) or (tmp_path, 0))
     scope_file = _scope(tmp_path)
     rc = main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path), "--observe"])
     assert rc == 0
@@ -98,10 +96,9 @@ def test_cli_observe_forwards_api_url_to_orchestrate(tmp_path, monkeypatch):
 
 
 def test_cli_interrupted_returns_130(tmp_path, monkeypatch):
-    from pipt import cli
-
-    # orchestrate returns the interrupted sentinel (-1) → CLI exits 130
-    monkeypatch.setattr(cli, "orchestrate", lambda *_a, **_k: (tmp_path, -1))
+    # orchestrate returns the interrupted sentinel (-1) → CLI exits 130 (patched at the source — it's
+    # imported inside cli._run after the run config is applied)
+    monkeypatch.setattr("pipt.core.orchestrator.orchestrate", lambda *_a, **_k: (tmp_path, -1))
     scope_file = _scope(tmp_path)
     assert main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path)]) == 130
 

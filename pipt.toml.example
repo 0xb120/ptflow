@@ -1,0 +1,64 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# pipt — run config (operator knobs). Optional: pass with `--config pipt.toml`.
+# Precedence:  --set CLI  >  PIPT_* env var  >  this file  >  code default.
+# NB: the ~119 internal tuning constants (rates/caps/timeouts/thresholds) are NOT here on purpose —
+#     they are versioned expert defaults in the code; the risky rate knobs are bundled under `profile`.
+# A copy of the EFFECTIVE values (secrets redacted) is written to <activity>/config.toml each run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Rate profile (wide|home) — the network aggressiveness, resolved at startup:
+#   wide = full bandwidth (naabu -rate 1000, nuclei -rl 150, high ferox -t/-L) — a fast server/line;
+#   home = throttled (naabu 300, nuclei 50, low ferox) for a domestic line / consumer NAT that the
+#          full-port scan or nuclei would otherwise choke. Set "home" on a home ADSL/FTTH connection.
+profile = "wide"
+
+# GLOBAL cap on concurrent network stages (per-app + spanning together). Bounds the aggregate load on
+# the uplink and the target. Lower it (e.g. 4–6) to be gentler; default 4 with profile=home else 10.
+net_limit = 10
+
+# Operator session headers/cookies — threaded into katana/httpx/nuclei/arjun/x8/dalfox/sqlmap so
+# crawl/fuzz/DAST reach the AUTHENTICATED surface (where most POST/JSON lives). Put your login cookie or
+# a Bearer here. SECRET → redacted in the snapshot. List of "Name: value" strings.
+http_header = ["Cookie: session=PUT-YOURS-HERE"]
+
+# Blind-XSS via OAST (interactsh) during the dalfox passes. Opt-in: OFF by default because it adds the
+# interactsh-client dependency (>=1.3) and routes callbacks through ProjectDiscovery's PUBLIC oast
+# servers (a RoE/privacy consideration). Catches only SYNCHRONOUS callbacks within the run.
+oast = false
+
+# Recrawl behavior (phase 3) when fuzzing opens never-crawled territory:
+#   on      = re-seed katana on the new entry points (default);
+#   preview = write/log the seeds (raw/recrawl/seeds.txt) WITHOUT crawling — to review them first;
+#   off     = skip entirely.
+recrawl = "on"
+
+# Content-discovery deep dive (phase 3): huge Assetnote "manual" lists (1–4M) on the few high-value
+# hosts. OFF by default — costs HOURS/host. Turn on only for a deep assessment.
+deep_dive = false
+
+# ── External tool path overrides ────────────────────────────────────────────
+# Only if a binary isn't in its default location; the relevant stage skips best-effort if it's absent.
+[tools]
+sqlmap = "/opt/sqlmap-dev/sqlmap.py"               # SQLi scanner (run via sys.executable). Path to sqlmap.py.
+search_vulns = "~/.local/bin/search_vulns"         # OFFLINE CVE correlation over enumerated software (local DB).
+nuclei_dast_templates = "~/nuclei-templates/dast"  # nuclei -dast fuzzing templates dir; dast/dast_full skip if missing.
+eyewitness = ""                                    # EyeWitness override (empty = auto-resolved / /opt/EyeWitness).
+
+# ── Global wordlists ────────────────────────────────────────────────────────
+[wordlists]
+# Search dir for the global lists (SecLists/Assetnote): roles are resolved by discovery in here.
+dir = "/opt/wordlist"
+
+# Pin a specific file for a ROLE (wins over discovery). Roles: content · wordpress · drupal · joomla ·
+# params · an_* · mn_*. Useful to fix exactly which list a role uses.
+[wordlists.roles]
+# content = "onelistforallmicro.txt"
+# params  = "burp-parameter-names.txt"
+
+# ── Self-hosted OAST (alternative to the public servers) ────────────────────
+[interactsh]
+# Self-hosted interactsh server(s) instead of the public oast.* — keeps callbacks (and any data
+# exfiltrated in the OOB request) off third-party infra. Empty = public servers by default.
+server = ""
+# Auth token for a protected/self-hosted interactsh server. SECRET → redacted in the snapshot.
+token = ""
