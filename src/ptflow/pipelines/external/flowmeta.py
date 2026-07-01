@@ -138,9 +138,12 @@ FLOWMETA: dict[str, StepMeta] = {
         outputs=("takeover.txt",),
     ),
     "fetch_delta": StepMeta(
-        summary="Scarica nello store SOLO il delta (passive + crawley) non già preso da katana — 'fetch once'.",
-        commands=("httpx -srd responses/osint/ -rl 50   # passive_delta = sorgenti - responses/index",),
+        summary="Scarica nello store SOLO il delta (passive + crawley) non già preso da katana — 'fetch "
+                "once'. Aggiunge anche i .map referenziati dai JS (sourceMappingURL) per la ricostruzione.",
+        commands=("httpx -srd responses/osint/ -rl 50   # passive_delta = sorgenti - responses/index",
+                  "# + _sourcemap_fetch_targets: i .map (non-inline) referenziati dai JS dello store"),
         outputs=("responses/osint/",),
+        notes=("i .map scaricati vengono ricostruiti offline da mine_responses (punto 5b)",),
     ),
     "api_spec": StepMeta(
         summary="Scopre spec API (OpenAPI/Swagger JSON) + endpoint GraphQL e li espande in richieste "
@@ -157,12 +160,16 @@ FLOWMETA: dict[str, StepMeta] = {
                "auth passthrough PTFLOW_HTTP_HEADER → httpx -H · ∥ al resto della FASE 1 (legge gli host, niente needs)"),
     ),
     "mine_responses": StepMeta(
-        summary="Estrae i body dello store (idempotente) e mina SOLO endpoint col jsluice — semina il "
-                "round 0 di content_discovery (FASE 3) e prepara il corpus per il catalogo di superficie.",
-        commands=("jsluice urls <js dello store>   # raw/extracted/ esteso → endpoints_js.txt",),
-        outputs=("endpoints_js.txt",),
+        summary="Estrae i body dello store (idempotente) e mina endpoint col jsluice — semina il round 0 "
+                "di content_discovery (FASE 3) e prepara il corpus per il catalogo. RICOSTRUISCE inoltre i "
+                "sorgenti originali dai sourcemap (punto 5b) e li mina come il resto del corpus.",
+        commands=("jsluice urls <js dello store + sorgenti da sourcemap>   # → endpoints_js.txt",
+                  "# _reconstruct_sourcemaps: .map (fetchati) + data: inline → raw/extracted/sourcemap/*.js",
+                  "# parse_sourcemap: sourcesContent → sorgenti de-bundlati (endpoint + secret fleet li vedono)"),
+        outputs=("endpoints_js.txt", "findings/sourcemap.jsonl", "raw/extracted/sourcemap/"),
         notes=("il fleet segreti NON gira qui — è in coda al fixpoint di content_discovery (vede anche i body fuzzati)",
-               "l'estrazione raw/extracted/ serve a request_catalog per minare le shape POST/form/XHR del corpus"),
+               "l'estrazione raw/extracted/ serve a request_catalog per minare le shape POST/form/XHR del corpus",
+               "sourcemap-exposed (info): sorgenti webpack de-bundlati → resa molto più alta di secret/endpoint"),
     ),
     "request_catalog": StepMeta(
         summary="FASE 1 (coda) — assembla il CATALOGO della SUPERFICIE ESPLORABILE (requests.jsonl): "
@@ -329,6 +336,21 @@ FLOWMETA: dict[str, StepMeta] = {
                "i body finiscono nel corpus → request_catalog ne mina gli shape (nessun codice di mining nuovo)",
                "preview per rivedere i seed senza crawlare; `on` (default) crawla"),
     ),
+    "cloud_assets": StepMeta(
+        summary="FASE 3 — esposizione cloud storage (punto 5a). Mina PASSIVAMENTE il corpus per "
+                "riferimenti S3/GCS/Azure, aggiunge candidati modesti derivati dall'apex, e sonda la "
+                "public-listability con httpx. In-house (nessun tool dedicato). ∥ al resto del loop 3.",
+        commands=(
+            "# passive: parse_cloud_refs(corpus body + URL dello store) → bucket S3/GCS/Azure referenziati",
+            "# candidati: bucket_candidates(apex) → <label>{,-assets,-dev,-backups,…} su S3 + GCS",
+            "httpx -mr 'ListBucketResult|EnumerationResults|<Contents>|storage#objects'   # → public (high)",
+            "httpx -mc 403   # → exists-but-private (info) · memoizzato per URL bucket process-wide",
+        ),
+        outputs=("findings/cloud_assets.jsonl",),
+        notes=("cloud-bucket-public (high) vince su cloud-bucket-exists (info) per lo stesso URL",
+               "candidati precision-first (set modesto), non una wordlist enorme · best-effort: salta senza httpx",
+               "i datastore unauth (redis/mongo/elastic/…) li copre nuclei_scope, non questo step"),
+    ),
     # --- PHASE 4: DAST the guessed surface (detailed) ---
     "request_catalog_full": StepMeta(
         summary="FASE 4 (testa) — ricostruisce il catalogo INCLUDENDO la superficie indovinata → "
@@ -461,7 +483,8 @@ _FANIN = StepMeta(
             "dast uniscono superficie (fase 2) + deep (fase 4); takeover.txt → record. nuclei_scope è "
             "già a livello activity. Il seam dell'agente (StubProvider) resta dormiente accanto.",
     outputs=("findings/cve.jsonl", "findings/dast.jsonl", "findings/tilde_enum.jsonl",
-             "findings/wpprobe.jsonl", "findings/secrets.jsonl", "findings/takeover.jsonl",
+             "findings/wpprobe.jsonl", "findings/cloud_assets.jsonl", "findings/sourcemap.jsonl",
+             "findings/secrets.jsonl", "findings/takeover.jsonl",
              "findings/default_creds.jsonl", "findings/hypotheses.jsonl"),
 )
 

@@ -41,9 +41,9 @@ crawl["crawl<br>katana -j -jc -jsl -kf all -fx -xhr -pc -fs fqdn -d 3 -c 2 -omit
 crawl_headless["crawl_headless<br>katana -hl -nos -jc -jsl -xhr -fx -iqp -fs fqdn -d 3 -c 5 -ct 180 -rl 50 -srd responses/headless/ [-H auth]<br># parse_katana_requests → requests_headless.jsonl (XHR/fetch POST/JSON della SPA)"]
 subenum["subenum<br>subfinder -silent     dnsx -silent"]
 takeover["takeover<br>subjack -w &lt;candidates&gt; -t 100 -timeout 30 -ssl"]
-fetch_delta["fetch_delta<br>httpx -srd responses/osint/ -rl 50   # passive_delta = sorgenti - responses/index"]
+fetch_delta["fetch_delta<br>httpx -srd responses/osint/ -rl 50   # passive_delta = sorgenti - responses/index<br># + _sourcemap_fetch_targets: i .map (non-inline) referenziati dai JS dello store"]
 api_spec["api_spec<br>httpx -srd store/ -mc 200   # sonda ~10 path spec noti (/openapi.json, /swagger.json, /v3/api-docs…)<br># expand_openapi: ogni operazione (path x metodo) → richiesta (path-param '1', query/header,<br>#   requestBody/in:body → skeleton JSON|urlencoded), cap API_SPEC_MAX_OPS=300<br>httpx -mc 200,400,405      # endpoint GraphQL → richiesta POST-json ({query:{__typename}})"]
-mine_responses["mine_responses  ·  net=False<br>jsluice urls &lt;js dello store&gt;   # raw/extracted/ esteso → endpoints_js.txt"]
+mine_responses["mine_responses  ·  net=False<br>jsluice urls &lt;js dello store + sorgenti da sourcemap&gt;   # → endpoints_js.txt<br># _reconstruct_sourcemaps: .map (fetchati) + data: inline → raw/extracted/sourcemap/*.js<br># parse_sourcemap: sourcesContent → sorgenti de-bundlati (endpoint + secret fleet li vedono)"]
 request_catalog["request_catalog  ·  net=False<br># 1) record richiesta: requests_crawl + requests_headless + requests_api<br># 2) SHAPE minati offline dal corpus crawl (fetch once — i body sono già su disco):<br>#    jsluice_requests(JS) → metodo/contentType/bodyParams di fetch/XHR · html_form_requests(HTML)<br>#    → form POST/GET; url relative risolte sull'URL sorgente del body (stem→url dagli index -srd)<br># 3) endpoint URL-only come GET di fallback · scheme raggiungibile (_working_schemes) · in-scope<br># dedup per shape (request_key = metodo + path-template) → merge_requests<br># 4) DROP delle shape GET il cui path il corpus ha visto SOLO come 404/410 (dead_url_keys)"]
 end
 passive_probe --> crawl
@@ -74,6 +74,7 @@ wordlist["wordlist  ·  net=False<br>tokenize_urls(endpoints + headless + js)   
 tech_enum["tech_enum<br>shortutil wordlist &lt;seed + global content&gt; &gt; rainbow.txt<br>shortscan -o json -a auto -w rainbow.txt -c 20 @hosts"]
 content_discovery["content_discovery<br># Pass A round 0 (wordlist STAGED: build_content_wordlist):<br>feroxbuster --smart -k -t 5 -L 2 -d 2 --timeout 15 --time-limit 20m -w round0.txt [-x exts]<br># feedback round (fuzza SOLO i token NUOVI):<br>feroxbuster --smart … --time-limit 5m -w round&lt;r&gt;.txt<br>httpx -srd responses/discovered/round&lt;r&gt;/ -rl 50   # scarica i nuovi hit 2xx/3xx<br>jsluice urls &lt;new-js&gt;                              # mina → cresce la frontiera<br># stage 3 deep dive (OPT-IN PTFLOW_DEEP_DIVE, solo host high-value):<br>feroxbuster --smart … -d 3 --time-limit 30m -w deepdive&lt;i&gt;.txt   # mn_php/mn_phpmillion/mn_html<br># poi UNA volta sul corpus completo, secret fleet ∥:<br>jsluice secrets ∥ gitleaks ∥ trufflehog --results=verified ∥ detect-secrets"]
 recrawl["recrawl<br># select_recrawl_seeds: hit 2xx il cui PRIMO SEGMENTO di path nessun URL crawlato usa<br>#   (covered = (host, primo-segmento) di endpoints.txt+headless+store) → 1 seed shallow/segmento nuovo<br># PTFLOW_RECRAWL: off | preview (scrive raw/recrawl/seeds.txt, NON crawla) | on (default: crawla)<br>katana -jc -jsl -kf all -fx -xhr -fs fqdn -d 2 -c 2 -ct 120 -omit-body -srd responses/recrawl/ [-H auth]"]
+cloud_assets["cloud_assets<br># passive: parse_cloud_refs(corpus body + URL dello store) → bucket S3/GCS/Azure referenziati<br># candidati: bucket_candidates(apex) → &lt;label&gt;{,-assets,-dev,-backups,…} su S3 + GCS<br>httpx -mr 'ListBucketResult|EnumerationResults|&lt;Contents&gt;|storage#objects'   # → public (high)<br>httpx -mc 403   # → exists-but-private (info) · memoizzato per URL bucket process-wide"]
 end
 wordlist --> tech_enum
 wordlist --> content_discovery
@@ -118,7 +119,7 @@ class provision_wl,expand,resolve,portscan,httpx breadth
 class portscan_full,nerva,nuclei_scope,screenshot span
 class passive_probe,crawl,crawl_headless,subenum,takeover,fetch_delta,api_spec,mine_responses,request_catalog phase1
 class dast,xss,sqli,cve_lookup phase2
-class wordlist,tech_enum,content_discovery,recrawl phase3
+class wordlist,tech_enum,content_discovery,recrawl,cloud_assets phase3
 class request_catalog_full,param_fuzz,dast_full,xss_full,sqli_full,cve_lookup_full,tech_vulnscan phase4
 class CLUSTER pivot
 class BAR2,BAR3,BAR4 bar
