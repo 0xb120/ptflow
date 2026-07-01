@@ -1,7 +1,7 @@
 # tests/core/test_runconfig.py
 import pytest
 
-from pipt.core import runconfig
+from ptflow.core import runconfig
 
 
 def _envmap(resolved):
@@ -10,28 +10,28 @@ def _envmap(resolved):
 
 def test_resolve_precedence_set_over_env_over_config():
     config = {"profile": "wide", "oast": False, "net_limit": 5}
-    env = {"PIPT_PROFILE": "home"}                       # env beats config
+    env = {"PTFLOW_PROFILE": "home"}                       # env beats config
     out = _envmap(runconfig.resolve(config, env, ["oast=on"]))  # --set beats env+config
-    assert out["PIPT_PROFILE"] == "home"                 # env wins over config
-    assert out["PIPT_OAST"] == "on"                      # --set wins (bool coerced)
-    assert out["PIPT_NET_LIMIT"] == "5"                  # from config (int → str)
+    assert out["PTFLOW_PROFILE"] == "home"                 # env wins over config
+    assert out["PTFLOW_OAST"] == "on"                      # --set wins (bool coerced)
+    assert out["PTFLOW_NET_LIMIT"] == "5"                  # from config (int → str)
 
 
 def test_resolve_coerces_bool_list_and_path():
     config = {"oast": True, "http_header": ["Cookie: a", "X: b"], "tools": {"sqlmap": "~/x/sqlmap.py"}}
     out = _envmap(runconfig.resolve(config, {}, None))
-    assert out["PIPT_OAST"] == "on"
-    assert out["PIPT_HTTP_HEADER"] == "Cookie: a;;X: b"  # list → ;;-joined
-    assert out["PIPT_SQLMAP"].endswith("/x/sqlmap.py")   # path expanduser
-    assert "~" not in out["PIPT_SQLMAP"]
+    assert out["PTFLOW_OAST"] == "on"
+    assert out["PTFLOW_HTTP_HEADER"] == "Cookie: a;;X: b"  # list → ;;-joined
+    assert out["PTFLOW_SQLMAP"].endswith("/x/sqlmap.py")   # path expanduser
+    assert "~" not in out["PTFLOW_SQLMAP"]
 
 
 def test_resolve_dynamic_wordlist_roles():
     config = {"wordlists": {"roles": {"content": "olfa.txt", "params": "p.txt"}}}
     out = _envmap(runconfig.resolve(config, {}, ["wordlists.roles.php=php.txt"]))
-    assert out["PIPT_WL_CONTENT"].endswith("olfa.txt")
-    assert out["PIPT_WL_PARAMS"].endswith("p.txt")
-    assert out["PIPT_WL_PHP"].endswith("php.txt")        # added via --set
+    assert out["PTFLOW_WL_CONTENT"].endswith("olfa.txt")
+    assert out["PTFLOW_WL_PARAMS"].endswith("p.txt")
+    assert out["PTFLOW_WL_PHP"].endswith("php.txt")        # added via --set
 
 
 def test_resolve_validates_enums_and_set_syntax():
@@ -60,9 +60,9 @@ def test_load_resolve_roundtrip_from_file(tmp_path):
     f = tmp_path / "c.toml"
     f.write_text('profile = "home"\noast = true\n[tools]\nsqlmap = "/opt/sqlmap-dev/sqlmap.py"\n')
     out = _envmap(runconfig.resolve(runconfig.load_config(str(f)), {}, None))
-    assert out["PIPT_PROFILE"] == "home"
-    assert out["PIPT_OAST"] == "on"
-    assert out["PIPT_SQLMAP"] == "/opt/sqlmap-dev/sqlmap.py"
+    assert out["PTFLOW_PROFILE"] == "home"
+    assert out["PTFLOW_OAST"] == "on"
+    assert out["PTFLOW_SQLMAP"] == "/opt/sqlmap-dev/sqlmap.py"
 
 
 def test_snapshot_redacts_secrets_and_is_refeedable(tmp_path):
@@ -78,7 +78,7 @@ def test_snapshot_redacts_secrets_and_is_refeedable(tmp_path):
     assert 'profile = "home"' in text
     # re-feed the snapshot: non-secret values round-trip
     out2 = _envmap(runconfig.resolve(runconfig.load_config(str(out)), {}, None))
-    assert out2["PIPT_PROFILE"] == "home"
+    assert out2["PTFLOW_PROFILE"] == "home"
 
 
 def test_snapshot_none_when_empty(tmp_path):

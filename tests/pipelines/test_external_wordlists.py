@@ -1,13 +1,13 @@
 from pathlib import Path
 
-from pipt.core.paths import Activity
-from pipt.pipelines.external import wordlists
+from ptflow.core.paths import Activity
+from ptflow.pipelines.external import wordlists
 
 
 def test_search_dirs_prepends_env_and_filters_missing(tmp_path, monkeypatch):
     real = tmp_path / "lists"
     real.mkdir()
-    monkeypatch.setenv("PIPT_WORDLISTS", f"{real}:/nonexistent/dir")
+    monkeypatch.setenv("PTFLOW_WORDLISTS", f"{real}:/nonexistent/dir")
     dirs = wordlists.search_dirs()
     assert real in dirs                      # existing env dir included
     assert Path("/nonexistent/dir") not in dirs  # missing dir filtered out
@@ -18,7 +18,7 @@ def test_provision_resolves_role_from_search_dir(tmp_path, monkeypatch):
     coll = tmp_path / "coll"
     (coll / "Discovery" / "Web-Content").mkdir(parents=True)
     (coll / "Discovery" / "Web-Content" / "common.txt").write_text("admin\nlogin\n")
-    monkeypatch.setenv("PIPT_WORDLISTS", str(coll))
+    monkeypatch.setenv("PTFLOW_WORDLISTS", str(coll))
 
     act = Activity.named("demo", root=tmp_path).ensure()
     resolved = wordlists.provision(act)
@@ -31,7 +31,7 @@ def test_provision_resolves_role_from_search_dir(tmp_path, monkeypatch):
 
 def test_provision_byo_wins_and_unresolved_degrades(tmp_path, monkeypatch):
     monkeypatch.setattr(wordlists, "_DEFAULT_DIRS", ())  # isolate from any system SecLists
-    monkeypatch.setenv("PIPT_WORDLISTS", str(tmp_path / "empty"))  # nothing installed
+    monkeypatch.setenv("PTFLOW_WORDLISTS", str(tmp_path / "empty"))  # nothing installed
     act = Activity.named("demo", root=tmp_path).ensure()
     # user drops their own content list → BYO must win, and unresolved roles stay None
     (act.wl_global / "content.txt").write_text("mine\n")
@@ -43,8 +43,8 @@ def test_provision_byo_wins_and_unresolved_degrades(tmp_path, monkeypatch):
 def test_explicit_env_override_per_role(tmp_path, monkeypatch):
     custom = tmp_path / "my_content.txt"
     custom.write_text("x\n")
-    monkeypatch.setenv("PIPT_WORDLISTS", str(tmp_path / "empty"))
-    monkeypatch.setenv("PIPT_WL_CONTENT", str(custom))
+    monkeypatch.setenv("PTFLOW_WORDLISTS", str(tmp_path / "empty"))
+    monkeypatch.setenv("PTFLOW_WL_CONTENT", str(custom))
     act = Activity.named("demo", root=tmp_path).ensure()
     wordlists.provision(act)
     assert wordlists.role_path(act, "content").read_text(encoding="utf-8") == "x\n"
@@ -66,7 +66,7 @@ def test_staged_roles_resolve_from_search_dir(tmp_path, monkeypatch):
     (coll / "an_directories_1m.txt").write_text("/\n/admin\n")
     (coll / "an_php.txt").write_text("index.php\n")
     monkeypatch.setattr(wordlists, "_DEFAULT_DIRS", ())
-    monkeypatch.setenv("PIPT_WORDLISTS", str(coll))
+    monkeypatch.setenv("PTFLOW_WORDLISTS", str(coll))
     act = Activity.named("demo", root=tmp_path).ensure()
     wordlists.provision(act)
     assert wordlists.role_path(act, "an_directories").read_text(encoding="utf-8") == "/\n/admin\n"

@@ -1,4 +1,4 @@
-"""Pytest configuration for the PIPT test suite."""
+"""Pytest configuration for the PTFLOW test suite."""
 
 import os
 

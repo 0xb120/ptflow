@@ -1,5 +1,5 @@
-from pipt.pipelines import load_pipeline
-from pipt.pipelines.webscan.pipeline import PIPELINE
+from ptflow.pipelines import load_pipeline
+from ptflow.pipelines.webscan.pipeline import PIPELINE
 
 # Stages deliberately OMITTED vs external: scope expansion, active network scan, and per-app OSINT.
 _OMITTED = {"expand", "resolve", "portscan", "portscan_full", "nerva", "nuclei_scope",
@@ -33,7 +33,7 @@ def test_webscan_breadth_is_just_ingest():
 
 
 def test_webscan_reuses_external_task_functions():
-    from pipt.pipelines.external import tasks as external
+    from ptflow.pipelines.external import tasks as external
 
     by_name = {s.name: s for s in PIPELINE.stages}
     assert by_name["ingest"].run is external.ingest_httpx
@@ -53,3 +53,17 @@ def test_webscan_has_composition_hooks():
     assert callable(PIPELINE.cluster)
     assert callable(PIPELINE.consolidate)
     assert callable(PIPELINE.provider)
+
+
+def test_webscan_requirements_narrow_core_to_depth_tools():
+    from ptflow.pipelines.external import tasks as external
+
+    reqs = PIPELINE.requirements()
+    # only the depth toolchain is CORE — webscan's loops fail without these four
+    assert {r.name for r in reqs if r.kind == "core"} == {"httpx", "katana", "feroxbuster", "nuclei"}
+    by = {r.name: r for r in reqs}
+    # external's breadth/OSINT CORE tools are demoted to optional (webscan never runs them → no FAIL)
+    assert by["naabu"].kind == "optional"
+    assert by["subfinder"].kind == "optional"
+    # same coverage as external — reclassified, nothing dropped
+    assert {r.name for r in reqs} == {r.name for r in external.requirements()}

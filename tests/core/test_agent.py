@@ -1,5 +1,5 @@
-from pipt.core import agent, tools
-from pipt.core.paths import Activity
+from ptflow.core import agent, tools
+from ptflow.core.paths import Activity
 
 
 def _activity_with_services(tmp_path):

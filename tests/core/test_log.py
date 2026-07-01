@@ -1,6 +1,6 @@
 import logging
 
-from pipt.core import log
+from ptflow.core import log
 
 
 def _console(lg):

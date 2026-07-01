@@ -1,4 +1,4 @@
 def test_package_imports():
-    import pipt
+    import ptflow
 
-    assert pipt is not None
+    assert ptflow is not None

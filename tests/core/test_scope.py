@@ -1,5 +1,5 @@
 # tests/core/test_scope.py
-from pipt.core import scope
+from ptflow.core import scope
 
 
 def test_classify():

@@ -1,4 +1,4 @@
-from pipt.core import workspace
+from ptflow.core import workspace
 
 
 def test_meta_roundtrip(tmp_path):

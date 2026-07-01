@@ -1,6 +1,6 @@
 import pytest
 
-from pipt.core.stage import Stage
+from ptflow.core.stage import Stage
 
 
 def test_stage_fields():
@@ -19,7 +19,7 @@ def test_stage_defaults():
 
 
 def test_load_pipeline_unknown_raises():
-    from pipt.pipelines import load_pipeline
+    from ptflow.pipelines import load_pipeline
 
     with pytest.raises(ValueError, match="unknown pipeline"):
         load_pipeline("does-not-exist")

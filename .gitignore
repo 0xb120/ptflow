@@ -6,5 +6,5 @@ __pycache__/
 *.egg-info/
 dist/
 
-# operator run config (may hold session cookies/tokens); the template pipt.toml.example IS tracked
-pipt.toml
+# operator run config (may hold session cookies/tokens); the template ptflow.toml.example IS tracked
+ptflow.toml

@@ -1,6 +1,6 @@
-from pipt.core import tools, workspace
-from pipt.core.paths import Activity
-from pipt.pipelines.example import tasks
+from ptflow.core import tools, workspace
+from ptflow.core.paths import Activity
+from ptflow.pipelines.example import tasks
 
 
 def _activity_with_scope(tmp_path):
@@ -44,7 +44,7 @@ def test_enum_reads_hosts_writes_services(tmp_path):
 
 
 def test_pipeline_object_shape():
-    from pipt.pipelines.example.pipeline import PIPELINE
+    from ptflow.pipelines.example.pipeline import PIPELINE
 
     assert PIPELINE.name == "example"
     assert [s.name for s in PIPELINE.stages] == ["discover", "scope_scan", "enum"]

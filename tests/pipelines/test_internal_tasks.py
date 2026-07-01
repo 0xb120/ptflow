@@ -1,6 +1,6 @@
-from pipt.core import tools, workspace
-from pipt.core.paths import Activity
-from pipt.pipelines.internal import tasks
+from ptflow.core import tools, workspace
+from ptflow.core.paths import Activity
+from ptflow.pipelines.internal import tasks
 
 
 # --- pure transforms ---------------------------------------------------------------------------
@@ -172,9 +172,9 @@ def test_consolidate_writes_web_targets(tmp_path):
 def test_followups_opt_in(tmp_path, monkeypatch):
     act = Activity.named("intdemo", root=tmp_path).ensure()
     tools.write_lines(act.base / "web_targets.txt", ["http://10.0.1.5:8080"])
-    monkeypatch.delenv("PIPT_INTERNAL_WEB_HANDOFF", raising=False)
+    monkeypatch.delenv("PTFLOW_INTERNAL_WEB_HANDOFF", raising=False)
     assert tasks.followups(act) == []                       # off by default (external-call RoE gate)
-    monkeypatch.setenv("PIPT_INTERNAL_WEB_HANDOFF", "on")
+    monkeypatch.setenv("PTFLOW_INTERNAL_WEB_HANDOFF", "on")
     fus = tasks.followups(act)
     assert len(fus) == 1
     assert fus[0].pipeline == "webscan"
@@ -184,13 +184,13 @@ def test_followups_opt_in(tmp_path, monkeypatch):
 
 def test_followups_no_web_service_is_noop(tmp_path, monkeypatch):
     act = Activity.named("intdemo", root=tmp_path).ensure()
-    monkeypatch.setenv("PIPT_INTERNAL_WEB_HANDOFF", "on")
+    monkeypatch.setenv("PTFLOW_INTERNAL_WEB_HANDOFF", "on")
     assert tasks.followups(act) == []                       # no web_targets.txt → nothing to hand off
 
 
 # --- pipeline object shape ---------------------------------------------------------------------
 def test_pipeline_object_shape():
-    from pipt.pipelines.internal.pipeline import PIPELINE
+    from ptflow.pipelines.internal.pipeline import PIPELINE
 
     assert PIPELINE.name == "internal"
     names = [s.name for s in PIPELINE.stages]
@@ -205,6 +205,18 @@ def test_pipeline_object_shape():
 
 
 def test_load_pipeline_resolves_internal():
-    from pipt.pipelines import load_pipeline
+    from ptflow.pipelines import load_pipeline
 
     assert load_pipeline("internal").name == "internal"
+
+
+def test_requirements_manifest_covers_internal_tool_dicts():
+    reqs = tasks.requirements()
+    by_name = {r.name: r for r in reqs}
+    for name in tasks._CORE_TOOLS:
+        assert by_name[name].kind == "core"
+    for name in tasks._OPTIONAL_TOOLS:
+        assert by_name[name].kind == "optional"
+    # internal's OWN toolset (nmap/netexec/…), not external's web toolchain
+    assert by_name["nmap"].kind == "core"
+    assert "netexec" in by_name

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ptflow · pipeline internal · mappa</title>
+<!-- AUTO-GENERATA da ptflow.core.flowdocs — non modificare a mano (un hook la rigenera).
+     Unica dipendenza esterna: mermaid via CDN (serve connessione quando apri il file). -->
+<style>
+  :root { --bg:#0f1419; --panel:#161b22; --ink:#e6edf3; --muted:#9aa7b4; --line:#2a3340;
+    --breadth:#4f9be6; --span:#a98ee0; --pivot:#34d3e6; --bar:#8a96a3;
+    --p1:#4cc46b; --p2:#e6c247; --p3:#ef6a9b; --p4:#f08a4c; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:14px/1.45 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+  header { position:fixed; top:0; left:0; right:0; z-index:10; display:flex; align-items:center;
+    gap:14px; flex-wrap:wrap; padding:8px 14px; background:rgba(22,27,34,.96);
+    border-bottom:1px solid var(--line); backdrop-filter:blur(4px); }
+  header h1 { font-size:15px; margin:0; font-weight:650; }
+  header h1 small { color:var(--muted); font-weight:400; }
+  .ctrls { display:flex; gap:6px; align-items:center; }
+  .ctrls button { background:var(--panel); color:var(--ink); border:1px solid var(--line);
+    border-radius:7px; padding:5px 10px; cursor:pointer; font-size:13px; }
+  .ctrls button:hover { border-color:#4b5763; background:#1e2530; }
+  .legend { display:flex; gap:10px; flex-wrap:wrap; align-items:center; color:var(--muted); font-size:12px; }
+  .legend .k { display:inline-flex; align-items:center; gap:5px; }
+  .legend .sw { width:12px; height:12px; border-radius:3px; display:inline-block; }
+  .hint { color:var(--muted); font-size:12px; }
+  #canvas { position:absolute; inset:0; overflow:auto; cursor:grab; padding-top:86px; }
+  #canvas.grabbing { cursor:grabbing; }
+  #diagram { transform-origin:0 0; width:max-content; padding:26px 40px 80px; }
+  #diagram svg { max-width:none !important; height:auto !important; }
+  #diagram .nodeLabel b { font-weight:700; font-size:14px; }
+  #diagram .nodeLabel .r { color:#cfd8e0; font-size:12px; }
+  #diagram .nodeLabel code { display:inline-block; margin-top:3px; font-size:11px;
+    font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:#b9c4cf; white-space:normal; }
+  .loading { padding:120px 40px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>ptflow · pipeline internal &nbsp;<small>mappa concettuale (scroll · pan · zoom)</small></h1>
+  <div class="ctrls">
+    <button id="zin" title="Zoom +">+</button>
+    <button id="zout" title="Zoom out">&minus;</button>
+    <button id="zreset" title="100%">100%</button>
+    <button id="zfit" title="Adatta alla larghezza">Fit</button>
+    <span class="hint">trascina per spostarti · ctrl/⌘ + rotella per zoomare</span>
+  </div>
+  <div class="legend">
+    <span class="k"><span class="sw" style="background:var(--breadth)"></span>breadth</span>
+    <span class="k"><span class="sw" style="background:var(--span)"></span>spanning ∥</span>
+    <span class="k"><span class="sw" style="background:var(--pivot)"></span>cluster</span>
+    <span class="k"><span class="sw" style="background:var(--p1)"></span>fase 1</span>
+    <span class="k"><span class="sw" style="background:var(--p2)"></span>fase 2</span>
+    <span class="k"><span class="sw" style="background:var(--p3)"></span>fase 3</span>
+    <span class="k"><span class="sw" style="background:var(--p4)"></span>fase 4</span>
+    <span class="k"><span class="sw" style="background:var(--bar)"></span>barriera</span>
+  </div>
+</header>
+
+<div id="canvas"><div id="diagram"><div class="loading">Rendering del diagramma…</div></div></div>
+
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+
+const graph = "flowchart TD\nscope([\"scope.txt\"])\nsubgraph BREADTH[\"\u2460 BREADTH \u00b7 activity scope \u2014 una volta su tutto lo scope\"]\ndirection TB\nexpand[\"<b>expand</b><br/><span class='r'>net=False</span><br/><code>mapcidr -silent   # ogni CIDR \u2192 IP \u00b7 scope IP passthrough se mapcidr assente</code>\"]\ndiscover[\"<b>discover</b><br/><code>nmap -sn -n -oG - -iL -   # parse_nmap_up: le righe 'Status: Up'</code>\"]\nportscan[\"<b>portscan</b><br/><code>naabu -silent -p &lt;INTERNAL_PORTS&gt; -c &lt;conc&gt; -rate &lt;rate&gt;   # rate/conc = profilo<br/># parse_naabu: righe ip:port \u2192 [{ip, port}]</code>\"]\nend\nscope -.->|\u2225 offline| expand\nexpand --> discover\ndiscover --> portscan\nCLUSTER{{\"\u2461 CLUSTER \u00b7 pivot fan-out<br/>\u2192 scans/&lt;subnet&gt;/\"}}\nBREADTH ==> CLUSTER\nsubgraph P1[\"\u2462 PER-APP \u00b7 FASE 1 \u00b7 inventario servizi\"]\ndirection TB\nfingerprint[\"<b>fingerprint</b><br/><code>nerva --json   # stdin = le socket ip:port del gruppo (dalla fetta di ports.jsonl)</code>\"]\nend\nCLUSTER ==> P1\nBAR2[[\"\u2501\u2501 BARRIERA: FASE 1 \u2192 FASE 2 \u2501\u2501\"]]\nP1 ==> BAR2\nsubgraph P2[\"FASE 2 \u00b7 frutti bassi\"]\ndirection TB\ncve_lookup[\"<b>cve_lookup</b><br/><span class='r'>net=False</span><br/><code># software_from_services: (prodotto, versione) dai record nerva \u2014 solo version-pinned<br/>search_vulns -q '&lt;Prodotto Versione&gt;' -f json --ignore-general-product-vulns<br/>                                              --use-created-product-ids<br/># cache memo process-wide \u2192 il fan-out per-subnet non ri-interroga lo stesso prodotto</code>\"]\nsmb_checks[\"<b>smb_checks</b><br/><code>nxc smb &lt;host\u2026&gt; -u '' -p ''   # gated su 445 aperta (dai ports.jsonl del gruppo)<br/># parse_nxc_smb: [*] signing:False/SMBv1:True (medium) \u00b7 [+] Pwn3d! (high)/valid (medium)</code>\"]\nsnmp_checks[\"<b>snmp_checks</b><br/><code>onesixtyone -c &lt;communities.txt&gt; -i &lt;hosts.txt&gt;   # public/private/community/manager/cisco<br/># parse_onesixtyone: 'ip [community] sysDescr' \u2192 snmp-default-community</code>\"]\nldap_checks[\"<b>ldap_checks</b><br/><code>ldapsearch -x -H ldap://&lt;host&gt; -s base -b '' namingContexts   # gated su 389/636 aperta</code>\"]\nnuclei_net[\"<b>nuclei_net</b><br/><code>nuclei -silent -duc -j -tags network,default-login   # stdin = le socket ip:port</code>\"]\nend\nBAR2 ==> P2\nFANIN[[\"\u2463 FAN-IN \u00b7 consolidate<br/>findings/&lt;tipo&gt;.jsonl\"]]\nP2 ==> FANIN\nclassDef breadth fill:#0d2f54,stroke:#4f9be6,color:#dbe9fb;\nclassDef span fill:#2e2147,stroke:#a98ee0,color:#ece4fb;\nclassDef pivot fill:#073b42,stroke:#34d3e6,color:#d6fbff;\nclassDef bar fill:#3a424c,stroke:#8a96a3,color:#eef2f6,font-weight:bold;\nclassDef fanin fill:#10331c,stroke:#54d07a,color:#dcf6e3,font-weight:bold;\nclassDef phase1 fill:#10331c,stroke:#4cc46b,color:#dcf6e3;\nclassDef phase2 fill:#3a2f06,stroke:#e6c247,color:#f8edc2;\nclass expand,discover,portscan breadth\nclass fingerprint phase1\nclass cve_lookup,smb_checks,snmp_checks,ldap_checks,nuclei_net phase2\nclass CLUSTER pivot\nclass BAR2 bar\nclass FANIN fanin";
+
+mermaid.initialize({
+  startOnLoad:false, securityLevel:'loose', theme:'dark',
+  flowchart:{ htmlLabels:true, nodeSpacing:45, rankSpacing:60, curve:'basis' },
+});
+
+const diagram = document.getElementById('diagram');
+const canvas = document.getElementById('canvas');
+try {
+  const { svg } = await mermaid.render('ptflowGraph', graph);
+  diagram.innerHTML = svg;
+} catch (e) {
+  diagram.innerHTML = '<div class="loading">Errore nel rendering Mermaid: ' + e + '</div>';
+}
+
+let zoom = 1;
+const apply = () => { diagram.style.transform = 'scale(' + zoom + ')'; };
+const clamp = z => Math.min(12, Math.max(0.05, z));
+const setZoom = z => { zoom = clamp(z); apply(); };
+
+document.getElementById('zin').onclick = () => setZoom(zoom * 1.2);
+document.getElementById('zout').onclick = () => setZoom(zoom / 1.2);
+document.getElementById('zreset').onclick = () => setZoom(1);
+document.getElementById('zfit').onclick = () => {
+  const svg = diagram.querySelector('svg');
+  if (!svg) return;
+  const w = svg.getBoundingClientRect().width / zoom;
+  setZoom((canvas.clientWidth - 90) / w);
+};
+
+canvas.addEventListener('wheel', (e) => {
+  if (!(e.ctrlKey || e.metaKey)) return;
+  e.preventDefault();
+  const prev = zoom;
+  setZoom(zoom * (e.deltaY < 0 ? 1.1 : 1 / 1.1));
+  const f = zoom / prev;
+  canvas.scrollLeft = (canvas.scrollLeft + e.clientX) * f - e.clientX;
+  canvas.scrollTop = (canvas.scrollTop + e.clientY) * f - e.clientY;
+}, { passive:false });
+
+let down = false, sx = 0, sy = 0, ox = 0, oy = 0;
+canvas.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  down = true; canvas.classList.add('grabbing');
+  sx = e.clientX; sy = e.clientY; ox = canvas.scrollLeft; oy = canvas.scrollTop;
+});
+window.addEventListener('mousemove', (e) => {
+  if (!down) return;
+  canvas.scrollLeft = ox - (e.clientX - sx);
+  canvas.scrollTop = oy - (e.clientY - sy);
+});
+window.addEventListener('mouseup', () => { down = false; canvas.classList.remove('grabbing'); });
+</script>
+</body>
+</html>

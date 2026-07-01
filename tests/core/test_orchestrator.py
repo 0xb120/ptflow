@@ -1,5 +1,5 @@
-from pipt.core import orchestrator
-from pipt.core.stage import Stage
+from ptflow.core import orchestrator
+from ptflow.core.stage import Stage
 
 
 def test_topo_order_respects_deps():
@@ -54,7 +54,7 @@ def test_pool_size_adds_spanning_headroom():
 
 
 def test_fanout_semaphore_bound_matches_config():
-    from pipt.core.config import CONFIG
+    from ptflow.core.config import CONFIG
 
     # the per-app fan-out cap is enforced by this semaphore (pool is larger), so it must equal max_workers
     assert orchestrator._FANOUT_SLOTS._initial_value == CONFIG.fanout.max_workers
@@ -86,7 +86,7 @@ def test_stage_tags_by_band():
 
 
 def test_marker_path(tmp_path):
-    from pipt.core.paths import Activity
+    from ptflow.core.paths import Activity
 
     act = Activity.named("acme", root=tmp_path)
     assert orchestrator._marker(act, "httpx", None) == act.state / "httpx.done"
@@ -94,7 +94,7 @@ def test_marker_path(tmp_path):
 
 
 def test_resume_ok_invalidates_on_scope_change(tmp_path):
-    from pipt.core.paths import Activity
+    from ptflow.core.paths import Activity
 
     act = Activity.named("acme", root=tmp_path).ensure()
     assert orchestrator._resume_ok(act, "scopeA", resume=True) is True   # first run: records hash, honored
