@@ -1,4 +1,4 @@
-from pipt.core.paths import Activity, AppWorkspace
+from ptflow.core.paths import Activity, AppWorkspace
 
 
 def test_activity_layout(tmp_path):

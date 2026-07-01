@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ptflow · pipeline internal</title>
+<style>
+:root{
+  --ground:#0b0f17; --ground-2:#111726; --inset:#0c111c;
+  --ink:#c7d2e1; --ink-dim:#8794ab; --ink-faint:#566179; --line:#22304a;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);line-height:1.5;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:48px 48px;background-position:center;}
+body::before{content:"";position:fixed;inset:0;background:var(--ground);opacity:.86;z-index:-1;}
+.wrap{max-width:1160px;margin:0 auto;padding:44px 22px 72px;}
+.masthead{border:1px solid var(--line);background:linear-gradient(180deg,#0e1422,#0b0f17);padding:28px 28px 24px;border-radius:4px;}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.32em;text-transform:uppercase;color:var(--ink-faint);margin:0 0 12px;}
+h1{font-family:var(--mono);font-weight:600;font-size:clamp(26px,5vw,46px);margin:0;letter-spacing:-.01em;line-height:1.04;}
+h1 .sep{color:#ff4d9d;}
+.thesis{max-width:74ch;color:var(--ink-dim);margin:14px 0 0;font-size:14.5px;}
+.thesis b{color:var(--ink);font-weight:600;}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:20px;padding-top:18px;border-top:1px dashed var(--line);font-family:var(--mono);font-size:11.5px;color:var(--ink-dim);}
+.legend .k{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;}
+.swatch{width:11px;height:11px;border-radius:2px;box-shadow:0 0 6px -1px currentColor;}
+.sym{color:var(--ink);font-weight:600;}
+.band{margin-top:36px;}
+.band-h{display:flex;align-items:baseline;gap:13px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.15em;font-size:13px;margin:0 0 18px;padding-bottom:9px;border-bottom:1px solid var(--line);}
+.band-h .n{font-size:21px;letter-spacing:0;color:var(--tone,var(--ink));font-weight:600;}
+.band-h .t{color:var(--tone,var(--ink));}
+.band-h .sub{color:var(--ink-faint);letter-spacing:.03em;text-transform:none;font-size:12px;margin-left:auto;}
+.lvl{display:flex;gap:16px;align-items:stretch;overflow-x:auto;padding-bottom:4px;}
+.lvl>.node{flex:1;min-width:248px;}
+.down{display:block;text-align:center;color:var(--ink-faint);font-size:15px;padding:6px 0;}
+.node{background:var(--ground-2);border:1px solid var(--line);border-left:3px solid var(--tone,var(--ink-faint));border-radius:4px;padding:12px 14px 13px;}
+.node .top{display:flex;align-items:baseline;gap:9px;margin-bottom:8px;}
+.node .idx{font-family:var(--mono);font-size:12px;color:var(--tone);font-weight:600;}
+.node h3{font-family:var(--mono);font-size:15px;margin:0;font-weight:600;letter-spacing:-.01em;}
+.node .tag{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-faint);border:1px solid var(--line);border-radius:3px;padding:2px 6px;white-space:nowrap;}
+.node .tag.par-tag{color:var(--tone);border-color:color-mix(in srgb,var(--tone) 45%,var(--line));}
+.node p{margin:0 0 9px;font-size:12.5px;color:var(--ink-dim);}
+.cmd{font-family:var(--mono);font-size:11.5px;background:var(--inset);border:1px solid var(--line);border-radius:3px;padding:8px 10px;margin:0 0 9px;color:var(--ink-dim);white-space:pre;overflow-x:auto;line-height:1.6;}
+.out{display:flex;flex-wrap:wrap;gap:6px;}
+.art{font-family:var(--mono);font-size:11px;color:var(--ink);background:#0e1626;border:1px solid var(--line);border-radius:3px;padding:3px 7px;white-space:nowrap;}
+.art::before{content:"→ ";color:var(--tone);}
+.notes{margin:9px 0 0;padding-left:16px;font-family:var(--mono);font-size:11px;color:var(--ink-dim);line-height:1.55;}
+.notes li::marker{color:var(--tone);}
+.barrier{display:flex;align-items:center;gap:14px;margin:26px 0 4px;font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint);}
+.barrier::before,.barrier::after{content:"";flex:1;border-top:1px dashed var(--line);}
+.band[style*="8b8fa3"] .node{border-style:dashed;}
+footer{margin-top:44px;padding-top:16px;border-top:1px solid var(--line);font-family:var(--mono);font-size:11px;color:var(--ink-faint);}
+a:focus-visible{outline:2px solid var(--ink);outline-offset:2px;}
+@media (max-width:560px){.wrap{padding:28px 13px 52px;}.masthead{padding:20px 16px;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="masthead">
+<p class="eyebrow">ptflow · pipeline internal</p>
+<h1>signal <span class="sep">/</span> flow</h1>
+<p class="thesis">Pentest interno IP/CIDR: la breadth mappa l'INTERO scope in UNA passata rate-controlled (più gentile del per-subnet su gear legacy/OT), il cluster fa da pivot fan-out partizionando gli host live per SUBNET DI SCOPE, poi i loop per-subnet vanno in profondità — inventario servizi, poi frutti bassi (CVE note offline + check SMB/SNMP/LDAP/nuclei ∥) — con una barriera globale tra loro. Ogni stage comunica solo via file su disco.</p>
+<div class="legend" aria-label="legenda">
+<span class="k"><span class="swatch" style="color:#4fd6c8;background:#4fd6c8"></span>breadth</span>
+<span class="k"><span class="swatch" style="color:#f0b429;background:#f0b429"></span>spanning / post-cluster</span>
+<span class="k"><span class="swatch" style="color:#cdd8e8;background:#cdd8e8"></span>pivot</span>
+<span class="k"><span class="swatch" style="color:#7bd88f;background:#7bd88f"></span>loop 1</span>
+<span class="k"><span class="swatch" style="color:#ff4d9d;background:#ff4d9d"></span>loop 2</span>
+<span class="k"><span class="swatch" style="color:#8b8fa3;background:#8b8fa3"></span>fan-in</span>
+<span class="k"><span class="sym">∥</span> parallelo</span>
+<span class="k"><span class="sym">▼</span> needs</span>
+<span class="k"><span class="sym">▭</span> barriera</span>
+</div>
+</header>
+<section class="band" style="--tone:#4fd6c8"><h2 class="band-h"><span class="n">01</span><span class="t">breadth</span><span class="sub">asset discovery · intero scope · DAG pre-cluster</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">00</span><h3>expand</h3><span class="tag par-tag">∥ no needs</span></div><p>BREADTH — espande lo scope IP/CIDR in una lista di host candidati (mapcidr). Trasformazione OFFLINE (net=False): nessun pacchetto, solo enumerazione degli indirizzi.</p><div class="cmd">mapcidr -silent   # ogni CIDR → IP · scope IP passthrough se mapcidr assente</div><div class="out"><span class="art">scope/scope_ip.txt</span></div><ul class="notes"><li>solo IP/CIDR: scope_entries tiene i token kind ip|cidr, deduplicati</li></ul></div></div><span class="down">▼</span><div class="lvl"><div class="node"><div class="top"><span class="idx">01</span><h3>discover</h3><span class="tag">needs expand</span></div><p>BREADTH — ping sweep nmap -sn per trovare gli host LIVE. Se nmap manca o l'ICMP è filtrato (0 host), fallback su TUTTI i candidati così il portscan gira lo stesso.</p><div class="cmd">nmap -sn -n -oG - -iL -   # parse_nmap_up: le righe 'Status: Up'</div><div class="out"><span class="art">asset_discovery/live_hosts.txt</span></div><ul class="notes"><li>fallback ICMP-filtrato: nessun segnale live → usa tutti i candidati (non salta la scansione)</li></ul></div></div><span class="down">▼</span><div class="lvl"><div class="node"><div class="top"><span class="idx">02</span><h3>portscan</h3><span class="tag">needs discover</span></div><p>BREADTH — naabu sul set curato di porte di servizio interne (INTERNAL_PORTS, ~100 TCP: SMB/LDAP/RDP/DB/UI di mgmt) sugli host live → ports.jsonl. Whole-scope + rate-controlled: UNA passata gentile invece di N flood per-subnet (gear legacy/OT è fragile).</p><div class="cmd">naabu -silent -p &lt;INTERNAL_PORTS&gt; -c &lt;conc&gt; -rate &lt;rate&gt;   # rate/conc = profilo
+# parse_naabu: righe ip:port → [{ip, port}]</div><div class="out"><span class="art">asset_discovery/ports.jsonl</span></div><ul class="notes"><li>rate=profilo (wide 1000/50 · home 300/20) · SNMP è UDP/161 → lo sonda snmp_checks, non qui</li><li>carico aggregato ≈ concorrenza x rate: il rate è la leva reale su una linea vincolata</li><li>cluster() affetta ports.jsonl per subnet dopo — scan whole-scope, output per-subnet</li></ul></div></div></section><section class="band" style="--tone:#cdd8e8"><h2 class="band-h"><span class="t">⬡ pivot</span><span class="sub">fan-out — raggruppa le vhost in application-group</span></h2><div class="lvl"><div class="node"><div class="top"><h3>scans/&lt;subnet&gt;/</h3><span class="tag par-tag">∥ no needs</span></div><p>Partiziona gli host LIVE per la ENTRY DI SCOPE che li contiene (longest-prefix wins; un IP nudo è /32). Un gruppo scans/&lt;subnet&gt;/ per ogni entry con ≥1 host live: la compartimentazione per-subnet dell'operatore, non una /24 arbitraria. app_id = slug del CIDR, stabile.</p><div class="out"><span class="art">meta.json</span><span class="art">hosts.txt</span><span class="art">ports.jsonl</span></div><ul class="notes"><li>assign_hosts è puro/unit-tested · scrive la fetta di ports.jsonl del gruppo (no re-scan)</li><li>app_id = subnet_slug: '10.0.1.0/24' → '10.0.1.0-24' · '192.168.5.10' → '192.168.5.10-32'</li></ul></div></div></section><section class="band" style="--tone:#7bd88f"><h2 class="band-h"><span class="n">02</span><span class="t">loop 1 · inventario servizi</span><span class="sub">per-app · phase 1</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">03</span><h3>fingerprint</h3><span class="tag par-tag">∥ no needs</span></div><p>LOOP 1 — fingerprint dei servizi sulle socket aperte del gruppo (nerva --json; nmap -sV è l'alternativa drop-in) → services.jsonl. Base per i check gated del loop 2.</p><div class="cmd">nerva --json   # stdin = le socket ip:port del gruppo (dalla fetta di ports.jsonl)</div><div class="out"><span class="art">services.jsonl</span></div><ul class="notes"><li>best-effort: salta se nerva assente · i banner alimentano cve_lookup + il rilevamento web</li></ul></div></div></section><div class="barrier">▭ barriera globale — ogni app finisce il loop 1 prima che inizi il loop 2</div><section class="band" style="--tone:#ff4d9d"><h2 class="band-h"><span class="n">03</span><span class="t">loop 2 · frutti bassi</span><span class="sub">per-app · phase 2</span></h2><div class="lvl"><div class="node"><div class="top"><span class="idx">04</span><h3>cve_lookup</h3><span class="tag par-tag">∥ no needs</span></div><p>LOOP 2 — CVE NOTE sui servizi fingerprinted: correlazione OFFLINE (net=False, zero traffico) contro il DB locale di search_vulns. Gira ∥ agli altri check del loop 2.</p><div class="cmd"># software_from_services: (prodotto, versione) dai record nerva — solo version-pinned
+search_vulns -q '&lt;Prodotto Versione&gt;' -f json --ignore-general-product-vulns
+                                              --use-created-product-ids
+# cache memo process-wide → il fan-out per-subnet non ri-interroga lo stesso prodotto</div><div class="out"><span class="art">findings/cve.jsonl</span></div><ul class="notes"><li>DB costruito FUORI dal run (search_vulns -u) · best-effort: salta se binario/DB assenti</li><li>ordinati per triage: known-exploited/KEV first, poi CVSS desc</li><li>stessa correlazione offline della pipeline external (search_vulns fa lui il check dei range)</li></ul></div><div class="node"><div class="top"><span class="idx">05</span><h3>smb_checks</h3><span class="tag par-tag">∥ no needs</span></div><p>LOOP 2 — first-check SMB via netexec sugli host con 445 aperta: signing non richiesto (superficie NTLM-relay), SMBv1 (EternalBlue), sessione null/guest, accesso admin (Pwn3d!).</p><div class="cmd">nxc smb &lt;host…&gt; -u '' -p ''   # gated su 445 aperta (dai ports.jsonl del gruppo)
+# parse_nxc_smb: [*] signing:False/SMBv1:True (medium) · [+] Pwn3d! (high)/valid (medium)</div><div class="out"><span class="art">findings/smb.jsonl</span></div><ul class="notes"><li>best-effort: salta se nessuna 445 o netexec assente · cap wall-clock CHECK_TIMEOUT (300s)</li><li>solo check non-distruttivi (null/guest) · brute-force/relay/coercion deliberatamente non wired</li></ul></div><div class="node"><div class="top"><span class="idx">06</span><h3>snmp_checks</h3><span class="tag par-tag">∥ no needs</span></div><p>LOOP 2 — sweep community di default SNMP (UDP/161) via onesixtyone su TUTTI gli host del gruppo (161 è UDP, fuori dal portscan TCP). Una community che risponde è un finding.</p><div class="cmd">onesixtyone -c &lt;communities.txt&gt; -i &lt;hosts.txt&gt;   # public/private/community/manager/cisco
+# parse_onesixtyone: 'ip [community] sysDescr' → snmp-default-community</div><div class="out"><span class="art">findings/snmp.jsonl</span></div><ul class="notes"><li>su TUTTI gli host del gruppo (161 UDP non è nel portscan) · best-effort: salta se onesixtyone assente</li></ul></div><div class="node"><div class="top"><span class="idx">07</span><h3>ldap_checks</h3><span class="tag par-tag">∥ no needs</span></div><p>LOOP 2 — bind anonimo LDAP via ldapsearch sugli host con 389/636 aperta: un rootDSE che restituisce i naming context senza credenziali è un finding.</p><div class="cmd">ldapsearch -x -H ldap://&lt;host&gt; -s base -b '' namingContexts   # gated su 389/636 aperta</div><div class="out"><span class="art">findings/ldap.jsonl</span></div><ul class="notes"><li>best-effort: salta se nessuna 389/636 o ldapsearch assente</li><li>parsing minimale (namingContexts:) — da rifinire dal vivo su un dominio reale</li></ul></div><div class="node"><div class="top"><span class="idx">08</span><h3>nuclei_net</h3><span class="tag par-tag">∥ no needs</span></div><p>LOOP 2 — template nuclei network + default-login sulle socket aperte del gruppo → findings/nuclei_net.jsonl.</p><div class="cmd">nuclei -silent -duc -j -tags network,default-login   # stdin = le socket ip:port</div><div class="out"><span class="art">findings/nuclei_net.jsonl</span></div><ul class="notes"><li>best-effort: salta se nuclei assente · -duc = disable update-check (offline-friendly)</li></ul></div></div></section><section class="band" style="--tone:#8b8fa3"><h2 class="band-h"><span class="t">fan-in</span><span class="sub">join dello spanning, poi il fan-in terminale deterministico</span></h2><div class="lvl"><div class="node"><div class="top"><h3>consolidate</h3><span class="tag par-tag">∥ no needs</span></div><p>Fan-in terminale DETERMINISTICO (consolidate): solleva i findings per-subnet in &lt;activity&gt;/findings/&lt;tipo&gt;.jsonl (un file per categoria, ogni record con app_id = slug). Aggrega inoltre i servizi web in web_targets.txt e (opt-in) fa l'hand-off alla pipeline webscan.</p><div class="out"><span class="art">findings/cve.jsonl</span><span class="art">findings/smb.jsonl</span><span class="art">findings/snmp.jsonl</span><span class="art">findings/ldap.jsonl</span><span class="art">findings/nuclei_net.jsonl</span><span class="art">web_targets.txt</span></div><ul class="notes"><li>web_targets_from: socket con porta HTTP(S) o banner http → scheme://ip:port (https per TLS)</li><li>hand-off webscan OPT-IN (PTFLOW_INTERNAL_WEB_HANDOFF): crawl/catalog/DAST/fuzz per servizio web</li><li>web_targets.txt sempre scritto; solo l'auto-run è gated · seam agente (StubProvider) dormiente accanto</li></ul></div></div></section>
+<footer>generato da <b>ptflow.core.flowdocs</b> · non modificare a mano · struttura derivata dagli Stage objects</footer>
+</div>
+</body>
+</html>

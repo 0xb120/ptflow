@@ -2,7 +2,7 @@ import dataclasses
 
 import pytest
 
-from pipt.core.config import CONFIG, Config
+from ptflow.core.config import CONFIG, Config
 
 
 def test_defaults():

@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**pipt** is a reusable **Prefect ≥3** scaffolding (`core/`) hosting pluggable pentest
+**ptflow** is a reusable **Prefect ≥3** scaffolding (`core/`) hosting pluggable pentest
 `pipelines/<name>/`. **Files on disk are the only state — there is no database.** A
 pipeline runs an asset-discovery (breadth) phase over the whole scope, clusters the
 results into "application groups", then runs one or more per-app **loops** (depth)
@@ -27,10 +27,13 @@ that fan out under Prefect.
 
 ```bash
 uv sync --all-groups                                   # install (incl. dev/lint/test groups)
-uv run pipt run <pipeline> <activity> <scope.txt> [--root DIR] [-v] [--resume]
+uv run ptflow run <pipeline> <activity> <scope.txt> [--root DIR] [-v] [--resume]
                                                        # output → <root>/<activity>/ (root defaults to cwd)
                                                        # --resume: skip stages a prior run finished (same scope)
-                  [--config pipt.toml] [--set KEY=VALUE ...]   # operator knobs (see "Run config")
+                  [--config ptflow.toml] [--set KEY=VALUE ...]   # operator knobs (see "Run config")
+uv run ptflow doctor [<pipeline>]                      # verify a pipeline's external tools + datasets
+                                                       # are installed (default: external); exit 1 if a
+                                                       # CORE tool is missing (CI/provisioning gate)
 uv run ruff check . && uv run ty check src/ && uv run pytest   # the full dev gate
 uv run pytest tests/core/test_orchestrator.py          # one file
 uv run pytest tests/core/test_scope.py::test_classify  # one test
@@ -40,7 +43,7 @@ uv run pytest tests/core/test_scope.py::test_classify  # one test
   `tools.run`/`tools.pipe`) is logged, and the full run log — every command + output — is persisted
   to `<activity>/logs/run.log` regardless of console verbosity. `-v`/`--verbose` additionally surfaces
   commands and live tool stdout/stderr on the console.
-  - The "pipt" logger level is always DEBUG; the *console* handler is raised to INFO without `-v`,
+  - The "ptflow" logger level is always DEBUG; the *console* handler is raised to INFO without `-v`,
     so the file (DEBUG) captures the full record while the console stays quiet. `is_verbose()` (not
     the logger level) gates console-only behaviour like streaming a tool's stderr.
   - `tools.run` logs a WARNING on any non-zero exit, so a broken tool (bad flag, crash) can't
@@ -50,13 +53,13 @@ uv run pytest tests/core/test_scope.py::test_classify  # one test
 
 ### Run config (operator knobs)
 
-The **operator-facing** knobs (the ~14 `PIPT_*` env vars: `profile`, `oast`, `net_limit`, `http_header`,
+The **operator-facing** knobs (the ~14 `PTFLOW_*` env vars: `profile`, `oast`, `net_limit`, `http_header`,
 `recrawl`, `deep_dive`, tool paths, wordlist dir/roles, interactsh server/token) can be set in an
-optional TOML file (`--config pipt.toml`; see `pipt.toml.example` for the annotated template) instead of
+optional TOML file (`--config ptflow.toml`; see `ptflow.toml.example` for the annotated template) instead of
 scattered env vars. Resolution is `core/runconfig.py` (pure `resolve()` + thin `apply()`/`snapshot()`),
-loaded by the CLI's `_run`. **Precedence: `--set KEY=VALUE` (CLI, repeatable) > `PIPT_*` env var >
+loaded by the CLI's `_run`. **Precedence: `--set KEY=VALUE` (CLI, repeatable) > `PTFLOW_*` env var >
 config file > code default.** The CLI writes the resolved knobs into `os.environ` **before** importing
-the pipeline (its constants read `PIPT_*` at import) — so `orchestrate`/`load_pipeline` are imported
+the pipeline (its constants read `PTFLOW_*` at import) — so `orchestrate`/`load_pipeline` are imported
 *inside* `cli._run`, after `runconfig.apply()`; the existing env reads stay the single consumption point
 (no constant re-plumbed). The effective values (secrets — `http_header`/`interactsh.token` — redacted)
 are snapshotted to `<activity>/config.toml` for reproducibility (re-feedable with `--config`). Enums
@@ -66,6 +69,35 @@ defaults in code, with `profile` (`wide`/`home`) the bundle for the rate-sensiti
 working unchanged (config is additive/optional). `core/config.py` (the `Config`/`CONFIG` structural
 dataclass: `fanout`/`retries`) is a SEPARATE concern — don't conflate it with `runconfig`.
 
+### Checking dependencies (`ptflow doctor`)
+
+`ptflow doctor [<pipeline>]` (default `external`) verifies the host has every external tool + dataset
+the pipeline needs, so "are the requirements installed?" becomes a **verifiable gate** for provisioning
+new workstations (the org installer is `/opt/custom-tools/org/install-offsec-tools.sh`). It prints a
+grouped ✓/✗ report (CORE tools / OPTIONAL tools / datasets) and **exits `1` iff a CORE tool is missing**
+(missing optional tools/datasets are warnings, exit `0`) — the CI/automation signal.
+
+- **Single source of truth (`core/requirements.py` + a `requirements()` hook).** The pure checker
+  (`Requirement`/`CheckResult`/`Report` + `check()`/`render_report()`, unit-tested via injected
+  resolve/version callables) is fed a manifest a pipeline exposes via a **duck-typed `requirements()`
+  hook** (same convention as `preflight`/`consolidate`/`followups` — read by `getattr`, off the
+  Protocol). `external`'s `tasks.requirements()` builds it from the `_CORE_TOOLS`/`_OPTIONAL_TOOLS`
+  dicts + the non-PATH tools (sqlmap/EyeWitness, checked by absolute path) + the on-disk datasets
+  (`nuclei-templates/dast`, resolvers), and **`preflight()` renders from the SAME manifest** — so the
+  run-time summary and `doctor` can't drift. A pipeline with no hook (e.g. `example`) is a graceful pass.
+- **When you add a tool**, add it to `_CORE_TOOLS`/`_OPTIONAL_TOOLS` (or, for a non-PATH tool/dataset,
+  to the tail of `requirements()`); `preflight` + `doctor` pick it up automatically. A version floor
+  goes on the `Requirement` (`min_version` + `version_args`, e.g. interactsh-client ≥1.3); an
+  unparseable version is treated as OK (never a false failure). Datasets are OPTIONAL (the pipeline
+  degrades best-effort), so they warn but never fail the gate.
+- **All three real pipelines declare the hook:** `external` and `internal` each build their manifest
+  from their OWN `_CORE_TOOLS`/`_OPTIONAL_TOOLS` (+ external's non-PATH tools/datasets). `webscan`
+  reuses external's manifest but **NARROWS the CORE set to its depth toolchain** (`_DEPTH_CORE` =
+  httpx/katana/feroxbuster/nuclei) — external's breadth/OSINT tools are demoted to optional (via
+  `dataclasses.replace`), so a webscan-only host doesn't FAIL the gate for tools webscan never runs
+  (same coverage, reclassified — nothing dropped). `example` has no hook → graceful pass. **Honours
+  `PTFLOW_*` env overrides** (the tool-path constants read them at import) but **not** `--config`/`--set` (v1).
+
 ## Observability (Prefect UI)
 
 Observability uses the framework's own GUI — the Prefect server + dashboard — kept **optional** so the
@@ -74,15 +106,15 @@ states, per-stage timings, logs, history); the pipeline's state stays on disk an
 without it (ephemeral).
 
 ```bash
-pipt serve                                             # start the Prefect server + UI → http://127.0.0.1:4200
-uv run pipt run external <activity> <scope.txt> --observe # stream THIS run to that UI (run graph + states + logs)
+ptflow serve                                             # start the Prefect server + UI → http://127.0.0.1:4200
+uv run ptflow run external <activity> <scope.txt> --observe # stream THIS run to that UI (run graph + states + logs)
 ```
 
-- **`pipt serve`** wraps `prefect server start` (foreground; its own terminal). The UI reads the local
+- **`ptflow serve`** wraps `prefect server start` (foreground; its own terminal). The UI reads the local
   SQLite (`~/.prefect/prefect.db`), so even plain runs show up there — but `--observe` is preferred.
 - **`--observe [API_URL]`** (default the local server) redirects *this run* to the persistent server via
   `temporary_settings` (env set post-import is too late — Prefect would still spin a throwaway ephemeral
-  server and contend on the SQLite). No global profile/config change; it also captures the `pipt` logger
+  server and contend on the SQLite). No global profile/config change; it also captures the `ptflow` logger
   so per-stage logs land on the run.
 - The run graph is **readable + phase-grouped** because `_submit_dag` gives each task a per-stage
   `name`/`task_run_name` (`crawl[<app_id>]`) and a band tag (`breadth`/`spanning`/`post-cluster`/`loop:N`)
@@ -139,7 +171,7 @@ tagged `net`. Two in-process caps gate them (module `BoundedSemaphore`s in `orch
 acquired in `_run_stage` in fixed order net→fan-out so they can't deadlock):
 - **`_FANOUT_SLOTS`** = `fanout.max_workers` — per-app chain cap (the pool is sized larger, fan-out +
   spanning headroom, so spanning runs ∥ the loops; this re-imposes the real fan-out limit).
-- **`_NET_SLOTS`** = **`PIPT_NET_LIMIT`** (else `4` when `PIPT_PROFILE=home`, else `fanout.net_limit`)
+- **`_NET_SLOTS`** = **`PTFLOW_NET_LIMIT`** (else `4` when `PTFLOW_PROFILE=home`, else `fanout.net_limit`)
   — GLOBAL network-concurrency cap over per-app **and** spanning, so the aggregate uplink load stays
   bounded (a home line / consumer router can choke). In-process (no Prefect server dependency), unlike
   the native `net`-tag limit (`prefect concurrency-limit create net N`) which needs a persistent server
@@ -179,7 +211,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       requests_crawl.jsonl  requests_headless.jsonl  requests_api.jsonl  requests_recrawl.jsonl  #   FULL requests
       requests.jsonl                     #   request_catalog (PHASE 1): EXPLORABLE-surface catalog (phase-2 DAST input)
       requests_full.jsonl                #   request_catalog_full (PHASE 4): + guessed surface (param_fuzz/dast_full input)
-      raw/recrawl/seeds.txt              #   recrawl: new-territory seeds (PIPT_RECRAWL on=crawl [default] · preview=list only)
+      raw/recrawl/seeds.txt              #   recrawl: new-territory seeds (PTFLOW_RECRAWL on=crawl [default] · preview=list only)
       params.jsonl                       #   param_fuzz: hidden params, ALL locations {url,param,loc:query|body|json|header}
       findings/tilde_enum.jsonl  findings/dast.jsonl  findings/dast_full.jsonl  findings/wpprobe.jsonl  #   per-app findings (shortscan; DAST surface/deep; wpprobe WP CVEs); consolidate lifts up
       findings/xss.jsonl  findings/xss_full.jsonl  findings/sqli.jsonl  findings/sqli_full.jsonl   #   dedicated scanners (dalfox XSS / sqlmap SQLi), surface+deep; consolidate folds by type
@@ -208,8 +240,8 @@ that app from its own corpus (`Activity.wl_global` / `AppWorkspace.wl_custom`).
 `provision_wl` breadth stage resolves each role (`content`, `wordpress`, `drupal`, `joomla`) to a
 concrete file and symlinks it into `wl_global/<role>.txt`; steps then read by role
 (`wordlists.role_path(activity, "content")`). Resolution order: BYO (`wl_global/<role>.txt` already
-present) › explicit env `PIPT_WL_<ROLE>` › discovery (first candidate filename under a search dir;
-search dirs = env `PIPT_WORDLISTS` ++ common locations like `/usr/share/seclists`) › unresolved →
+present) › explicit env `PTFLOW_WL_<ROLE>` › discovery (first candidate filename under a search dir;
+search dirs = env `PTFLOW_WORDLISTS` ++ common locations like `/usr/share/seclists`) › unresolved →
 the step degrades to the generated `wl_custom` (the pipeline never fails for missing wordlists).
 This keeps it independent of WHICH collection, WHERE it's installed, and whether it's installed.
 
@@ -349,7 +381,7 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     back to all candidates when ICMP is filtered) → `portscan` (naabu over the curated `INTERNAL_PORTS`
     set → `asset_discovery/ports.jsonl`). Whole-scope + rate-controlled on purpose — one global sweep is
     gentler on fragile legacy/OT gear and switches than N per-subnet floods (aggregate load ≈ concurrency
-    × rate; `PIPT_PROFILE=home` throttles naabu, same lever as external).
+    × rate; `PTFLOW_PROFILE=home` throttles naabu, same lever as external).
   - **`cluster`** — `assign_hosts` (pure, unit-tested) partitions the LIVE hosts by the **scope entry
     that contains them**: the CIDR from the scope file, **longest-prefix wins** on overlap, a bare IP is
     a /32; only entries with ≥1 live host become groups. `app_id` = the filesystem-safe CIDR slug
@@ -374,7 +406,7 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     sub-activity** `<activity>/web_recon/`. The CLI runs each `Followup` as a **separate top-level
     `orchestrate()`**, NOT a nested Prefect subflow — so each pipeline stays a clean flow with its own
     runner/teardown and files-as-only-state holds (the hand-off crosses via the on-disk scope artifact).
-    **OPT-IN** via `PIPT_INTERNAL_WEB_HANDOFF` (default OFF): a full web-depth scan per service is long.
+    **OPT-IN** via `PTFLOW_INTERNAL_WEB_HANDOFF` (default OFF): a full web-depth scan per service is long.
     The aggregation artifact is always written; only the auto-run is gated.
 
   **Design decisions:** grouping keys on the **scope CIDR** (the operator's own compartmentalisation),
@@ -386,8 +418,8 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
   corpus-less `cve_lookup` banner extraction are still **best-effort/minimal** and want live internal
   testing (the natural next lever: reuse external's `collect_software` for CVE, richer share/perms parsing
   for SMB). Destructive/active checks (brute-force, responder/relay, coercion) and credentialed auth
-  (a future `PIPT_CREDS`) are deliberately **opt-in, not yet wired**. `internal` has **no `flowmeta`**
-  (the flow-map gate is external-only, verified) so the dev gate doesn't require one.
+  (a future `PTFLOW_CREDS`) are deliberately **opt-in, not yet wired**. `internal` ships its own flow map
+  (`pipelines/internal/flowmeta.py` → `docs/internal-pipeline-*`), like every non-stub pipeline.
 - **`webscan`** — external's web-DEPTH loops over a **PRE-AGGREGATED web target list** (`pipelines/webscan/
   pipeline.py`). This is the "dedicated external profile" the `internal` hand-off targets: given a list of
   known web services (`scheme://host[:port]`, e.g. an internal run's `web_targets.txt`), it runs external's
@@ -408,8 +440,9 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
   still call out — `content_discovery`'s trufflehog `--results=verified` validates hits against the
   credential's PROVIDER (external) — mind it on an air-gapped engagement. Verified end-to-end on a
   loopback server: `ingest` (scheme+port honoured) → `cluster` → all four depth loops (the catalog
-  captured a POST form + query params), no expansion/OSINT artifacts written. Like `internal`, it needs
-  no `flowmeta` (flow-map gate is external-only).
+  captured a POST form + query params), no expansion/OSINT artifacts written. It ships its own flow map
+  (`pipelines/webscan/flowmeta.py` → `docs/webscan-pipeline-*`), reusing external's `FLOWMETA` + adding
+  only the `ingest` step.
 
 ### Fetch once, mine offline
 
@@ -481,7 +514,7 @@ to the pure `assemble_wordlist` (custom full+first, then each layer truncated to
   generic stages.
 - **stage 2b `STAGE2B_ROLES`** = `an_txt` + `an_xml` (robots/security.txt; sitemap/opensearch). Small → full.
 
-**Stage 3 — the deep dive** (`_deep_dive`) is a SEPARATE pass, **OPT-IN via env `PIPT_DEEP_DIVE`**
+**Stage 3 — the deep dive** (`_deep_dive`) is a SEPARATE pass, **OPT-IN via env `PTFLOW_DEEP_DIVE`**
 (off by default — these lists cost hours/host). It runs the huge Assetnote *manual* lists at full depth
 (`DEEP_DIVE_DEPTH`=3) on the few **high-value** hosts, gated per stack (`DEEPDIVE_TECH_ROLES`): php→`mn_php`
 (3M)+`mn_phpmillion` (1M) · asp.net→`mn_aspx`/`mn_asp`/`mn_cfm` · java→`mn_jsp`/`mn_do` · plus the generic
@@ -500,8 +533,8 @@ earlier `auto/targeted/broad` mode (`resolve_wl_mode`/`combine_wordlist`) — th
 gating subsume it. *(Detected-tech CMS `wordpress`/`drupal`/`joomla` roles + `tech_role_paths` remain as
 resolution infra, currently unwired into the fuzz wordlist.)*
 
-New roles are resolved exactly like the others (BYO › `PIPT_WL_<ROLE>` › discovery under
-`PIPT_WORDLISTS`/SecLists), so the lists live wherever you point `PIPT_WORDLISTS` — nothing hardcoded.
+New roles are resolved exactly like the others (BYO › `PTFLOW_WL_<ROLE>` › discovery under
+`PTFLOW_WORDLISTS`/SecLists), so the lists live wherever you point `PTFLOW_WORDLISTS` — nothing hardcoded.
 
 `content_discovery` is the one phase-3 step that *must* make new requests — forced browsing finds
 UNLINKED paths, which by definition aren't in any downloaded body. It runs `feroxbuster --smart`
@@ -602,7 +635,7 @@ artifacts so write-once holds and each DAST pass reads exactly its scope.
   no crawled URL uses — conservative: a new sub-dir UNDER an already-crawled region does NOT seed (one
   shallow seed per new top-level segment, static/JS/out-of-scope dropped, capped). It re-seeds katana
   there (one pass, depth-bounded) and stores the bodies into the corpus so `request_catalog_full` mines
-  them. `PIPT_RECRAWL` ∈ `off|preview|on`, **default `on`**; `preview` writes/logs the seeds
+  them. `PTFLOW_RECRAWL` ∈ `off|preview|on`, **default `on`**; `preview` writes/logs the seeds
   (`raw/recrawl/seeds.txt`) WITHOUT crawling (to review them). Bounded even when on (few shallow seeds,
   depth 2, `-ct` cap), one pass — never a crawl⇄fuzz loop.
 - **`api_spec`** (phase 1, ∥) probes well-known OpenAPI/Swagger JSON paths + GraphQL endpoints on the
@@ -630,7 +663,7 @@ flagged `category` on all 50 query endpoints → now one record. Endpoint-specif
 
 **DAST runs in two passes** (shared `_run_dast`), both **`nuclei -dast -im jsonl`** fuzzing
 query/path/header/cookie/**body** per template `part`, `-fa low` for live-infra politeness, best-effort
-(skip if nuclei or the dast templates dir — `PIPT_NUCLEI_DAST_TEMPLATES`, default `~/nuclei-templates/dast`
+(skip if nuclei or the dast templates dir — `PTFLOW_NUCLEI_DAST_TEMPLATES`, default `~/nuclei-templates/dast`
 — is absent), capped at `DAST_MAX_REQUESTS` (reconftw DEEP_LIMIT analog):
 - **`dast`** (phase 2) over the explorable-surface catalog `requests.jsonl` with its **observed** params
   → `findings/dast.jsonl` (input `raw/dast/input.jsonl`). The fast low-hanging-fruit pass.
@@ -651,7 +684,7 @@ Whole-scope full-template nuclei stays `nuclei_scope` (breadth, ∥ everything);
 fuzzing passes. Per-app findings → `consolidate` (terminal fan-in) lifts them. arjun/x8/api_spec provenance in
 their `raw/` dirs.
 
-**Auth passthrough** (`PIPT_HTTP_HEADER`, `_header_flags`/`_auth_headers`) threads operator session
+**Auth passthrough** (`PTFLOW_HTTP_HEADER`, `_header_flags`/`_auth_headers`) threads operator session
 headers/cookies into katana/httpx/nuclei (`-H`), arjun (`--headers`), x8 (`-H`), dalfox (`-H`) and
 sqlmap (`--headers`) so the crawl/fetch/fuzz/DAST reach the **authenticated** surface (where most
 POST/JSON lives).
@@ -679,8 +712,8 @@ full-request catalog over a URL list.
   `Title:`/`Payload:` result block → one `type:sqli` record per (param, technique) + back-end DBMS).
 - Per-app `findings/xss{,_full}.jsonl` + `findings/sqli{,_full}.jsonl` → `consolidate` lifts them by TYPE
   (`xss` folds surface+deep, `sqli` likewise — same as cve/dast). Tools: dalfox `~/go/bin/dalfox`; sqlmap
-  `/opt/sqlmap-dev/sqlmap.py` (override `PIPT_SQLMAP`, invoked via `sys.executable`).
-- **OAST / blind XSS** (OPT-IN `PIPT_OAST`, best-effort): dalfox `-b` fires blind payloads at an
+  `/opt/sqlmap-dev/sqlmap.py` (override `PTFLOW_SQLMAP`, invoked via `sys.executable`).
+- **OAST / blind XSS** (OPT-IN `PTFLOW_OAST`, best-effort): dalfox `-b` fires blind payloads at an
   interactsh callback — the hit lands on the interactsh SERVER, not dalfox's output. So `_run_dalfox`
   runs an `interactsh-client` (`~/go/bin`, **≥1.3** — older can't decrypt) for the pass via the
   teardown-tracked `tools.spawn`/`tools.stop`, gives EACH request a unique callback subdomain
@@ -688,8 +721,8 @@ full-request catalog over a URL list.
   stops the client and `correlate_oast` matches each interaction's `full-id` (`<marker>.<unique-id>`)
   back to its request → a `poc_kind:"blind"` finding (deduped by marker+protocol; bare-domain interactsh
   noise ignored). **Synchronous callbacks only** — a truly-stored/delayed XSS fires after the run, out of
-  scope (a persistent receiver would break files-as-only-state). Self-host via `PIPT_INTERACTSH_SERVER`/
-  `PIPT_INTERACTSH_TOKEN`, else the public oast servers (a RoE/privacy note: callbacks transit PD infra).
+  scope (a persistent receiver would break files-as-only-state). Self-host via `PTFLOW_INTERACTSH_SERVER`/
+  `PTFLOW_INTERACTSH_TOKEN`, else the public oast servers (a RoE/privacy note: callbacks transit PD infra).
 
 ### CVE lookup — known CVEs on enumerated software (offline correlation, two passes)
 
@@ -726,7 +759,7 @@ is active + template-coverage-limited), especially for non-HTTP services where t
   CVSS). Best-effort: skips if `search_vulns` / its DB is absent.
 - **DB provisioning (out-of-band):** `search_vulns -u` downloads the prebuilt local DB (or
   `--full-update` rebuilds it); the stage never builds it during a run. Override the binary with
-  `PIPT_SEARCH_VULNS`. *(The CVE quality lever is version detection — nerva covers services well; httpx
+  `PTFLOW_SEARCH_VULNS`. *(The CVE quality lever is version detection — nerva covers services well; httpx
   `tech` often lacks versions, so version-less software is skipped. The corpus mining now also recovers
   versioned asset filenames/CDN paths (`mine_asset_versions`), the most common place a JS-lib version
   actually appears; a curated WordPress/CMS plugin-path miner is the natural next extension.)*
@@ -755,7 +788,7 @@ aborting the run.
 
 ## Adding a pipeline (checklist)
 
-- [ ] Create `src/pipt/pipelines/<name>/` with a `PIPELINE` object satisfying the `Pipeline` protocol.
+- [ ] Create `src/ptflow/pipelines/<name>/` with a `PIPELINE` object satisfying the `Pipeline` protocol.
 - [ ] Reads/writes **only** via `Activity` / `AppWorkspace` — no path literals.
 - [ ] Each tool output written **once**: intermediate → `raw/<tool>/`; terminal artifact → canonical
       name directly (no verbatim raw↔canonical copy); derived → canonical only.
@@ -763,32 +796,44 @@ aborting the run.
       Within a loop use `needs`; across loops rely on the barrier (no cross-loop `needs`).
 - [ ] `cluster(activity) -> list[str]` creates the app groups, keyed on a stable hash of cluster identity.
 - [ ] Network stages tagged `net`.
-- [ ] Register it in `load_pipeline`.
-- [ ] Add a `StepMeta` for every stage in its flow-map metadata (see below) — the dev gate fails otherwise.
+- [ ] Register it in `load_pipeline` **and** add its name to `pipelines.PIPELINE_NAMES`.
+- [ ] Give it a flow map (the standard, see below): create `pipelines/<name>/flowmeta.py` with a
+      `FLOWMETA` (a `StepMeta` per stage) + `SPEC` (`MapSpec`), and expose it via a `flowmap_spec()`
+      hook on the `Pipeline`. The dev gate fails otherwise (only the `example` stub is exempt).
 
-## Pipeline flow map (auto-generated, always current)
+## Pipeline flow map (auto-generated, always current) — a per-pipeline STANDARD
 
-`flowmeta.main()` writes THREE self-contained, always-up-to-date views of the external pipeline's flow.
-A git diff of any of them shows exactly how the flow changed:
-- **`docs/pipeline-flow.html`** — the detailed band "spec sheet" (bands, parallelism, barriers,
-  per-step commands/outputs/notes, with the content-discovery fixpoint as its centerpiece).
-- **`docs/pipeline-map.html`** — a conceptual **flowchart** (Mermaid) you can pan/zoom and scroll on
-  both axes; each node shows the step + its commands. Mermaid loads from a CDN (needs a connection).
-- **`docs/pipeline-map.md`** — the same flowchart as a GitHub-renderable ```mermaid block.
+**Every pipeline ships a flow map** (the `example` stub excepted). `ptflow.core.flowdocs` writes THREE
+self-contained, always-up-to-date `docs/<name>-pipeline-*` views for each pipeline that declares the
+standard — `external`, `internal`, `webscan` today. A git diff of any of them shows exactly how that
+flow changed:
+- **`docs/<name>-pipeline-flow.html`** — the detailed band "spec sheet" (bands, parallelism, barriers,
+  per-step commands/outputs/notes; external's centerpiece is the content-discovery fixpoint).
+- **`docs/<name>-pipeline-map.html`** — a conceptual **flowchart** (Mermaid) you can pan/zoom and scroll
+  on both axes; each node shows the step + its commands. Mermaid loads from a CDN (needs a connection).
+- **`docs/<name>-pipeline-map.md`** — the same flowchart as a GitHub-renderable ```mermaid block.
 
 - **Structure is derived from code, not hand-drawn.** `core/flowmap.py` lays out the band spec sheet
   via longest-path layering; `core/mermaidmap.py` emits the Mermaid flowchart (both generic,
   pipeline-agnostic, from the `Stage` objects — `needs`/`phase`/`per_app`/`spanning`/`cluster_scope`/
   `net` — plus the `MapSpec`). Output is deterministic (no timestamps).
-- **Per-step prose/commands/outputs live in `pipelines/external/flowmeta.py`** (`FLOWMETA` + `SPEC`).
+- **A pipeline joins the standard via a duck-typed `flowmap_spec() -> MapSpec` hook** (same convention
+  as `requirements()`/`consolidate()`/`preflight()` — read via `getattr`, off the Protocol). It returns
+  the pipeline's `SPEC` (a `MapSpec` bundling title/thesis/`FLOWMETA`/phase_labels/pivot/fanin). A
+  pipeline with no hook (the `example` stub) is skipped gracefully by `flowdocs` and exempted by the gate.
+- **Per-step prose/commands/outputs live in `pipelines/<name>/flowmeta.py`** (`FLOWMETA` + `SPEC`).
   This is the ONE thing you maintain by hand: **when you add or change a step, add/adjust its
-  `StepMeta`.** `tests/pipelines/test_flowmap.py::test_flowmeta_covers_every_stage` fails the dev gate
-  if any `Stage` lacks a `StepMeta`, so the maps can't silently drift.
+  `StepMeta`.** `webscan`'s `flowmeta.py` reuses external's `FLOWMETA` (it runs external's functions),
+  adding only its one webscan-only step (`ingest`).
+- **The dev gate enforces the standard.** `tests/pipelines/test_flowmap.py` is parametrized over every
+  registered pipeline (`pipelines.PIPELINE_NAMES`, minus the `example` stub): each must expose the hook,
+  every `Stage` must have a `StepMeta`, and all three views must render. So a new pipeline that forgets
+  its map — or a new stage without a `StepMeta` — fails the gate; the maps can't silently drift.
 - **A hook regenerates them automatically.** `.claude/settings.json` runs `.claude/hooks/regen-flowmap.sh`
-  (PostToolUse · Edit/Write/MultiEdit) which re-runs the generator whenever a file under
-  `src/pipt/pipelines/` changes (where commands and execution order live). Regenerate by hand any time
-  with: `uv run python -m pipt.pipelines.external.flowmeta`. (Edits to the generators themselves in
-  `core/` aren't watched by the hook — regenerate manually after those.)
+  (PostToolUse · Edit/Write/MultiEdit) which re-runs `python -m ptflow.core.flowdocs` (ALL pipelines)
+  whenever a file under `src/ptflow/pipelines/` changes (where commands and execution order live).
+  Regenerate by hand any time with: `uv run python -m ptflow.core.flowdocs`. (Edits to the generators
+  themselves in `core/` aren't watched by the hook — regenerate manually after those.)
 
 ## External environment gotchas
 
@@ -797,31 +842,31 @@ A git diff of any of them shows exactly how the flow changed:
   assetfinder, gau, urlfinder, subjack, …) are in `~/go/bin`; feroxbuster in `~/.local/bin`.
 - Trusted resolvers: `/opt/resolvers/resolvers-trusted.txt`.
 - **DAST (`dast` step)** uses `nuclei -dast` with the fuzzing templates at `~/nuclei-templates/dast`
-  (override `PIPT_NUCLEI_DAST_TEMPLATES`); the step skips best-effort if the dir or nuclei is absent.
+  (override `PTFLOW_NUCLEI_DAST_TEMPLATES`); the step skips best-effort if the dir or nuclei is absent.
 - **Dedicated scanners (`xss`/`sqli`/`xss_full`/`sqli_full`)** use **dalfox** (`~/go/bin/dalfox`) and
-  **sqlmap** (`/opt/sqlmap-dev/sqlmap.py`, override `PIPT_SQLMAP`, run via `sys.executable` — it's a
+  **sqlmap** (`/opt/sqlmap-dev/sqlmap.py`, override `PTFLOW_SQLMAP`, run via `sys.executable` — it's a
   python script, not a PATH binary). Both make target requests; best-effort (skip if absent). No DB to
   provision. Tunables (`VULN_MAX_REQUESTS`/`VULN_FANOUT`/`VULN_TOOL_TIMEOUT`/`SQLMAP_LEVEL`/`SQLMAP_RISK`)
   at the top of `tasks.py`.
-- **OAST / blind XSS (`PIPT_OAST=on`, opt-in)** uses **`interactsh-client`** (`~/go/bin`, **≥1.3** — the
+- **OAST / blind XSS (`PTFLOW_OAST=on`, opt-in)** uses **`interactsh-client`** (`~/go/bin`, **≥1.3** — the
   1.2.x decrypt format is incompatible with today's public oast servers, verified: interactions arrive
-  but unmarshal as binary garbage). Default public servers; self-host with `PIPT_INTERACTSH_SERVER`/
-  `PIPT_INTERACTSH_TOKEN`. Catches only synchronous callbacks (see "Dedicated vuln scanners"); off by default.
+  but unmarshal as binary garbage). Default public servers; self-host with `PTFLOW_INTERACTSH_SERVER`/
+  `PTFLOW_INTERACTSH_TOKEN`. Catches only synchronous callbacks (see "Dedicated vuln scanners"); off by default.
 - **CVE lookup (`cve_lookup`/`cve_lookup_full`)** uses `search_vulns` (`~/.local/bin/search_vulns`,
-  override `PIPT_SEARCH_VULNS`) against its LOCAL DB. **Build/refresh the DB out-of-band:**
+  override `PTFLOW_SEARCH_VULNS`) against its LOCAL DB. **Build/refresh the DB out-of-band:**
   `search_vulns -u` (prebuilt download) or `--full-update` (rebuild) — never during a run. The step
   skips best-effort if the binary or DB is absent. Offline once built (no target traffic).
 - **WordPress vuln scan (`tech_vulnscan` → `wpprobe`)** uses `wpprobe` (`~/go/bin/wpprobe`,
   Chocapikk/wpprobe) against its LOCAL Wordfence DB. **Build/refresh out-of-band:** `wpprobe update-db`
   (and `wpprobe update` for the binary) — never during a run. Runs ONLY on WordPress app groups,
   best-effort (skips if absent). Makes target requests (stealthy REST enumeration, `--rate-limit`).
-- **Auth passthrough** — set `PIPT_HTTP_HEADER` to one or more `Name: value` session headers/cookies
+- **Auth passthrough** — set `PTFLOW_HTTP_HEADER` to one or more `Name: value` session headers/cookies
   (separated by newlines or `;;`) to reach the authenticated surface; threaded into katana/httpx/nuclei
-  (`-H`), arjun (`--headers`), x8 (`-H`). Set it *before* launching (like `PIPT_PROFILE`).
+  (`-H`), arjun (`--headers`), x8 (`-H`). Set it *before* launching (like `PTFLOW_PROFILE`).
 - **EyeWitness (optional, `screenshot` step)** — a Selenium app, **installed** at `/opt/EyeWitness`
   with its own venv (`/opt/EyeWitness/.venv`, selenium ≥4.45 → Selenium Manager auto-provisions
   chromedriver; runs `--headless=new`, no Xvfb/sudo needed). `_eyewitness_cmd` resolves it
-  automatically (PIPT_EYEWITNESS override › `eyewitness` on PATH › `_EYEWITNESS_DIR` = `/opt/EyeWitness`);
+  automatically (PTFLOW_EYEWITNESS override › `eyewitness` on PATH › `_EYEWITNESS_DIR` = `/opt/EyeWitness`);
   if it ever goes missing
   the step just keeps the httpx gallery and skips EyeWitness. It's fed ALL candidate URLs (one best
   host per group) via a single `-f` file — ONE batched run (the `-f` report path writes `Requests.csv`,
@@ -830,7 +875,7 @@ A git diff of any of them shows exactly how the flow changed:
   (`-sc`/`-system-chrome` hangs for katana here — but works for httpx -screenshot).
 - External tunables (rates, port counts, honeypot threshold, crawl depths, wordlist constants) are at the
   top of `pipelines/external/tasks.py` — tuned conservatively for live infra; don't bump blindly.
-- **Rate profile** (env **`PIPT_PROFILE`** ∈ `wide|home`, default `wide`, resolved at import — set it
+- **Rate profile** (env **`PTFLOW_PROFILE`** ∈ `wide|home`, default `wide`, resolved at import — set it
   *before* launching): `wide` = today's rates (real bandwidth); `home` throttles naabu `-rate`
   (300 vs 1000 — the full-port packet flood that exhausts a consumer NAT/router), nuclei `-rl`
   (50 vs 150) and feroxbuster `-t`/`-L`, for a domestic line. Aggregate load ≈ concurrency × rate,
@@ -845,7 +890,7 @@ The architecture sections above say *what* the external pipeline does; this reco
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
 
 - **The catalog REALIGNS `raw` to the unioned params after the merge (`normalize_request`), and seeds a
-  non-blank value.** A run-analysis (`pipt-recon-20260630`) found the phase-2 surface scanners testing
+  non-blank value.** A run-analysis (`ptflow-recon-20260630`) found the phase-2 surface scanners testing
   nothing: sqlmap exited in ~1s with "no testable parameter", DAST produced 2 low-value records, and the
   dedicated dalfox/sqlmap found 0 SQLi / 0 XSS on three deliberately-vulnerable targets — including
   ginandjuice, whose known SQLi/XSS live on `/catalog?category=`. Root cause: `merge_requests` dedups by
@@ -878,7 +923,7 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
 
 - **OAST/blind-XSS is within-run + best-effort (synchronous callbacks only), correlated per-request via
   the per-request runner.** dalfox `-b` fires blind payloads at an interactsh callback, but the hit lands
-  on the interactsh SERVER, not dalfox's output. `_run_dalfox` (PIPT_OAST on) runs an `interactsh-client`
+  on the interactsh SERVER, not dalfox's output. `_run_dalfox` (PTFLOW_OAST on) runs an `interactsh-client`
   for the pass (teardown-tracked `tools.spawn`/`stop`), gives each request a unique callback subdomain
   `b<i>.<domain>`, then `_oast_drain` → `correlate_oast` matches each interaction's `full-id`
   (`<marker>.<unique-id>`) back to the request. *Why per-request subdomains, not one callback:* dalfox
@@ -889,7 +934,7 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
   callback+correlation service living past the run, which breaks files-as-only-state. We capture what
   fires during the run (the scan's own request triggers a server-side render) and explicitly punt the
   rest. *Why opt-in:* it adds the interactsh dependency + (default) routes callbacks through PD's public
-  oast servers (a RoE/privacy consideration); self-host via `PIPT_INTERACTSH_SERVER`. *Tool floor:*
+  oast servers (a RoE/privacy consideration); self-host via `PTFLOW_INTERACTSH_SERVER`. *Tool floor:*
   interactsh-client **≥1.3** — 1.2.x can't decrypt the current public servers (interactions arrive but
   unmarshal as binary garbage; verified before/after the upgrade). *Verified end-to-end:* register →
   callback → decode → correlate → `poc_kind:"blind"` finding on the right request. *Rejected:* one

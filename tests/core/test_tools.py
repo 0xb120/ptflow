@@ -1,6 +1,6 @@
 import time
 
-from pipt.core import tools
+from ptflow.core import tools
 
 
 def test_dedupe_preserves_order_strips_blanks():
@@ -25,7 +25,7 @@ def test_run_echoes_stdout():
 def test_run_warns_on_nonzero_exit():
     import logging
 
-    from pipt.core.log import get_logger
+    from ptflow.core.log import get_logger
 
     lg = get_logger()
     records: list[logging.LogRecord] = []

@@ -1,0 +1,126 @@
+"""The external Pipeline object (real ProjectDiscovery toolchain), as a dependency DAG."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+from ptflow.core.agent import HypothesisProvider, StubProvider
+from ptflow.core.stage import Stage
+from ptflow.pipelines.external import tasks
+
+if TYPE_CHECKING:
+    from ptflow.core.flowmap import MapSpec
+    from ptflow.core.paths import Activity
+    from ptflow.core.requirements import Requirement
+
+
+class ExternalPipeline:
+    name = "external"
+    stages: Sequence[Stage] = (
+        # activity scope (whole-scope asset discovery)
+        Stage("provision_wl", tasks.provision_wl, net=False),  # wordlist roles → wl_global/ (offline, ∥)
+        Stage("expand", tasks.expand),
+        Stage("resolve", tasks.resolve, needs=("expand",)),
+        Stage("portscan", tasks.portscan, needs=("resolve",)),
+        Stage("httpx", tasks.httpx_fingerprint, needs=("portscan",)),
+        # full 65535-port scan + non-HTTP fingerprint — SPANNING: ∥ clustering + all per-app loops,
+        # joined at the fan-in. httpx only needs the fast top-1k web set (naabu_web.txt), so the
+        # expensive full scan no longer serializes in front of the breadth→cluster→loops path.
+        Stage("portscan_full", tasks.portscan_full, needs=("portscan",), spanning=True),
+        Stage("nerva", tasks.nerva_fingerprint, needs=("portscan_full",), spanning=True),
+        # whole-scope nuclei — spanning: runs ∥ clustering + all per-app loops, joined at the fan-in
+        Stage("nuclei_scope", tasks.nuclei_scope, needs=("httpx",), spanning=True),
+        # post-cluster spanning — ONE batched screenshot run (1 host/group) → unified gallery, ∥ loops
+        Stage("screenshot", tasks.screenshot_all, cluster_scope=True),
+        # ── per-app PHASE 1 — EXPLORABLE SURFACE (OSINT + crawl, NO guessing) ────────────────────────
+        # Map only what's really there: passive/crawl/headless + API specs, mine the corpus offline, and
+        # assemble the surface request catalog (requests.jsonl). No fuzzing/guessing in this phase.
+        Stage("passive_probe", tasks.passive_probe, per_app=True, phase=1),
+        Stage("crawl", tasks.crawl, needs=("passive_probe",), per_app=True, phase=1),
+        # gated TIER-1 headless crawl — runs only on the JS-rendered bucket (∥ takeover)
+        Stage("crawl_headless", tasks.crawl_headless, needs=("crawl",), per_app=True, phase=1),
+        Stage("subenum", tasks.subenum, per_app=True, phase=1),  # ∥ passive_probe/crawl
+        Stage("takeover", tasks.takeover, needs=("crawl", "subenum"), per_app=True, phase=1),
+        # download the OSINT/crawley delta, then mine the corpus offline (extract + jsluice endpoints)
+        Stage("fetch_delta", tasks.fetch_delta, needs=("crawl_headless",), per_app=True, phase=1),
+        # API spec discovery (OpenAPI/Swagger/GraphQL) → requests_api.jsonl (∥; reads hosts only)
+        Stage("api_spec", tasks.api_spec, per_app=True, phase=1),
+        Stage("mine_responses", tasks.mine_responses, needs=("fetch_delta",), per_app=True, phase=1,
+              net=False),  # offline: extract + jsluice the stored corpus, no network
+        # surface request catalog — crawl/headless/API + shapes mined from the crawl corpus, NO guessed
+        # surface (content_discovery/recrawl run later). The full-request DAST input for phase 2.
+        Stage("request_catalog", tasks.request_catalog,
+              needs=("crawl_headless", "mine_responses", "api_spec"), per_app=True, phase=1, net=False),
+        # ── per-app PHASE 2 — DAST the explorable surface (low-hanging fruit) ────────────────────────
+        # nuclei -dast over the surface catalog (observed params) — fast, high-signal findings on the
+        # real attack surface BEFORE sinking hours into fuzzing. Reads requests.jsonl across the barrier.
+        Stage("dast", tasks.dast, per_app=True, phase=2),
+        # dedicated vuln scanners over the explorable surface (full requests, every param location) —
+        # dalfox (XSS) ∥ sqlmap (SQLi), each tool's own engine decides (no gf-style name routing). The
+        # high-signal complement to nuclei -dast's generic templates. Best-effort; run ∥ dast/cve_lookup.
+        Stage("xss", tasks.xss, per_app=True, phase=2),
+        Stage("sqli", tasks.sqli, per_app=True, phase=2),
+        # CVE lookup over the explorable-surface enumerated software (web server + tech + service banners
+        # + corpus libs) — OFFLINE correlation (net=False, no target traffic), runs ∥ dast (same phase,
+        # no needs). Records the covered (product,version) set so the phase-4 pass reports only the delta.
+        Stage("cve_lookup", tasks.cve_lookup, per_app=True, phase=2, net=False),
+        # ── per-app PHASE 3 — guessing / surface expansion ──────────────────────────────────────────
+        # build the fuzzing seed offline (JS/body/seed parsing), run the per-stack surface scanners, then
+        # the content-discovery fixpoint; recrawl re-seeds katana on new-territory entry points it found.
+        Stage("wordlist", tasks.build_wordlist, per_app=True, phase=3, net=False),
+        Stage("tech_enum", tasks.tech_enum, needs=("wordlist",), per_app=True, phase=3),
+        Stage("content_discovery", tasks.content_discovery, needs=("wordlist", "tech_enum"),
+              per_app=True, phase=3),
+        Stage("recrawl", tasks.recrawl, needs=("content_discovery",), per_app=True, phase=3),
+        # ── per-app PHASE 4 — DAST the guessed surface (detailed) ───────────────────────────────────
+        # rebuild the catalog INCLUDING the guessed surface (requests_full.jsonl), discover hidden params,
+        # then DAST only the DELTA vs phase 2 + the param-injection requests (no re-DAST of the surface).
+        Stage("request_catalog_full", tasks.request_catalog_full, per_app=True, phase=4, net=False),
+        Stage("param_fuzz", tasks.param_fuzz, needs=("request_catalog_full",), per_app=True, phase=4),
+        Stage("dast_full", tasks.dast_full, needs=("request_catalog_full", "param_fuzz"),
+              per_app=True, phase=4),
+        # dedicated vuln scanners over the GUESSED-surface delta + discovered params (the dalfox/sqlmap
+        # analog of dast_full): fuzz only what phase 2 didn't already cover. Need the full catalog + params.
+        Stage("xss_full", tasks.xss_full, needs=("request_catalog_full", "param_fuzz"),
+              per_app=True, phase=4),
+        Stage("sqli_full", tasks.sqli_full, needs=("request_catalog_full", "param_fuzz"),
+              per_app=True, phase=4),
+        # CVE lookup over the EXPANDED enumeration (the phase-3 crawl grew the corpus) — OFFLINE, runs ∥
+        # dast_full; reports only the delta vs the phase-2 pass (raw/cve/seen.txt).
+        Stage("cve_lookup_full", tasks.cve_lookup_full, per_app=True, phase=4, net=False),
+        # finding-only per-stack vuln scanners (gated on detected tech) — runs ∥ the rest of loop 4.
+        # Today: wpprobe (WordPress plugin/theme → known-CVE) on WordPress groups → findings/wpprobe.jsonl.
+        Stage("tech_vulnscan", tasks.tech_vulnscan, per_app=True, phase=4),
+    )
+
+    def cluster(self, activity: Activity) -> list[str]:
+        return tasks.cluster(activity)
+
+    def consolidate(self, activity: Activity) -> dict[str, int]:
+        """Deterministic terminal fan-in: lift per-app findings into <activity>/findings/<type>.jsonl
+        (one file per finding type). The orchestrator calls this if present (the dormant agent seam
+        stays in place beside it)."""
+        return tasks.consolidate(activity)
+
+    def provider(self) -> HypothesisProvider:
+        return StubProvider()
+
+    def preflight(self) -> None:
+        """Log present/missing external tools at run start (best-effort, never aborts)."""
+        tasks.preflight()
+
+    def requirements(self) -> list[Requirement]:
+        """Host requirement manifest (tools + datasets) that `ptflow doctor` checks. Duck-typed hook,
+        like preflight/consolidate — read via getattr, so it stays off the Protocol."""
+        return tasks.requirements()
+
+    def flowmap_spec(self) -> MapSpec:
+        """Flow-map metadata for the doc generator (duck-typed hook; see core/flowdocs.py). Lazy
+        import keeps the doc-only prose off the normal run's import path."""
+        from ptflow.pipelines.external.flowmeta import SPEC  # noqa: PLC0415
+
+        return SPEC
+
+
+PIPELINE = ExternalPipeline()

@@ -1,11 +1,11 @@
 import json
 
-from pipt.core.scope import Target
-from pipt.pipelines.external import tasks
+from ptflow.core.scope import Target
+from ptflow.pipelines.external import tasks
 
 
 def test_extract_bodies_skips_missing_indexed_file(tmp_path):
-    from pipt.core.paths import AppWorkspace
+    from ptflow.core.paths import AppWorkspace
 
     ws = AppWorkspace(tmp_path / "app").ensure()
     store = ws.responses
@@ -41,13 +41,13 @@ def test_screenshot_fingerprint_slims_record():
 
 
 def test_resolve_profile_from_env(monkeypatch):
-    monkeypatch.setenv("PIPT_PROFILE", "home")
+    monkeypatch.setenv("PTFLOW_PROFILE", "home")
     assert tasks._resolve_profile().name == "home"
-    monkeypatch.setenv("PIPT_PROFILE", "WIDE")  # case-insensitive
+    monkeypatch.setenv("PTFLOW_PROFILE", "WIDE")  # case-insensitive
     assert tasks._resolve_profile().name == "wide"
-    monkeypatch.setenv("PIPT_PROFILE", "nonsense")  # unknown → default wide
+    monkeypatch.setenv("PTFLOW_PROFILE", "nonsense")  # unknown → default wide
     assert tasks._resolve_profile().name == "wide"
-    monkeypatch.delenv("PIPT_PROFILE", raising=False)
+    monkeypatch.delenv("PTFLOW_PROFILE", raising=False)
     assert tasks._resolve_profile().name == "wide"  # default
 
 
@@ -89,9 +89,11 @@ def test_app_id_is_readable_stable_and_unique():
 def test_preflight_runs_and_logs():
     import logging
 
-    from pipt.core.log import get_logger
+    from ptflow.core.log import get_logger
 
     lg = get_logger()
+    prior_level = lg.level
+    lg.setLevel(logging.DEBUG)   # capture the INFO summary regardless of setup_logging / installed tools
     recs: list[logging.LogRecord] = []
     handler = logging.Handler()
     handler.emit = recs.append
@@ -100,7 +102,24 @@ def test_preflight_runs_and_logs():
         tasks.preflight()  # best-effort: must never raise regardless of which tools are installed
     finally:
         lg.removeHandler(handler)
+        lg.setLevel(prior_level)
     assert any("preflight" in r.getMessage() for r in recs)  # always logs the tool-inventory summary
+
+
+def test_requirements_manifest_covers_tool_dicts_and_datasets():
+    reqs = tasks.requirements()
+    by_name = {r.name: r for r in reqs}
+    # every tool from the which-based dicts is in the manifest with the matching kind (single source
+    # of truth — preflight + doctor both render from this)
+    for name in tasks._CORE_TOOLS:
+        assert by_name[name].kind == "core"
+    for name in tasks._OPTIONAL_TOOLS:
+        assert by_name[name].kind == "optional"
+    # interactsh-client carries the documented >=1.3 version floor
+    assert by_name["interactsh-client"].min_version == "1.3"
+    # datasets are represented as category=="dataset" (path-existence checks), e.g. the resolvers file
+    datasets = {r.name for r in reqs if r.category == "dataset"}
+    assert "resolvers" in datasets
 
 
 def test_web_ports_constant_is_250_distinct_valid():
@@ -179,7 +198,7 @@ def test_select_unique_webapps_dedups_by_signature():
 
 
 def test_pipeline_object_shape():
-    from pipt.pipelines.external.pipeline import PIPELINE
+    from ptflow.pipelines.external.pipeline import PIPELINE
 
     assert PIPELINE.name == "external"
     activity = [s.name for s in PIPELINE.stages
@@ -223,7 +242,7 @@ def test_pipeline_object_shape():
 def test_pipeline_phase_wiring():
     """The 4-phase surface-first/DAST-first per-app model: phase numbers + intra-phase `needs`
     (cross-phase ordering is the barrier, never `needs`)."""
-    from pipt.pipelines.external.pipeline import PIPELINE
+    from ptflow.pipelines.external.pipeline import PIPELINE
 
     by_name = {s.name: s for s in PIPELINE.stages}
     # PHASE 1 = explorable surface (OSINT + crawl, NO guessing): crawl/headless + delta fetch + offline
@@ -363,8 +382,8 @@ def test_merge_params_wordlist_custom_first_dedup():
 
 def test_effective_params_wl_merges_custom_first(tmp_path):
     """param_fuzz uses wl_custom/params.txt custom-first; falls back to the global role when empty."""
-    from pipt.core import tools
-    from pipt.core.paths import Activity
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     ws = act.app("app1").ensure()
@@ -463,10 +482,10 @@ def test_parse_eyewitness_csv_keeps_default_cred_leads():
 
 def test_eyewitness_cmd_resolves_env_then_path(monkeypatch, tmp_path):
     # explicit env override wins
-    monkeypatch.setenv("PIPT_EYEWITNESS", "python3 /opt/EyeWitness/Python/EyeWitness.py")
+    monkeypatch.setenv("PTFLOW_EYEWITNESS", "python3 /opt/EyeWitness/Python/EyeWitness.py")
     assert tasks._eyewitness_cmd() == ["python3", "/opt/EyeWitness/Python/EyeWitness.py"]
     # nothing resolvable (no env, no PATH eyewitness, no install dir) ⇒ None ⇒ step skips cleanly
-    monkeypatch.delenv("PIPT_EYEWITNESS", raising=False)
+    monkeypatch.delenv("PTFLOW_EYEWITNESS", raising=False)
     monkeypatch.setattr(tasks.shutil, "which", lambda _: None)
     monkeypatch.setattr(tasks, "_EYEWITNESS_DIR", tmp_path / "absent")  # no known-location install
     assert tasks._eyewitness_cmd() is None
@@ -505,8 +524,8 @@ def test_parse_shortscan_findings():
 
 def test_build_wordlist_offline(tmp_path):
     """wordlist is pure offline: it tokenizes loop-1's endpoints.txt, never fetches."""
-    from pipt.core import tools, workspace
-    from pipt.core.paths import Activity
+    from ptflow.core import tools, workspace
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     ws = act.app("app1").ensure()
@@ -521,8 +540,8 @@ def test_build_wordlist_offline(tmp_path):
 def test_build_wordlist_mines_links_and_bodies(tmp_path, monkeypatch):
     """The lexicon extractor mines BOTH the link surface AND the extracted bodies into four products:
     seed (endpoints), params (names), values (semantic words), identities (users/emails)."""
-    from pipt.core import tools, workspace
-    from pipt.core.paths import Activity
+    from ptflow.core import tools, workspace
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     ws = act.app("app1").ensure()
@@ -674,8 +693,8 @@ def test_best_host_prefers_non_ip_then_https():
 
 def test_expand_splits_scope_offline(tmp_path):
     """A domain-only scope invokes no external tools, so expand is testable offline."""
-    from pipt.core import tools
-    from pipt.core.paths import Activity
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     act.scope_init.write_text("example.com\nnmap.org\n", encoding="utf-8")
@@ -686,8 +705,8 @@ def test_expand_splits_scope_offline(tmp_path):
 
 
 def test_cluster_groups_by_signature(tmp_path):
-    from pipt.core import tools, workspace
-    from pipt.core.paths import Activity
+    from ptflow.core import tools, workspace
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     tools.write_jsonl(
@@ -712,8 +731,8 @@ def test_cluster_groups_by_signature(tmp_path):
 
 
 def test_cluster_honors_explicit_scope_scheme(tmp_path):
-    from pipt.core import tools
-    from pipt.core.paths import Activity
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     act.scope.write_text("http://zero.example.com\nhttps://shop.example.org\n", encoding="utf-8")
@@ -732,8 +751,8 @@ def test_cluster_honors_explicit_scope_scheme(tmp_path):
 
 
 def test_working_schemes_prefers_content_discovery_over_hosts(tmp_path):
-    from pipt.core import tools
-    from pipt.core.paths import AppWorkspace
+    from ptflow.core import tools
+    from ptflow.core.paths import AppWorkspace
 
     ws = AppWorkspace(tmp_path / "app").ensure()
     tools.write_lines(ws.hosts, ["https://a.x.com", "http://b.x.com"])
@@ -866,7 +885,7 @@ def test_ferox_time_limit_round0_full_feedback_capped():
 
 
 def test_all_store_indices_globs_every_store(tmp_path):
-    from pipt.core.paths import Activity
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     ws = act.app("app1").ensure()
@@ -994,8 +1013,8 @@ def test_richest_hosts_ranks_by_hit_count_and_caps():
 def test_build_wordlist_seed_excludes_tech_lists(tmp_path):
     """The layer split: build_wordlist writes ONLY app tokens — tech CMS lists are added later by
     content_discovery's combine, never folded into the custom seed."""
-    from pipt.core import tools, workspace
-    from pipt.core.paths import Activity
+    from ptflow.core import tools, workspace
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     ws = act.app("app1").ensure()
@@ -1173,10 +1192,10 @@ def test_merge_requests_upgrades_blank_param_value_with_observed():
 
 
 def test_auth_headers_parses_env(monkeypatch):
-    monkeypatch.setenv("PIPT_HTTP_HEADER", "Cookie: s=1;;Authorization: Bearer x\nBad")
+    monkeypatch.setenv("PTFLOW_HTTP_HEADER", "Cookie: s=1;;Authorization: Bearer x\nBad")
     assert tasks._auth_headers() == ["Cookie: s=1", "Authorization: Bearer x"]    # 'Bad' (no ':') dropped
     assert tasks._header_flags("-H") == ["-H", "Cookie: s=1", "-H", "Authorization: Bearer x"]
-    monkeypatch.delenv("PIPT_HTTP_HEADER")
+    monkeypatch.delenv("PTFLOW_HTTP_HEADER")
     assert tasks._auth_headers() == []
     assert tasks._header_flags() == []
 
@@ -1224,7 +1243,7 @@ def test_dead_url_keys_only_paths_seen_exclusively_as_404():
 
 
 def test_assemble_catalog_drops_dead_get_keeps_post(tmp_path):
-    from pipt.core.paths import AppWorkspace
+    from ptflow.core.paths import AppWorkspace
 
     ws = AppWorkspace(tmp_path / "app").ensure()
     ws.responses.mkdir(parents=True, exist_ok=True)
@@ -1661,8 +1680,8 @@ def test_map_hosts_to_ips_parses_dnsx_resp_format():
 def test_app_service_banners_attributes_ip_only_record(tmp_path):
     # regression: an IP-only nerva record must attach to the app via domain_ip_map.txt — the old
     # parser took the '[A]' record-type column instead of the bracketed IP, so it never matched.
-    from pipt.core import tools
-    from pipt.core.paths import Activity
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     canon = act.asset_discovery_canonical
@@ -1715,8 +1734,8 @@ def test_cve_sort_key_prioritizes_exploited_then_cvss():
 
 # --- consolidate (terminal fan-in) ---
 def test_consolidate_lifts_per_app_findings_by_type(tmp_path):
-    from pipt.core import tools
-    from pipt.core.paths import Activity
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     a1, a2 = act.app("app-1").ensure(), act.app("app-2").ensure()
@@ -1745,7 +1764,7 @@ def test_consolidate_lifts_per_app_findings_by_type(tmp_path):
 
 
 def test_consolidate_no_findings_returns_empty(tmp_path):
-    from pipt.core.paths import Activity
+    from ptflow.core.paths import Activity
 
     act = Activity.named("empty", root=tmp_path).ensure()
     act.app("app-1").ensure()
@@ -1753,8 +1772,8 @@ def test_consolidate_no_findings_returns_empty(tmp_path):
 
 
 def test_external_pipeline_exposes_consolidate(tmp_path):
-    from pipt.core.paths import Activity
-    from pipt.pipelines.external.pipeline import PIPELINE
+    from ptflow.core.paths import Activity
+    from ptflow.pipelines.external.pipeline import PIPELINE
 
     act = Activity.named("demo", root=tmp_path).ensure()
     act.app("app-1").ensure()
@@ -1792,8 +1811,8 @@ def test_parse_wpprobe_themes_sorting_and_tolerance():
 
 
 def test_tech_vulnscan_gates_on_wordpress(tmp_path, monkeypatch):
-    from pipt.core import tools, workspace
-    from pipt.core.paths import Activity
+    from ptflow.core import tools, workspace
+    from ptflow.core.paths import Activity
 
     act = Activity.named("demo", root=tmp_path).ensure()
     ws = act.app("app-1").ensure()
