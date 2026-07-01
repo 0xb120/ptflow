@@ -73,6 +73,9 @@ class ExternalPipeline:
         Stage("content_discovery", tasks.content_discovery, needs=("wordlist", "tech_enum"),
               per_app=True, phase=3),
         Stage("recrawl", tasks.recrawl, needs=("content_discovery",), per_app=True, phase=3),
+        # cloud-storage exposure — mine the corpus for S3/GCS/Azure refs + probe apex-derived candidate
+        # bucket names for public listability (∥ the rest of loop 3; reads the corpus, no needs).
+        Stage("cloud_assets", tasks.cloud_assets, per_app=True, phase=3),
         # ── per-app PHASE 4 — DAST the guessed surface (detailed) ───────────────────────────────────
         # rebuild the catalog INCLUDING the guessed surface (requests_full.jsonl), discover hidden params,
         # then DAST only the DELTA vs phase 2 + the param-injection requests (no re-DAST of the surface).

@@ -76,29 +76,40 @@ FLOWMETA: dict[str, StepMeta] = {
                "stessa correlazione offline della pipeline external (search_vulns fa lui il check dei range)"),
     ),
     "smb_checks": StepMeta(
-        summary="LOOP 2 — first-check SMB via netexec sugli host con 445 aperta: signing non richiesto "
-                "(superficie NTLM-relay), SMBv1 (EternalBlue), sessione null/guest, accesso admin (Pwn3d!).",
-        commands=("nxc smb <host…> -u '' -p ''   # gated su 445 aperta (dai ports.jsonl del gruppo)",
-                  "# parse_nxc_smb: [*] signing:False/SMBv1:True (medium) · [+] Pwn3d! (high)/valid (medium)"),
+        summary="LOOP 2 — postura SMB + LOOT via netexec sugli host con 445 aperta: signing non richiesto "
+                "(NTLM-relay), SMBv1 (EternalBlue), null/guest, admin (Pwn3d!); poi — dalla STESSA sessione "
+                "anonima — enum delle share (READ/WRITE) e spider SOLO-METADATI delle share non-default.",
+        commands=("nxc smb <host…> -u '' -p ''            # postura → parse_nxc_smb",
+                  "nxc smb <host…> -u '' -p '' --shares   # → parse_nxc_shares (WRITE=high · READ=medium)",
+                  "nxc smb <host…> -u '' -p '' -M spider_plus -o OUTPUT_FOLDER=<dir>   # metadati, no download",
+                  "# spider_interesting: file con nome sospetto (pass/secret/backup/.kdbx/…) → smb-interesting-file"),
         outputs=("findings/smb.jsonl",),
-        notes=("best-effort: salta se nessuna 445 o netexec assente · cap wall-clock CHECK_TIMEOUT (300s)",
-               "solo check non-distruttivi (null/guest) · brute-force/relay/coercion deliberatamente non wired"),
+        notes=("read-only: lo spider è SOLO metadati (nessun download di contenuti — follow-up manuale)",
+               "spider solo sugli host con una share READABLE non-default (IPC$/PRINT$/ADMIN$/C$ esclusi)",
+               "best-effort: salta se nessuna 445 o netexec assente · brute-force/relay/coercion non wired"),
     ),
     "snmp_checks": StepMeta(
-        summary="LOOP 2 — sweep community di default SNMP (UDP/161) via onesixtyone su TUTTI gli host del "
-                "gruppo (161 è UDP, fuori dal portscan TCP). Una community che risponde è un finding.",
+        summary="LOOP 2 — community di default SNMP (UDP/161) via onesixtyone su TUTTI gli host + LOOT. Una "
+                "community che risponde è un finding; da quella community poi snmpwalk di OID ad alto valore "
+                "(system · processi · tabella ARP) → mappa di rete come loot.",
         commands=("onesixtyone -c <communities.txt> -i <hosts.txt>   # public/private/community/manager/cisco",
-                  "# parse_onesixtyone: 'ip [community] sysDescr' → snmp-default-community"),
+                  "# parse_onesixtyone: 'ip [community] sysDescr' → snmp-default-community",
+                  "snmpwalk -v2c -c <community> <host> <OID>   # 1.3.6.1.2.1.1 / .25.4.2.1.2 / .4.22.1.2",
+                  "# parse_snmpwalk: sysDescr + conteggio entry → snmp-info"),
         outputs=("findings/snmp.jsonl",),
-        notes=("su TUTTI gli host del gruppo (161 UDP non è nel portscan) · best-effort: salta se onesixtyone assente",),
+        notes=("su TUTTI gli host del gruppo (161 UDP non è nel portscan) · walk read-only, bounded per OID",
+               "best-effort: salta se onesixtyone/snmpwalk assenti"),
     ),
     "ldap_checks": StepMeta(
-        summary="LOOP 2 — bind anonimo LDAP via ldapsearch sugli host con 389/636 aperta: un rootDSE che "
-                "restituisce i naming context senza credenziali è un finding.",
-        commands=("ldapsearch -x -H ldap://<host> -s base -b '' namingContexts   # gated su 389/636 aperta",),
+        summary="LOOP 2 — bind anonimo LDAP via ldapsearch sugli host con 389/636 aperta + LOOT: un rootDSE "
+                "che restituisce i naming context senza credenziali è un finding; dallo stesso bind anonimo "
+                "poi dump (bounded) dei nomi account come users loot file.",
+        commands=("ldapsearch -x -H ldap://<host> -s base -b '' namingContexts   # gated su 389/636",
+                  "ldapsearch -x -b <baseDN> -z 500 '(|(objectClass=user)(objectClass=person)…)' sAMAccountName uid",
+                  "# parse_naming_contexts + parse_ldap_accounts → ldap-anonymous-bind + ldap-anon-users"),
         outputs=("findings/ldap.jsonl",),
-        notes=("best-effort: salta se nessuna 389/636 o ldapsearch assente",
-               "parsing minimale (namingContexts:) — da rifinire dal vivo su un dominio reale"),
+        notes=("dump bounded (-z LDAP_MAX_ENTRIES) sul primo naming context di dominio · read-only",
+               "best-effort: salta se nessuna 389/636 o ldapsearch assente"),
     ),
     "ftp_checks": StepMeta(
         summary="LOOP 2 — login FTP ANONIMO via netexec sugli host con 21 aperta (`-u anonymous -p ''`). "

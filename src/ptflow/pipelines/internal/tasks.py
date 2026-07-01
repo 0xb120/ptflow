@@ -22,9 +22,9 @@ the fan-out unit is a **scope subnet**, not a web app:
   LOOP 2 — low-hanging fruit (per-subnet, gated on the ports found in the breadth scan; all ∥,
            best-effort, NON-destructive — no credentialed/brute-force checks, those are opt-in/future)
     cve_lookup     — search_vulns over the service banners (OFFLINE)   → findings/cve.jsonl
-    smb_checks     — netexec: signing / null-session / guest           → findings/smb.jsonl
-    snmp_checks    — onesixtyone: default community strings            → findings/snmp.jsonl
-    ldap_checks    — ldapsearch: anonymous bind                        → findings/ldap.jsonl
+    smb_checks     — netexec: signing/null-session/guest + share enum + metadata spider → findings/smb.jsonl
+    snmp_checks    — onesixtyone default community + snmpwalk loot      → findings/snmp.jsonl
+    ldap_checks    — ldapsearch: anonymous bind + account dump         → findings/ldap.jsonl
     ftp_checks     — netexec: anonymous FTP login                      → findings/ftp.jsonl
     telnet_checks  — nmap -sV: exposed cleartext telnet + banner       → findings/telnet.jsonl
     nfs_checks     — showmount -e: anonymously-readable NFS exports    → findings/nfs.jsonl
@@ -94,11 +94,12 @@ LDAPSEARCH = _resolve("PTFLOW_LDAPSEARCH", "ldapsearch")
 SCRYING = _resolve("PTFLOW_SCRYING", "scrying")                          # RDP/VNC screenshotter
 RSYNC = _resolve("PTFLOW_RSYNC", "rsync")
 SHOWMOUNT = _resolve("PTFLOW_SHOWMOUNT", "/usr/sbin/showmount", "showmount")  # nfs-utils (often /usr/sbin)
+SNMPWALK = _resolve("PTFLOW_SNMPWALK", "snmpwalk")                       # net-snmp (post-hit walk)
 
 _CORE_TOOLS = {"mapcidr": MAPCIDR, "naabu": NAABU, "nmap": NMAP, "nerva": NERVA}
 _OPTIONAL_TOOLS = {"nuclei": NUCLEI, "netexec": NXC, "search_vulns": SEARCH_VULNS,
                    "onesixtyone": ONESIXTYONE, "ldapsearch": LDAPSEARCH,
-                   "scrying": SCRYING, "rsync": RSYNC, "showmount": SHOWMOUNT}
+                   "scrying": SCRYING, "rsync": RSYNC, "showmount": SHOWMOUNT, "snmpwalk": SNMPWALK}
 
 # --- tunables (rates conservative for live internal infra — legacy/OT gear is fragile) -----------
 # Aggregate load ~= concurrency x rate; a full connect-scan flood can knock over old devices and
@@ -115,6 +116,18 @@ CHECK_TIMEOUT = 300   # per-invocation wall-clock cap (s) for the bounded loop-2
 SCRYING_TIMEOUT = 600  # one scrying run screenshots all a subnet's RDP/VNC sockets — give it headroom
 CVE_TOOL_TIMEOUT = 90
 _CVE_DESC_MAX = 300
+
+# --- loot tunables (point 4 — turn a fase-2 hit into read-only loot; all bounded/non-destructive) ---
+LDAP_MAX_ENTRIES = "500"   # ldapsearch -z size cap for the anonymous account dump
+# curated high-value OIDs for the post-hit SNMP walk: system · running processes · ARP table
+SNMP_WALK_OIDS = ("1.3.6.1.2.1.1", "1.3.6.1.2.1.25.4.2.1.2", "1.3.6.1.2.1.4.22.1.2")
+# SMB share hygiene: null-session noise never becomes a finding; default/admin shares are never spidered.
+_SMB_NOISE_SHARES = frozenset({"IPC$", "PRINT$"})
+_SMB_SKIP_SPIDER = frozenset({"IPC$", "PRINT$", "ADMIN$", "C$"})
+# interesting-filename patterns for the SMB spider (metadata only — no content download)
+_SMB_INTERESTING = re.compile(
+    r"(?i)(pass|secret|cred|backup|\.bak|\.kdbx|\.key|\.pem|id_rsa|\.ppk|\.config|unattend|\.ovpn|"
+    r"\.sql|shadow|\.vmdk|\.ps1|\.ini)")
 
 # curated internal-service TCP ports for the fast portscan (naabu -p). Not nmap's generic top-1k —
 # this leans to the services an internal first-check cares about (SMB/LDAP/RDP/DB/mgmt UIs). SNMP is
@@ -476,6 +489,66 @@ def parse_scrying(pngs: list[Path]) -> list[dict]:
     return findings
 
 
+def parse_nxc_shares(out: str) -> list[dict]:
+    """netexec `--shares` output → SMB share-access findings (pure). Share rows are
+    'SMB <ip> <port> <host> <share> <perms> [remark]'; the perms column carries READ / WRITE /
+    READ,WRITE. A WRITE share is HIGH, READ MEDIUM; null-session noise (IPC$/PRINT$), shares with no
+    access, and the banner/header rows are skipped."""
+    findings: list[dict] = []
+    for raw in out.splitlines():
+        m = _NXC_SMB_LINE.match(raw.strip())
+        if not m:
+            continue
+        host, rest = m.group(1), m.group(2).strip()
+        if not rest or rest.startswith(("[", "Share", "---")):
+            continue
+        parts = rest.split()
+        share = parts[0]
+        perm = parts[1].upper() if len(parts) > 1 else ""
+        writable, readable = "WRITE" in perm, "READ" in perm
+        if share.upper() in _SMB_NOISE_SHARES or not (readable or writable):
+            continue
+        findings.append({"type": "smb-share-writable" if writable else "smb-share-readable",
+                         "severity": "high" if writable else "medium", "host": host,
+                         "share": share, "permissions": perm, "evidence": rest})
+    return findings
+
+
+def spider_interesting(spider: dict, host: str) -> list[dict]:
+    """spider_plus JSON ({share: {relpath: meta}}) → smb-interesting-file findings (pure). Only paths
+    whose name matches _SMB_INTERESTING (passwords/keys/backups/configs/…) are kept — the JSON is
+    metadata only (spider_plus does not download content by default)."""
+    return [{"type": "smb-interesting-file", "severity": "medium", "host": host, "share": share,
+             "path": path, "evidence": f"//{host}/{share}/{path}"}
+            for share, files in (spider or {}).items()
+            for path in (files or {})
+            if _SMB_INTERESTING.search(path)]
+
+
+def parse_naming_contexts(out: str) -> list[str]:
+    """ldapsearch rootDSE output → the base DNs from the 'namingContexts:' lines (pure, in order)."""
+    return [ln.split(":", 1)[1].strip() for ln in out.splitlines()
+            if ln.startswith("namingContexts:")]
+
+
+def parse_ldap_accounts(out: str) -> list[str]:
+    """ldapsearch entries → account names from the sAMAccountName / uid attributes (pure, sorted-unique)."""
+    names: set[str] = set()
+    for ln in out.splitlines():
+        attr, _, value = ln.partition(":")
+        if attr.strip().lower() in ("samaccountname", "uid") and value.strip():
+            names.add(value.strip())
+    return sorted(names)
+
+
+def parse_snmpwalk(out: str) -> dict:
+    """snmpwalk output → a small summary (pure): the sysDescr string + the count of walked entries."""
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    sysdescr = next((ln.split("STRING:", 1)[1].strip() for ln in lines
+                     if "sysDescr" in ln and "STRING:" in ln), "")
+    return {"entries": len(lines), "sysdescr": sysdescr}
+
+
 # --- breadth stages (activity scope) -------------------------------------------------------------
 def _raw(activity: Activity, tool: str, label: str) -> Path:
     return activity.asset_discovery_raw(tool) / f"{label}.txt"
@@ -681,24 +754,72 @@ def cve_lookup(activity: Activity, app_id: str) -> None:
     log.info("  → cve_lookup [%s] — %d software → %d CVE(s)", app_id, len(software), len(findings))
 
 
+def _smb_spider(ws: AppWorkspace, hosts: list[str]) -> list[dict]:
+    """Metadata-only SMB spider (spider_plus) over `hosts` → smb-interesting-file findings. spider_plus
+    writes one <host>.json of file METADATA (no content download) into OUTPUT_FOLDER; each is filtered
+    for interesting filenames. Read-only, best-effort ([] on any failure)."""
+    outdir = ws.raw("netexec") / "spider"
+    outdir.mkdir(parents=True, exist_ok=True)
+    _capture([NXC, "smb", *hosts, "-u", "", "-p", "", "-M", "spider_plus",
+              "-o", f"OUTPUT_FOLDER={outdir}"], dest=ws.raw("netexec") / "spider.txt", label="smb-spider")
+    findings: list[dict] = []
+    for jf in sorted(outdir.glob("*.json")):
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8", errors="replace"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        findings += spider_interesting(data if isinstance(data, dict) else {}, jf.stem)
+    return findings
+
+
 def smb_checks(activity: Activity, app_id: str) -> None:
-    """LOOP 2 — SMB first-checks via netexec on hosts with 445 open: signing not required, guest /
-    null-session access. Best-effort → findings/smb.jsonl."""
+    """LOOP 2 — SMB first-checks + LOOT via netexec on hosts with 445 open. Posture (signing not
+    required / SMBv1 / null-session / guest / admin), then — from the SAME anonymous session — share
+    enumeration (READ/WRITE) and a metadata-only spider of readable non-default shares flagging
+    interesting filenames. All read-only, best-effort → findings/smb.jsonl."""
     ws = activity.app(app_id)
     hosts = _hosts_with_port(ws, PORT_SMB)
     if not hosts or shutil.which(NXC) is None:
         log.debug("  · skip smb_checks [%s] (no 445 / netexec absent)", app_id)
         return
-    out = _capture([NXC, "smb", *hosts, "-u", "", "-p", ""],
-                   dest=ws.raw("netexec") / "smb.txt", label="smb")
-    findings = parse_nxc_smb(out)
+    findings = parse_nxc_smb(_capture([NXC, "smb", *hosts, "-u", "", "-p", ""],
+                                      dest=ws.raw("netexec") / "smb.txt", label="smb"))
+    shares = parse_nxc_shares(_capture([NXC, "smb", *hosts, "-u", "", "-p", "", "--shares"],
+                                       dest=ws.raw("netexec") / "shares.txt", label="smb-shares"))
+    findings += shares
+    # spider only the hosts that exposed a readable, non-default share (keeps the load down)
+    loot_hosts = sorted({f["host"] for f in shares if f["share"].upper() not in _SMB_SKIP_SPIDER})
+    if loot_hosts:
+        findings += _smb_spider(ws, loot_hosts)
     tools.write_jsonl(ws.findings / "smb.jsonl", findings)
     log.info("  → smb_checks [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
 
 
+def _snmp_walk(ws: AppWorkspace, hits: list[dict]) -> list[dict]:
+    """For each SNMP community hit, snmpwalk the curated OIDs (system · processes · ARP) → an snmp-info
+    finding + a network-map loot file. Read-only, bounded per OID, best-effort ([] on nothing)."""
+    out_findings: list[dict] = []
+    for hit in hits:
+        host, community = hit.get("host"), hit.get("community")
+        if not host or not community:
+            continue
+        combined = "".join(
+            _capture([SNMPWALK, "-v2c", "-c", community, "-t", "2", "-r", "1", host, oid],
+                     dest=ws.raw("snmpwalk") / f"{host}_{oid}.txt", label="snmpwalk")
+            for oid in SNMP_WALK_OIDS)
+        summary = parse_snmpwalk(combined)
+        if summary["entries"]:
+            out_findings.append({"type": "snmp-info", "severity": "medium", "host": host,
+                                 "community": community, "sysdescr": summary["sysdescr"],
+                                 "entries": summary["entries"],
+                                 "evidence": f"snmpwalk via '{community}' — {summary['entries']} OID value(s)"})
+    return out_findings
+
+
 def snmp_checks(activity: Activity, app_id: str) -> None:
-    """LOOP 2 — SNMP default-community sweep (UDP/161) via onesixtyone over ALL group hosts (161 is
-    UDP so it's not in the TCP portscan). A responding community is a finding. Best-effort."""
+    """LOOP 2 — SNMP default-community sweep + LOOT (UDP/161) via onesixtyone over ALL group hosts (161
+    is UDP so it's not in the TCP portscan). A responding community is a finding; from that community we
+    then snmpwalk a curated OID set (system/processes/ARP) into a network-map loot. Best-effort."""
     ws = activity.app(app_id)
     hosts = tools.read_lines(ws.hosts)
     if not hosts or shutil.which(ONESIXTYONE) is None:
@@ -711,13 +832,32 @@ def snmp_checks(activity: Activity, app_id: str) -> None:
     out = _capture([ONESIXTYONE, "-c", str(comm_file), "-i", str(host_file)],
                    dest=ws.raw("onesixtyone") / "snmp.txt", label="snmp")
     findings = parse_onesixtyone(out)
+    if findings and shutil.which(SNMPWALK):   # post-hit walk: turn a community hit into a network map
+        findings += _snmp_walk(ws, findings)
     tools.write_jsonl(ws.findings / "snmp.jsonl", findings)
     log.info("  → snmp_checks [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
 
 
+def _ldap_dump(ws: AppWorkspace, host: str, contexts: list[str]) -> list[dict]:
+    """Bounded anonymous account dump (ldapsearch -z LDAP_MAX_ENTRIES) over the first DOMAIN naming
+    context → an ldap-anon-users finding + a users loot file. Read-only, best-effort ([] on nothing)."""
+    base = next((c for c in contexts if "DC=" in c.upper()), contexts[0])
+    out = _capture([LDAPSEARCH, "-x", "-H", f"ldap://{host}", "-b", base, "-z", LDAP_MAX_ENTRIES,
+                    "(|(objectClass=user)(objectClass=person)(objectClass=inetOrgPerson))",
+                    "sAMAccountName", "uid"],
+                   dest=ws.raw("ldapsearch") / f"{host}_dump.txt", label="ldap-dump")
+    accounts = parse_ldap_accounts(out)
+    if not accounts:
+        return []
+    tools.write_lines(ws.raw("ldapsearch") / f"{host}_accounts.txt", accounts)
+    return [{"type": "ldap-anon-users", "severity": "high", "host": host, "count": len(accounts),
+             "sample": accounts[:10], "evidence": f"{len(accounts)} account(s) via anonymous bind"}]
+
+
 def ldap_checks(activity: Activity, app_id: str) -> None:
-    """LOOP 2 — LDAP anonymous-bind check via ldapsearch on hosts with 389/636 open. A rootDSE that
-    returns naming contexts anonymously is a finding. Best-effort → findings/ldap.jsonl."""
+    """LOOP 2 — LDAP anonymous bind + LOOT via ldapsearch on hosts with 389/636 open. A rootDSE that
+    returns naming contexts anonymously is a finding; from the same anonymous bind we then dump the
+    account names (bounded) as a users loot file. Best-effort → findings/ldap.jsonl."""
     ws = activity.app(app_id)
     hosts = sorted(set(_hosts_with_port(ws, PORT_LDAP)) | set(_hosts_with_port(ws, PORT_LDAPS)))
     if not hosts or shutil.which(LDAPSEARCH) is None:
@@ -727,10 +867,12 @@ def ldap_checks(activity: Activity, app_id: str) -> None:
     for host in hosts:
         out = _capture([LDAPSEARCH, "-x", "-H", f"ldap://{host}", "-s", "base", "-b", "",
                         "namingContexts"], dest=ws.raw("ldapsearch") / f"{host}.txt", label="ldap")
-        if "namingContexts:" in out:
-            findings.append({"type": "ldap-anonymous-bind", "severity": "medium", "host": host,
-                             "evidence": next((ln.strip() for ln in out.splitlines()
-                                               if ln.startswith("namingContexts:")), "")})
+        contexts = parse_naming_contexts(out)
+        if not contexts:
+            continue
+        findings.append({"type": "ldap-anonymous-bind", "severity": "medium", "host": host,
+                         "evidence": f"namingContexts: {contexts[0]}"})
+        findings += _ldap_dump(ws, host, contexts)
     tools.write_jsonl(ws.findings / "ldap.jsonl", findings)
     log.info("  → ldap_checks [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
 

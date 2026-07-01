@@ -9,6 +9,7 @@ memory. Pure transforms are module-level so they can be unit-tested.
 
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import io
@@ -2490,6 +2491,105 @@ def build_wordlist(activity: Activity, app_id: str) -> None:
              app_id, n_seed, n_par, n_val, n_id)
 
 
+# --- JS sourcemap extraction (point 5b) — recover original sources the crawlers can't see ---------
+_SOURCEMAP_RE = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)")
+
+
+def sourcemap_ref(js_text: str) -> str | None:
+    """The `//# sourceMappingURL=<ref>` value in a JS body (LAST occurrence wins), or None. Pure."""
+    matches = _SOURCEMAP_RE.findall(js_text)
+    return matches[-1].strip() if matches else None
+
+
+def decode_inline_sourcemap(ref: str) -> str | None:
+    """An inline `data:` sourcemap ref → the decoded map JSON text (base64 or url-encoded), else None
+    (a non-data ref is a URL fetched by fetch_delta). Pure."""
+    if not ref.startswith("data:"):
+        return None
+    header, _, payload = ref.partition(",")
+    if "base64" in header:
+        try:
+            return base64.b64decode(payload).decode("utf-8", "replace")
+        except ValueError:               # binascii.Error subclasses ValueError
+            return None
+    return unquote(payload)
+
+
+def parse_sourcemap(map_text: str) -> list[tuple[str, str]]:
+    """A sourcemap's `sources`/`sourcesContent` → [(source_path, original_content)] for the entries
+    that actually carry content (the reconstructable ones). Pure ([] on non-JSON / no content)."""
+    try:
+        data = json.loads(map_text)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    sources = data.get("sources") or []
+    contents = data.get("sourcesContent") or []
+    out: list[tuple[str, str]] = []
+    for i, content in enumerate(contents):
+        if isinstance(content, str) and content.strip():
+            src = sources[i] if i < len(sources) and isinstance(sources[i], str) else f"source{i}"
+            out.append((src, content))
+    return out
+
+
+def _stored_js(ws: AppWorkspace) -> list[tuple[str, str]]:
+    """(url, body) for every stored JS response in the -srd corpus — offline. Skips missing files."""
+    out: list[tuple[str, str]] = []
+    for index in _all_store_indices(ws):
+        for stored, url in _store_index(index):
+            if not is_js_url(url):
+                continue
+            src = Path(stored)
+            if src.is_file():
+                out.append((url, http_body(src.read_text(encoding="utf-8", errors="replace"))))
+    return out
+
+
+def _sourcemap_fetch_targets(ws: AppWorkspace, have: set[str]) -> list[str]:
+    """Absolute .map URLs referenced (non-inline) by the stored JS and NOT yet in the store — added to
+    fetch_delta's download set so the maps land in the corpus (fetch-once). Pure-ish (reads disk)."""
+    targets = [urljoin(url, ref) for url, body in _stored_js(ws)
+               if (ref := sourcemap_ref(body)) and not ref.startswith("data:")]
+    return [t for t in tools.dedupe(targets) if t not in have]
+
+
+def _reconstruct_sourcemaps(ws: AppWorkspace) -> tuple[list[str], list[str]]:
+    """OFFLINE — reconstruct original sources from every sourcemap in the corpus (fetched `.map`
+    responses + inline `data:` maps in JS) into raw/extracted/sourcemap/*.js, so jsluice + the secret
+    fleet mine the un-bundled source. Idempotent (skips existing). Returns (new source files, exposed
+    map URLs)."""
+    smdir = ws.raw("extracted") / "sourcemap"
+    new_files: list[str] = []
+    exposed: list[str] = []
+    for index in _all_store_indices(ws):
+        for stored, url in _store_index(index):
+            src = Path(stored)
+            if not src.is_file():
+                continue
+            body = http_body(src.read_text(encoding="utf-8", errors="replace"))
+            if url.split("?", 1)[0].endswith(".map"):
+                map_text: str | None = body
+            elif is_js_url(url) and (ref := sourcemap_ref(body)) and ref.startswith("data:"):
+                map_text = decode_inline_sourcemap(ref)
+            else:
+                continue
+            sources = parse_sourcemap(map_text or "")
+            if not sources:
+                continue
+            exposed.append(url)
+            for path, content in sources:
+                stem = re.sub(r"[^A-Za-z0-9]+", "_", path).strip("_")[-60:] or "src"
+                dst = smdir / f"{stem}-{hashlib.sha256(content.encode()).hexdigest()[:8]}.js"
+                if dst.exists():
+                    continue
+                smdir.mkdir(parents=True, exist_ok=True)
+                dst.write_text(content, encoding="utf-8")
+                new_files.append(str(dst))
+    return new_files, tools.dedupe(exposed)
+
+
 def fetch_delta(activity: Activity, app_id: str) -> None:
     """PHASE 1 — download the discovery delta into the response store.
 
@@ -2508,6 +2608,9 @@ def fetch_delta(activity: Activity, app_id: str) -> None:
          *tools.read_lines(ws.canonical("endpoints_crawley.txt"))],
         have,
     )
+    # + the .map files referenced by the stored JS (point 5b) — fetch once so mine_responses can
+    # reconstruct the original sources offline.
+    delta = tools.dedupe([*delta, *_sourcemap_fetch_targets(ws, set(have))])
     if not delta:
         log.debug("  · skip osint fetch (empty delta) for %s", app_id)
         return
@@ -2902,9 +3005,15 @@ def mine_responses(activity: Activity, app_id: str) -> None:
     if bodies is None:
         log.debug("  · skip mine_responses (empty response store) for %s", app_id)
         return
-    n_ep = tools.write_lines(ws.canonical("endpoints_js.txt"), _jsluice_urls(js_files))
-    log.info("  → mine_responses (%s) — %d JS → %d endpoint(s) → endpoints_js.txt",
-             app_id, len(js_files), n_ep)
+    # point 5b: reconstruct original sources from sourcemaps → mine them for endpoints too (and the
+    # secret fleet picks up raw/extracted/sourcemap/ automatically at content_discovery's tail).
+    sm_files, exposed = _reconstruct_sourcemaps(ws)
+    n_ep = tools.write_lines(ws.canonical("endpoints_js.txt"), _jsluice_urls([*js_files, *sm_files]))
+    if exposed:
+        tools.write_jsonl(ws.findings / "sourcemap.jsonl",
+                          [{"type": "sourcemap-exposed", "severity": "info", "url": u} for u in exposed])
+    log.info("  → mine_responses (%s) — %d JS (+%d sourcemap src) → %d endpoint(s) · %d map(s) exposed",
+             app_id, len(js_files), len(sm_files), n_ep, len(exposed))
 
 
 def _shortscan_surface(activity: Activity, ws: AppWorkspace, app_id: str) -> tuple[list[str], list[dict]]:
@@ -4531,6 +4640,108 @@ def cve_lookup_full(activity: Activity, app_id: str) -> None:
 # root) lifted into it, every record stamped with its app_id. A scanner's surface (phase 2) and deep
 # (phase 4) passes FOLD INTO ONE type file (cve+cve_full → cve · dast+dast_full → dast), so the
 # activity findings/ is organized by finding TYPE, not by pipeline phase.
+# --- cloud bucket enumeration (point 5a) — S3/GCS/Azure exposure from corpus + apex candidates -----
+_S3_VHOST = re.compile(r"https?://([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])\.s3[.\-][\w.\-]*amazonaws\.com", re.IGNORECASE)
+_S3_PATH = re.compile(r"https?://s3[.\-][\w.\-]*amazonaws\.com/([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])", re.IGNORECASE)
+_GCS_PATH = re.compile(r"https?://storage\.googleapis\.com/([a-z0-9][\w.\-]{1,61}[a-z0-9])", re.IGNORECASE)
+_GCS_VHOST = re.compile(r"https?://([a-z0-9][\w.\-]{1,61}[a-z0-9])\.storage\.googleapis\.com", re.IGNORECASE)
+_AZURE = re.compile(r"https?://([a-z0-9]{3,24})\.blob\.core\.windows\.net/([a-z0-9\-]{3,63})", re.IGNORECASE)
+_BUCKET_SUFFIXES = ("", "-assets", "-static", "-media", "-dev", "-prod", "-staging", "-backup",
+                    "-backups", "-uploads", "-data", "-public", "-files")
+_BUCKET_LISTING_RE = "ListBucketResult|EnumerationResults|<Contents>|storage#objects"
+_BUCKET_CACHE: dict[str, str] = {}   # url → public|exists|none (process-wide: one probe per bucket URL)
+_BUCKET_LOCK = threading.Lock()
+
+
+def parse_cloud_refs(text: str) -> list[dict]:
+    """Cloud-storage bucket references in a text corpus → [{provider, bucket, url}] (pure, deduped).
+    Covers S3 (vhost + path style), GCS (path + vhost) and Azure blob (account/container)."""
+    out: dict[tuple[str, str], dict] = {}
+    for provider, rx in (("s3", _S3_VHOST), ("s3", _S3_PATH), ("gcs", _GCS_PATH), ("gcs", _GCS_VHOST)):
+        for m in rx.finditer(text):
+            out[provider, m.group(1)] = {"provider": provider, "bucket": m.group(1), "url": m.group(0)}
+    for m in _AZURE.finditer(text):
+        bucket = f"{m.group(1)}/{m.group(2)}"
+        out["azure", bucket] = {"provider": "azure", "bucket": bucket, "url": m.group(0)}
+    return list(out.values())
+
+
+def bucket_candidates(apex_domain: str) -> list[str]:
+    """Modest, precision-first candidate bucket names from an apex label (base + common suffixes, both
+    `<label>-x` and `x-<label>`). Pure ([] for a blank apex)."""
+    label = apex_domain.split(".", maxsplit=1)[0].strip()
+    if not label:
+        return []
+    names = {f"{label}{sfx}" for sfx in _BUCKET_SUFFIXES}
+    names |= {f"{sfx.lstrip('-')}-{label}" for sfx in _BUCKET_SUFFIXES if sfx}
+    return sorted(names)
+
+
+def cloud_findings(public: set[str], exists: set[str], url_meta: dict[str, dict]) -> list[dict]:
+    """Merge probe results into findings (pure): a public-listable bucket is HIGH, a present-but-403
+    one is info. Public wins over exists for the same URL."""
+    findings = [{"type": "cloud-bucket-public", "severity": "high", "url": u, **url_meta.get(u, {})}
+                for u in sorted(public)]
+    findings += [{"type": "cloud-bucket-exists", "severity": "info", "url": u, **url_meta.get(u, {})}
+                 for u in sorted(set(exists) - set(public))]
+    return findings
+
+
+def _httpx_match(urls: list[str], flags: list[str], dest: Path) -> set[str]:
+    """URLs whose httpx probe matches `flags` (best-effort; empty if httpx absent). `-silent` prints
+    the matching URLs one per line."""
+    if not urls or shutil.which(HTTPX) is None:
+        return set()
+    out = _run("httpx", [HTTPX, "-silent", "-timeout", "10", "-rl", OSINT_FETCH_RL, *flags],
+               stdin="\n".join(urls), dest=dest, label="cloud")
+    return {ln.strip().rstrip("/") for ln in out.splitlines() if ln.strip()}
+
+
+def _probe_buckets(ws: AppWorkspace, urls: list[str]) -> dict[str, str]:
+    """Classify each bucket URL public|exists|none via httpx (`-mr` listing regex, `-mc 403`),
+    memoized process-wide so a bucket shared across apps is probed once."""
+    with _BUCKET_LOCK:
+        todo = [u for u in urls if u not in _BUCKET_CACHE]
+    if todo and shutil.which(HTTPX):
+        raw = ws.raw("httpx") / "cloud"
+        raw.mkdir(parents=True, exist_ok=True)
+        public = _httpx_match(todo, ["-mr", _BUCKET_LISTING_RE], raw / "public.txt")
+        exists = _httpx_match(todo, ["-mc", "403"], raw / "exists.txt")
+        with _BUCKET_LOCK:
+            for u in todo:
+                _BUCKET_CACHE[u] = "public" if u in public else ("exists" if u in exists else "none")
+    with _BUCKET_LOCK:
+        return {u: _BUCKET_CACHE.get(u, "none") for u in urls}
+
+
+def cloud_assets(activity: Activity, app_id: str) -> None:
+    """PHASE 3 — cloud storage exposure. Passively mines the corpus for S3/GCS/Azure bucket references,
+    adds modest apex-derived candidate names, and probes each for public listability with httpx (public
+    = high, present-but-private/403 = info) → findings/cloud_assets.jsonl. Best-effort; per-bucket
+    probe memoized across apps."""
+    ws = activity.app(app_id)
+    meta = workspace.read_meta(ws.meta)
+    hosts = [url_host(h) for h in (meta.get("hosts") or [])]
+    apex_domain = apex(hosts[0]) if hosts else ""
+    refs = parse_cloud_refs("\n".join([*_corpus_texts(ws), *_corpus_urls(ws)]))
+    url_meta: dict[str, dict] = {
+        r["url"].rstrip("/"): {"provider": r["provider"], "bucket": r["bucket"], "source": "passive"}
+        for r in refs}
+    for name in bucket_candidates(apex_domain):
+        for url in (f"https://{name}.s3.amazonaws.com", f"https://storage.googleapis.com/{name}"):
+            url_meta.setdefault(url, {"provider": "s3" if ".s3." in url else "gcs",
+                                      "bucket": name, "source": "candidate"})
+    if not url_meta:
+        log.debug("  · skip cloud_assets (no refs/candidates) for %s", app_id)
+        return
+    classified = _probe_buckets(ws, sorted(url_meta))
+    public = {u for u, c in classified.items() if c == "public"}
+    exists = {u for u, c in classified.items() if c == "exists"}
+    tools.write_jsonl(ws.findings / "cloud_assets.jsonl", cloud_findings(public, exists, url_meta))
+    log.info("  → cloud_assets (%s) — %d bucket URL(s) → %d public · %d exists",
+             app_id, len(url_meta), len(public), len(exists))
+
+
 _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "cve.jsonl": ("findings/cve.jsonl", "findings/cve_full.jsonl"),
     "dast.jsonl": ("findings/dast.jsonl", "findings/dast_full.jsonl"),
@@ -4538,6 +4749,8 @@ _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "sqli.jsonl": ("findings/sqli.jsonl", "findings/sqli_full.jsonl"),
     "tilde_enum.jsonl": ("findings/tilde_enum.jsonl",),
     "wpprobe.jsonl": ("findings/wpprobe.jsonl",),
+    "cloud_assets.jsonl": ("findings/cloud_assets.jsonl",),
+    "sourcemap.jsonl": ("findings/sourcemap.jsonl",),
     "secrets.jsonl": ("secrets.jsonl",),
     "default_creds.jsonl": ("default_creds.jsonl",),
 }

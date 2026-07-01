@@ -67,6 +67,7 @@ class WebscanPipeline:
         Stage("content_discovery", external.content_discovery, needs=("wordlist", "tech_enum"),
               per_app=True, phase=3),
         Stage("recrawl", external.recrawl, needs=("content_discovery",), per_app=True, phase=3),
+        Stage("cloud_assets", external.cloud_assets, per_app=True, phase=3),  # S3/GCS/Azure exposure
         # ── LOOP 4 — DAST the guessed surface ────────────────────────────────────────────────────────
         Stage("request_catalog_full", external.request_catalog_full, per_app=True, phase=4, net=False),
         Stage("param_fuzz", external.param_fuzz, needs=("request_catalog_full",), per_app=True, phase=4),

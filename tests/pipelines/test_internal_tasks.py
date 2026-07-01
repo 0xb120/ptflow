@@ -173,6 +173,60 @@ def test_parse_scrying_maps_pngs_to_findings():
     assert by[("vnc", "10.0.0.9", 5900)]["severity"] == "high"   # a captured VNC framebuffer ⇒ accessible
 
 
+# --- loot parsers: SMB shares/spider · LDAP dump · SNMP walk (point 4 — from hit to loot) --------
+def test_parse_nxc_shares_read_write():
+    out = (
+        "SMB  10.0.0.1  445  DC01  [*] Enumerated shares\n"
+        "SMB  10.0.0.1  445  DC01  Share           Permissions     Remark\n"
+        "SMB  10.0.0.1  445  DC01  IPC$            READ            Remote IPC\n"
+        "SMB  10.0.0.1  445  DC01  data            READ,WRITE      \n"
+        "SMB  10.0.0.1  445  DC01  backups         READ\n"
+        "SMB  10.0.0.1  445  DC01  C$                              Default share\n"
+    )
+    findings = tasks.parse_nxc_shares(out)
+    by = {f["share"]: f for f in findings}
+    assert set(by) == {"data", "backups"}          # IPC$ noise excluded, C$ (no access) + headers skipped
+    assert by["data"]["type"] == "smb-share-writable"
+    assert by["data"]["severity"] == "high"
+    assert by["backups"]["type"] == "smb-share-readable"
+    assert all(f["host"] == "10.0.0.1" for f in findings)
+
+
+def test_spider_interesting_filters_by_name():
+    data = {"data": {"creds/passwords.xlsx": {"size": 12}, "readme.txt": {"size": 5},
+                     "db/backup.bak": {"size": 99}, "id_rsa": {"size": 3}}}
+    findings = tasks.spider_interesting(data, "10.0.0.1")
+    paths = {f["path"] for f in findings}
+    assert paths == {"creds/passwords.xlsx", "db/backup.bak", "id_rsa"}   # readme.txt not interesting
+    assert all(f["type"] == "smb-interesting-file" and f["share"] == "data" for f in findings)
+
+
+def test_parse_naming_contexts():
+    out = "dn:\nnamingContexts: DC=corp,DC=local\nnamingContexts: CN=Configuration,DC=corp,DC=local\n"
+    assert tasks.parse_naming_contexts(out) == ["DC=corp,DC=local", "CN=Configuration,DC=corp,DC=local"]
+
+
+def test_parse_ldap_accounts():
+    out = (
+        "dn: CN=Alice,DC=corp,DC=local\nsAMAccountName: alice\ncn: Alice A\n\n"
+        "dn: CN=Bob,DC=corp,DC=local\nsAMAccountName: bob\n\n"
+        "dn: uid=carol,ou=People\nuid: carol\n"
+    )
+    accts = tasks.parse_ldap_accounts(out)
+    assert accts == ["alice", "bob", "carol"]        # sAMAccountName + uid, sorted-unique
+
+
+def test_parse_snmpwalk_summary():
+    out = (
+        "SNMPv2-MIB::sysDescr.0 = STRING: Linux router 5.10\n"
+        "IP-MIB::ipNetToMediaPhysAddress.2.1.10.0.0.5 = STRING: 0:11:22:33:44:55\n"
+        "\n"
+    )
+    summary = tasks.parse_snmpwalk(out)
+    assert "Linux router" in summary["sysdescr"]
+    assert summary["entries"] == 2                   # blank line not counted
+
+
 # --- cluster() end-to-end (no external tools) --------------------------------------------------
 def test_cluster_partitions_by_scope_cidr(tmp_path):
     act = Activity.named("intdemo", root=tmp_path).ensure()

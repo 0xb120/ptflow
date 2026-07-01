@@ -215,7 +215,7 @@ def test_pipeline_object_shape():
         "passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
         "fetch_delta", "api_spec", "mine_responses", "request_catalog",
         "dast", "xss", "sqli", "cve_lookup",
-        "wordlist", "tech_enum", "content_discovery", "recrawl",
+        "wordlist", "tech_enum", "content_discovery", "recrawl", "cloud_assets",
         "request_catalog_full", "param_fuzz", "dast_full", "xss_full", "sqli_full",
         "cve_lookup_full", "tech_vulnscan",
     ]
@@ -1830,3 +1830,62 @@ def test_tech_vulnscan_gates_on_wordpress(tmp_path, monkeypatch):
     workspace.write_meta(ws.meta, {"app_id": "app-1", "tech": ["WordPress", "PHP"]})
     tasks.tech_vulnscan(act, "app-1")
     assert tools.read_jsonl(ws.findings / "wpprobe.jsonl") == fake
+
+
+# --- point 5b: JS sourcemap extraction (pure parsers) ------------------------------------------
+def test_sourcemap_ref_extracts_last():
+    assert tasks.sourcemap_ref("var x=1;\n//# sourceMappingURL=app.js.map\n") == "app.js.map"
+    assert tasks.sourcemap_ref("//@ sourceMappingURL=/static/b.map") == "/static/b.map"
+    assert tasks.sourcemap_ref("no map here") is None
+
+
+def test_decode_inline_sourcemap():
+    import base64
+
+    payload = base64.b64encode(b'{"version":3}').decode()
+    assert tasks.decode_inline_sourcemap(f"data:application/json;base64,{payload}") == '{"version":3}'
+    assert tasks.decode_inline_sourcemap("app.js.map") is None       # not a data: URI
+
+
+def test_parse_sourcemap_reconstructs_sources():
+    mt = '{"version":3,"sources":["src/a.js","src/b.js"],"sourcesContent":["export const a=1","//c"]}'
+    out = tasks.parse_sourcemap(mt)
+    assert ("src/a.js", "export const a=1") in out
+    assert len(out) == 2
+    assert tasks.parse_sourcemap("not json") == []
+    assert tasks.parse_sourcemap('{"sources":["a"],"mappings":";;"}') == []   # no sourcesContent
+
+
+# --- point 5a: cloud bucket enumeration (pure parsers) -----------------------------------------
+def test_parse_cloud_refs_all_providers():
+    text = (
+        "https://assets-acme.s3.amazonaws.com/logo.png "
+        "https://s3.eu-west-1.amazonaws.com/acme-backups/db.sql "
+        "https://storage.googleapis.com/acme-static/app.js "
+        "https://acmeblob.blob.core.windows.net/uploads/x"
+    )
+    got = {(r["provider"], r["bucket"]) for r in tasks.parse_cloud_refs(text)}
+    assert ("s3", "assets-acme") in got
+    assert ("s3", "acme-backups") in got
+    assert ("gcs", "acme-static") in got
+    assert ("azure", "acmeblob/uploads") in got
+
+
+def test_bucket_candidates_from_apex():
+    cands = tasks.bucket_candidates("ginandjuice.shop")
+    assert "ginandjuice" in cands
+    assert "ginandjuice-backups" in cands
+    assert "assets-ginandjuice" in cands
+    assert tasks.bucket_candidates("") == []
+
+
+def test_cloud_findings_public_beats_exists():
+    meta = {"https://a.s3.amazonaws.com": {"provider": "s3", "bucket": "a", "source": "candidate"},
+            "https://b.s3.amazonaws.com": {"provider": "s3", "bucket": "b", "source": "passive"}}
+    findings = tasks.cloud_findings(
+        {"https://a.s3.amazonaws.com"},
+        {"https://a.s3.amazonaws.com", "https://b.s3.amazonaws.com"}, meta)
+    by = {f["url"]: f for f in findings}
+    assert by["https://a.s3.amazonaws.com"]["type"] == "cloud-bucket-public"
+    assert by["https://a.s3.amazonaws.com"]["severity"] == "high"
+    assert by["https://b.s3.amazonaws.com"]["type"] == "cloud-bucket-exists"   # 403 only
