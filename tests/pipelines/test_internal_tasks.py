@@ -112,6 +112,67 @@ def test_parse_search_vulns():
     assert tasks.parse_search_vulns('{"x": "no match warning"}', "x", "1") == []
 
 
+# --- loop-2 low-hanging-fruit parsers (anon services + RDP/VNC screenshots) --------------------
+def test_parse_nxc_ftp_anonymous_success():
+    out = (
+        "FTP  10.0.0.1  21  10.0.0.1  [*] Banner: 220 (vsFTPd 3.0.3)\n"
+        "FTP  10.0.0.1  21  10.0.0.1  [+] anonymous: \n"
+        "FTP  10.0.0.2  21  10.0.0.2  [-] anonymous: (530 Login incorrect)\n"
+    )
+    findings = tasks.parse_nxc_ftp(out)
+    assert len(findings) == 1                      # only the [+] anon success, not the [-] failure
+    assert findings[0]["host"] == "10.0.0.1"
+    assert findings[0]["type"] == "ftp-anonymous"
+
+
+def test_parse_showmount_exports_severity():
+    out = "Export list for 10.0.0.1:\n/srv/share *\n/home 10.0.0.0/24\nclnt_create: RPC: error\n"
+    findings = tasks.parse_showmount(out, "10.0.0.1")
+    exports = {f["export"]: f for f in findings}
+    assert set(exports) == {"/srv/share", "/home"}     # the RPC error line is not an export
+    assert exports["/srv/share"]["severity"] == "high"  # world-readable (*)
+    assert exports["/home"]["severity"] == "medium"
+    assert all(f["type"] == "nfs-export" and f["host"] == "10.0.0.1" for f in findings)
+    assert tasks.parse_showmount("clnt_create: RPC: Timed out\n", "10.0.0.1") == []
+
+
+def test_parse_rsync_modules():
+    out = "data           \tBackup area\nwww            \tWeb root\n"
+    findings = tasks.parse_rsync_modules(out, "10.0.0.1")
+    assert {f["module"] for f in findings} == {"data", "www"}
+    assert findings[0]["type"] == "rsync-module"
+    assert findings[0]["host"] == "10.0.0.1"
+    assert tasks.parse_rsync_modules("@ERROR: access denied\n", "10.0.0.1") == []   # error, no modules
+
+
+def test_parse_telnet_exposed_from_grepable():
+    out = (
+        "Host: 10.0.0.1 (gw)\tPorts: 23/open/tcp//telnet//BusyBox telnetd/\n"
+        "Host: 10.0.0.2 ()\tPorts: 23/closed/tcp//telnet///\n"
+    )
+    findings = tasks.parse_telnet(out)
+    assert len(findings) == 1                       # only the open telnet port
+    assert findings[0]["host"] == "10.0.0.1"
+    assert findings[0]["type"] == "telnet-exposed"
+    assert "BusyBox" in findings[0]["evidence"]
+
+
+def test_parse_scrying_maps_pngs_to_findings():
+    from pathlib import Path
+
+    pngs = [
+        Path("/act/scans/10.0.0.0-24/raw/scrying/rdp/10.0.0.5-3389.png"),
+        Path("/act/scans/10.0.0.0-24/raw/scrying/vnc/10.0.0.9-5900.png"),
+        Path("/act/scans/10.0.0.0-24/raw/scrying/web/10.0.0.1-80.png"),   # web is ignored
+    ]
+    findings = tasks.parse_scrying(pngs)
+    by = {(f["protocol"], f["host"], f["port"]): f for f in findings}
+    assert ("web", "10.0.0.1", 80) not in by                 # only rdp/vnc kept
+    assert by[("rdp", "10.0.0.5", 3389)]["type"] == "rdp-screenshot"
+    assert by[("vnc", "10.0.0.9", 5900)]["type"] == "vnc-screenshot"
+    assert by[("vnc", "10.0.0.9", 5900)]["severity"] == "high"   # a captured VNC framebuffer ⇒ accessible
+
+
 # --- cluster() end-to-end (no external tools) --------------------------------------------------
 def test_cluster_partitions_by_scope_cidr(tmp_path):
     act = Activity.named("intdemo", root=tmp_path).ensure()
@@ -194,12 +255,19 @@ def test_pipeline_object_shape():
 
     assert PIPELINE.name == "internal"
     names = [s.name for s in PIPELINE.stages]
-    assert names == ["expand", "discover", "portscan", "fingerprint", "cve_lookup",
-                     "smb_checks", "snmp_checks", "ldap_checks", "nuclei_net"]
+    assert names == ["expand", "discover", "portscan", "nuclei_scope", "fingerprint", "cve_lookup",
+                     "smb_checks", "snmp_checks", "ldap_checks", "ftp_checks", "telnet_checks",
+                     "nfs_checks", "rsync_checks", "remote_desktop"]
     by_name = {s.name: s for s in PIPELINE.stages}
     assert by_name["fingerprint"].per_app is True
     assert by_name["fingerprint"].phase == 1
-    assert all(by_name[n].phase == 2 for n in ("cve_lookup", "smb_checks", "nuclei_net"))
+    assert all(by_name[n].phase == 2 for n in
+               ("cve_lookup", "smb_checks", "ftp_checks", "telnet_checks", "nfs_checks",
+                "rsync_checks", "remote_desktop"))
+    # whole-scope full nuclei runs ∥ the loops as a spanning stage (replaces the per-subnet nuclei_net)
+    assert by_name["nuclei_scope"].spanning is True
+    assert by_name["nuclei_scope"].per_app is False
+    assert "nuclei_net" not in by_name
     assert by_name["cve_lookup"].net is False  # offline CVE correlation
     assert by_name["expand"].net is False
 

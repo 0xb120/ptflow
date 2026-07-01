@@ -42,6 +42,18 @@ FLOWMETA: dict[str, StepMeta] = {
                "carico aggregato ≈ concorrenza x rate: il rate è la leva reale su una linea vincolata",
                "cluster() affetta ports.jsonl per subnet dopo — scan whole-scope, output per-subnet"),
     ),
+    # --- spanning (whole-scope) ---
+    "nuclei_scope": StepMeta(
+        summary="SPANNING — nuclei full-template su OGNI socket scoperta di tutto lo scope, UN solo "
+                "processo con un rate-limit globale (-rl). Più gentile del per-subnet su gear legacy/OT "
+                "(principio del pipeline: una sweep globale invece di N flood). Gira ∥ cluster + loop, "
+                "joinato al fan-in. Sostituisce il vecchio nuclei_net per-subnet a soli tag network.",
+        commands=("nuclei -ut                                    # update template (best-effort, air-gap ok)",
+                  "nuclei -silent -duc -j -stats -rl <profilo>   # stdin = tutte le socket ip:port"),
+        outputs=("findings/nuclei_scope.jsonl",),
+        notes=("-rl = profilo (wide 150 · home 50) · finding a livello activity (come external), non per-subnet",
+               "best-effort: salta se nuclei assente · full-template sussume network+default-login"),
+    ),
     # --- loop 1: inventario servizi (per-subnet) ---
     "fingerprint": StepMeta(
         summary="LOOP 1 — fingerprint dei servizi sulle socket aperte del gruppo (nerva --json; nmap -sV "
@@ -88,12 +100,49 @@ FLOWMETA: dict[str, StepMeta] = {
         notes=("best-effort: salta se nessuna 389/636 o ldapsearch assente",
                "parsing minimale (namingContexts:) — da rifinire dal vivo su un dominio reale"),
     ),
-    "nuclei_net": StepMeta(
-        summary="LOOP 2 — template nuclei network + default-login sulle socket aperte del gruppo → "
-                "findings/nuclei_net.jsonl.",
-        commands=("nuclei -silent -duc -j -tags network,default-login   # stdin = le socket ip:port",),
-        outputs=("findings/nuclei_net.jsonl",),
-        notes=("best-effort: salta se nuclei assente · -duc = disable update-check (offline-friendly)",),
+    "ftp_checks": StepMeta(
+        summary="LOOP 2 — login FTP ANONIMO via netexec sugli host con 21 aperta (`-u anonymous -p ''`). "
+                "Una riga '[+]' = login anonimo riuscito → finding. Best-effort.",
+        commands=("nxc ftp <host…> -u anonymous -p ''   # gated su 21 aperta",
+                  "# parse_nxc_ftp: riga FTP con [+] → ftp-anonymous"),
+        outputs=("findings/ftp.jsonl",),
+        notes=("best-effort: salta se nessuna 21 o netexec assente · cap wall-clock CHECK_TIMEOUT (300s)",),
+    ),
+    "telnet_checks": StepMeta(
+        summary="LOOP 2 — telnet CLEARTEXT esposto sugli host con 23 aperta (nmap -sV per il banner). "
+                "Una porta telnet aperta è già un finding (credenziali in chiaro). Best-effort.",
+        commands=("nmap -Pn -n -sV -p23 -oG - <host…>   # gated su 23 aperta",
+                  "# parse_telnet: campo grepable 23/open/tcp//telnet//<banner>/ → telnet-exposed"),
+        outputs=("findings/telnet.jsonl",),
+        notes=("best-effort: salta se nessuna 23 o nmap assente",
+               "rilevare no-auth affidabilmente richiede un login attempt (opt-in/futuro): v1 riporta l'esposizione + banner"),
+    ),
+    "nfs_checks": StepMeta(
+        summary="LOOP 2 — export NFS leggibili anonimamente via showmount -e sugli host con 2049 aperta. "
+                "Un export world-readable è LHF di alto valore (backup/home dir). Best-effort.",
+        commands=("showmount -e <host>   # gated su 2049 aperta, per host",
+                  "# parse_showmount: '<path> <clients>' → nfs-export (world '*'/'0.0.0.0' ⇒ high)"),
+        outputs=("findings/nfs.jsonl",),
+        notes=("best-effort: salta se nessuna 2049 o showmount (nfs-utils) assente",),
+    ),
+    "rsync_checks": StepMeta(
+        summary="LOOP 2 — moduli rsync ANONIMI via `rsync rsync://host/` sugli host con 873 aperta. "
+                "Moduli elencabili anonimamente espongono spesso un albero di filesystem. Best-effort.",
+        commands=("rsync --contimeout=10 rsync://<host>/   # gated su 873 aperta, per host",
+                  "# parse_rsync_modules: righe '<modulo> <commento>' (skip @ERROR/rsync:) → rsync-module"),
+        outputs=("findings/rsync.jsonl",),
+        notes=("best-effort: salta se nessuna 873 o rsync assente",),
+    ),
+    "remote_desktop": StepMeta(
+        summary="LOOP 2 — screenshot di RDP/VNC esposti con scrying (SENZA credenziali). Una sola run su "
+                "tutte le socket RDP (3389) + VNC (5900-5906) del gruppo cattura login screen / desktop; "
+                "un framebuffer VNC catturato = desktop raggiungibile senza auth (finding high).",
+        commands=("scrying -f <targets rdp://·vnc://> -o raw/scrying/ --silent --disable-report",
+                  "# parse_scrying: <proto>/<host>-<port>.png → rdp-screenshot (info) / vnc-screenshot (high)"),
+        outputs=("findings/remote_desktop.jsonl", "screenshots/<proto>-<host>-<port>.png"),
+        notes=("best-effort: salta se nessuna socket RDP/VNC o scrying assente · cap wall-clock (600s)",
+               "gli screenshot sono ri-homati in scans/<subnet>/screenshots/ e referenziati dai finding",
+               "no password spraying: solo cattura di ciò che è esposto (i check con credenziali sono futuri)"),
     ),
 }
 
@@ -109,9 +158,11 @@ _FANIN = StepMeta(
     summary="Fan-in terminale DETERMINISTICO (consolidate): solleva i findings per-subnet in "
             "<activity>/findings/<tipo>.jsonl (un file per categoria, ogni record con app_id = slug). "
             "Aggrega inoltre i servizi web in web_targets.txt e (opt-in) fa l'hand-off alla pipeline webscan.",
-    outputs=("findings/cve.jsonl", "findings/smb.jsonl", "findings/snmp.jsonl",
-             "findings/ldap.jsonl", "findings/nuclei_net.jsonl", "web_targets.txt"),
-    notes=("web_targets_from: socket con porta HTTP(S) o banner http → scheme://ip:port (https per TLS)",
+    outputs=("findings/cve.jsonl", "findings/smb.jsonl", "findings/snmp.jsonl", "findings/ldap.jsonl",
+             "findings/ftp.jsonl", "findings/telnet.jsonl", "findings/nfs.jsonl", "findings/rsync.jsonl",
+             "findings/remote_desktop.jsonl", "web_targets.txt"),
+    notes=("nuclei_scope è già un finding a livello activity (whole-scope) e non viene sollevato qui",
+           "web_targets_from: socket con porta HTTP(S) o banner http → scheme://ip:port (https per TLS)",
            "hand-off webscan OPT-IN (PTFLOW_INTERNAL_WEB_HANDOFF): crawl/catalog/DAST/fuzz per servizio web",
            "web_targets.txt sempre scritto; solo l'auto-run è gated · seam agente (StubProvider) dormiente accanto"),
 )
