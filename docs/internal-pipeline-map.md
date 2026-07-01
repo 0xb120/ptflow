@@ -21,9 +21,11 @@ CLUSTER{{"② CLUSTER · pivot fan-out<br>→ scans/&lt;subnet&gt;/"}}
 BREADTH ==> CLUSTER
 subgraph SPAN["SPANNING · ∥ cluster + tutti i loop — join al fan-in"]
 direction TB
-nuclei_scope["nuclei_scope<br>nuclei -ut                                    # update template (best-effort, air-gap ok)<br>nuclei -silent -duc -j -stats -rl &lt;profilo&gt;   # stdin = tutte le socket ip:port"]
+portscan_full["portscan_full<br>naabu -silent -p - -c &lt;conc&gt; -rate &lt;rate&gt;   # rate/conc = profilo, come il portscan veloce"]
+nuclei_scope["nuclei_scope<br>nuclei -ut                                    # update template (best-effort, air-gap ok)<br>nuclei -silent -duc -j -stats -rl &lt;profilo&gt;   # stdin = ip:port dai full-port"]
 end
-portscan -.->|∥| nuclei_scope
+portscan -.->|∥| portscan_full
+portscan_full --> nuclei_scope
 subgraph P1["③ PER-APP · FASE 1 · inventario servizi"]
 direction TB
 fingerprint["fingerprint<br>nerva --json   # stdin = le socket ip:port del gruppo (dalla fetta di ports.jsonl)"]
@@ -35,12 +37,15 @@ subgraph P2["FASE 2 · frutti bassi"]
 direction TB
 cve_lookup["cve_lookup  ·  net=False<br># software_from_services: (prodotto, versione) dai record nerva — solo version-pinned<br>search_vulns -q '&lt;Prodotto Versione&gt;' -f json --ignore-general-product-vulns<br>                                              --use-created-product-ids<br># cache memo process-wide → il fan-out per-subnet non ri-interroga lo stesso prodotto"]
 smb_checks["smb_checks<br>nxc smb &lt;host…&gt; -u '' -p ''            # postura → parse_nxc_smb<br>nxc smb &lt;host…&gt; -u '' -p '' --shares   # → parse_nxc_shares (WRITE=high · READ=medium)<br>nxc smb &lt;host…&gt; -u '' -p '' -M spider_plus -o OUTPUT_FOLDER=&lt;dir&gt;   # metadati, no download<br># spider_interesting: file con nome sospetto (pass/secret/backup/.kdbx/…) → smb-interesting-file"]
+ad_enum["ad_enum<br>nxc smb &lt;host…&gt; -u '' -p '' --rid-brute   # → parse_nxc_rid_brute (utenti/gruppi)<br>nxc smb &lt;host…&gt; -u '' -p '' --pass-pol     # → parse_nxc_pass_pol (min length, lockout)<br># → ad-users-enumerated (high) + ad-password-policy (info) · loot: domain_users/groups.txt"]
 snmp_checks["snmp_checks<br>onesixtyone -c &lt;communities.txt&gt; -i &lt;hosts.txt&gt;   # public/private/community/manager/cisco<br># parse_onesixtyone: 'ip [community] sysDescr' → snmp-default-community<br>snmpwalk -v2c -c &lt;community&gt; &lt;host&gt; &lt;OID&gt;   # 1.3.6.1.2.1.1 / .25.4.2.1.2 / .4.22.1.2<br># parse_snmpwalk: sysDescr + conteggio entry → snmp-info"]
-ldap_checks["ldap_checks<br>ldapsearch -x -H ldap://&lt;host&gt; -s base -b '' namingContexts   # gated su 389/636<br>ldapsearch -x -b &lt;baseDN&gt; -z 500 '(|(objectClass=user)(objectClass=person)…)' sAMAccountName uid<br># parse_naming_contexts + parse_ldap_accounts → ldap-anonymous-bind + ldap-anon-users"]
+ldap_checks["ldap_checks<br>nxc ldap &lt;host…&gt; -u '' -p ''   # banner: (signing:None|Enforced) (channel binding:…)<br>#   parse_nxc_ldap_signing → ldap-signing-not-required · ldaps-no-channel-binding<br>ldapsearch -x -H ldap://&lt;host&gt; -s base -b '' namingContexts<br>ldapsearch -x -b &lt;baseDN&gt; -z 500 '(|(objectClass=user)…)' sAMAccountName uid description<br>#   → ldap-anonymous-bind · ldap-anon-users · ldap-user-description (password in desc)"]
 ftp_checks["ftp_checks<br>nxc ftp &lt;host…&gt; -u anonymous -p ''   # gated su 21 aperta<br># parse_nxc_ftp: riga FTP con [+] → ftp-anonymous"]
 telnet_checks["telnet_checks<br>nmap -Pn -n -sV -p23 -oG - &lt;host…&gt;   # gated su 23 aperta<br># parse_telnet: campo grepable 23/open/tcp//telnet//&lt;banner&gt;/ → telnet-exposed"]
 nfs_checks["nfs_checks<br>showmount -e &lt;host&gt;   # gated su 2049 aperta, per host<br># parse_showmount: '&lt;path&gt; &lt;clients&gt;' → nfs-export (world '*'/'0.0.0.0' ⇒ high)"]
 rsync_checks["rsync_checks<br>rsync --contimeout=10 rsync://&lt;host&gt;/   # gated su 873 aperta, per host<br># parse_rsync_modules: righe '&lt;modulo&gt; &lt;commento&gt;' (skip @ERROR/rsync:) → rsync-module"]
+netbios_checks["netbios_checks<br>nmap -sU -Pn -n -p137 --script nbstat -oN - &lt;host…&gt;<br># parse_nbstat: 'NetBIOS name/user/MAC' → netbios-info"]
+dns_checks["dns_checks<br>dig +time=5 +tries=1 axfr &lt;N.N.N.in-addr.arpa&gt; @&lt;host&gt;   # reverse_zones(cidr)<br># parse_dig_axfr: record BIND → dns-zone-transfer (+ dump record in raw/dig/)"]
 remote_desktop["remote_desktop<br>scrying -f &lt;targets rdp://·vnc://&gt; -o raw/scrying/ --silent --disable-report<br># parse_scrying: &lt;proto&gt;/&lt;host&gt;-&lt;port&gt;.png → rdp-screenshot (info) / vnc-screenshot (high)"]
 end
 BAR2 ==> P2
@@ -55,9 +60,9 @@ classDef fanin fill:#10331c,stroke:#54d07a,color:#dcf6e3,font-weight:bold;
 classDef phase1 fill:#10331c,stroke:#4cc46b,color:#dcf6e3;
 classDef phase2 fill:#3a2f06,stroke:#e6c247,color:#f8edc2;
 class expand,discover,portscan breadth
-class nuclei_scope span
+class portscan_full,nuclei_scope span
 class fingerprint phase1
-class cve_lookup,smb_checks,snmp_checks,ldap_checks,ftp_checks,telnet_checks,nfs_checks,rsync_checks,remote_desktop phase2
+class cve_lookup,smb_checks,ad_enum,snmp_checks,ldap_checks,ftp_checks,telnet_checks,nfs_checks,rsync_checks,netbios_checks,dns_checks,remote_desktop phase2
 class CLUSTER pivot
 class BAR2 bar
 class FANIN fanin

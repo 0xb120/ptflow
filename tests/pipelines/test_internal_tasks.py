@@ -227,6 +227,84 @@ def test_parse_snmpwalk_summary():
     assert summary["entries"] == 2                   # blank line not counted
 
 
+# --- Tier-1 enumeration parsers: AD null-session · NetBIOS · DNS AXFR --------------------------
+def test_parse_nxc_rid_brute():
+    out = (
+        "SMB  10.0.0.1  445  DC01  [*] Enumerating\n"
+        "SMB  10.0.0.1  445  DC01  500: CORP\\Administrator (SidTypeUser)\n"
+        "SMB  10.0.0.1  445  DC01  512: CORP\\Domain Admins (SidTypeGroup)\n"
+        "SMB  10.0.0.1  445  DC01  1104: CORP\\alice (SidTypeUser)\n"
+    )
+    res = tasks.parse_nxc_rid_brute(out)
+    assert res["users"] == ["Administrator", "alice"]
+    assert res["groups"] == ["Domain Admins"]
+
+
+def test_parse_nxc_pass_pol():
+    out = ("SMB  x  445  DC01  Minimum password length: 7\n"
+           "SMB  x  445  DC01  Account Lockout Threshold: None\n")
+    pol = tasks.parse_nxc_pass_pol(out)
+    assert pol["min_length"] == "7"
+    assert pol["lockout_threshold"] == "None"
+
+
+def test_parse_nxc_ldap_signing():
+    out = (
+        "LDAP  10.0.0.1  389  DC01  Windows Server 2019 (name:DC01) (domain:corp.local) "
+        "(signing:None) (channel binding:Never)\n"
+        "LDAP  10.0.0.2  389  DC02  Windows Server 2022 (name:DC02) (domain:corp.local) "
+        "(signing:Enforced) (channel binding:Always)\n"
+        "LDAP  10.0.0.3  389  SRV  Windows (signing:None) (channel binding:When Supported)\n"
+    )
+    by = {(f["host"], f["type"]) for f in tasks.parse_nxc_ldap_signing(out)}
+    assert ("10.0.0.1", "ldap-signing-not-required") in by
+    assert ("10.0.0.1", "ldaps-no-channel-binding") in by      # Never ≠ Always
+    assert ("10.0.0.2", "ldap-signing-not-required") not in by  # Enforced
+    assert ("10.0.0.2", "ldaps-no-channel-binding") not in by   # Always
+    assert ("10.0.0.3", "ldaps-no-channel-binding") in by       # When Supported ≠ Always
+
+
+def test_parse_ldap_descriptions_pairs_account_and_desc():
+    out = ("dn: CN=Bob,DC=corp\nsAMAccountName: bob\ndescription: temp pw Summer2024\n\n"
+           "dn: CN=Al,DC=corp\nsAMAccountName: al\n\n")
+    assert tasks.parse_ldap_descriptions(out) == [{"account": "bob", "description": "temp pw Summer2024"}]
+
+
+def test_parse_nbstat():
+    out = (
+        "Nmap scan report for 10.0.0.1\n"
+        "Host script results:\n"
+        "| nbstat: NetBIOS name: DC01, NetBIOS user: <unknown>, NetBIOS MAC: 00:11:22:33:44:55 (VMware)\n"
+    )
+    findings = tasks.parse_nbstat(out)
+    assert len(findings) == 1
+    assert findings[0]["host"] == "10.0.0.1"
+    assert findings[0]["name"] == "DC01"
+    assert findings[0]["mac"].startswith("00:11:22:33:44:55")
+
+
+def test_reverse_zones_from_cidr():
+    assert tasks.reverse_zones("10.0.1.0/24") == ["1.0.10.in-addr.arpa"]
+    assert tasks.reverse_zones("10.0.0.0/16") == ["0.10.in-addr.arpa"]
+    assert tasks.reverse_zones("192.168.5.10/32") == ["5.168.192.in-addr.arpa"]
+    assert tasks.reverse_zones("not-a-cidr") == []
+
+
+def test_parse_dig_axfr():
+    out = (
+        "; <<>> DiG 9.18 <<>> axfr\n"
+        "corp.local.\t86400\tIN\tSOA\tdc01. admin. 1 900\n"
+        "dc01.corp.local.\t3600\tIN\tA\t10.0.0.1\n"
+        "ws01.corp.local.\t3600\tIN\tA\t10.0.0.5\n"
+    )
+    recs = tasks.parse_dig_axfr(out)
+    types = {r["rtype"] for r in recs}
+    assert "A" in types
+    assert "SOA" in types
+    assert {r["name"] for r in recs if r["rtype"] == "A"} == {"dc01.corp.local.", "ws01.corp.local."}
+    assert tasks.parse_dig_axfr("; Transfer failed.") == []
+
+
 # --- cluster() end-to-end (no external tools) --------------------------------------------------
 def test_cluster_partitions_by_scope_cidr(tmp_path):
     act = Activity.named("intdemo", root=tmp_path).ensure()
@@ -309,18 +387,20 @@ def test_pipeline_object_shape():
 
     assert PIPELINE.name == "internal"
     names = [s.name for s in PIPELINE.stages]
-    assert names == ["expand", "discover", "portscan", "nuclei_scope", "fingerprint", "cve_lookup",
-                     "smb_checks", "snmp_checks", "ldap_checks", "ftp_checks", "telnet_checks",
-                     "nfs_checks", "rsync_checks", "remote_desktop"]
+    assert names == ["expand", "discover", "portscan", "portscan_full", "nuclei_scope", "fingerprint",
+                     "cve_lookup", "smb_checks", "ad_enum", "snmp_checks", "ldap_checks", "ftp_checks",
+                     "telnet_checks", "nfs_checks", "rsync_checks", "netbios_checks", "dns_checks",
+                     "remote_desktop"]
     by_name = {s.name: s for s in PIPELINE.stages}
     assert by_name["fingerprint"].per_app is True
     assert by_name["fingerprint"].phase == 1
     assert all(by_name[n].phase == 2 for n in
-               ("cve_lookup", "smb_checks", "ftp_checks", "telnet_checks", "nfs_checks",
-                "rsync_checks", "remote_desktop"))
-    # whole-scope full nuclei runs ∥ the loops as a spanning stage (replaces the per-subnet nuclei_net)
+               ("cve_lookup", "smb_checks", "ad_enum", "ftp_checks", "netbios_checks", "dns_checks",
+                "remote_desktop"))
+    # full-port scan + whole-scope nuclei run ∥ the loops as SPANNING stages (off the critical path)
+    assert by_name["portscan_full"].spanning is True
     assert by_name["nuclei_scope"].spanning is True
-    assert by_name["nuclei_scope"].per_app is False
+    assert by_name["nuclei_scope"].needs == ("portscan_full",)  # nuclei scans the COMPLETE surface
     assert "nuclei_net" not in by_name
     assert by_name["cve_lookup"].net is False  # offline CVE correlation
     assert by_name["expand"].net is False

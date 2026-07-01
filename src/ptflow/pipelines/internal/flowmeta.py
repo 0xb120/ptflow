@@ -42,17 +42,24 @@ FLOWMETA: dict[str, StepMeta] = {
                "carico aggregato ≈ concorrenza x rate: il rate è la leva reale su una linea vincolata",
                "cluster() affetta ports.jsonl per subnet dopo — scan whole-scope, output per-subnet"),
     ),
-    # --- spanning (whole-scope) ---
+    # --- spanning (whole-scope) — full-port scan → full-template nuclei, ∥ i loop ---
+    "portscan_full": StepMeta(
+        summary="SPANNING — scan naabu full 65535 porte sugli host live → ports_full.jsonl. Fuori dal "
+                "percorso critico (∥ cluster + loop): i check per-subnet girano sul set curato veloce, "
+                "il full-port alimenta nuclei_scope così vede servizi su porte non standard.",
+        commands=("naabu -silent -p - -c <conc> -rate <rate>   # rate/conc = profilo, come il portscan veloce",),
+        outputs=("asset_discovery/ports_full.jsonl",),
+        notes=("stessa profilazione rate del portscan · best-effort: salta se naabu assente",),
+    ),
     "nuclei_scope": StepMeta(
-        summary="SPANNING — nuclei full-template su OGNI socket scoperta di tutto lo scope, UN solo "
-                "processo con un rate-limit globale (-rl). Più gentile del per-subnet su gear legacy/OT "
-                "(principio del pipeline: una sweep globale invece di N flood). Gira ∥ cluster + loop, "
-                "joinato al fan-in. Sostituisce il vecchio nuclei_net per-subnet a soli tag network.",
+        summary="SPANNING — nuclei full-template su OGNI socket scoperta (set FULL-port di portscan_full, "
+                "fallback al set veloce), UN solo processo con rate-limit globale (-rl). Più gentile del "
+                "per-subnet su gear legacy/OT (una sweep globale invece di N flood). ∥ cluster + loop.",
         commands=("nuclei -ut                                    # update template (best-effort, air-gap ok)",
-                  "nuclei -silent -duc -j -stats -rl <profilo>   # stdin = tutte le socket ip:port"),
+                  "nuclei -silent -duc -j -stats -rl <profilo>   # stdin = ip:port dai full-port"),
         outputs=("findings/nuclei_scope.jsonl",),
         notes=("-rl = profilo (wide 150 · home 50) · finding a livello activity (come external), non per-subnet",
-               "best-effort: salta se nuclei assente · full-template sussume network+default-login"),
+               "legge ports_full.jsonl (portscan_full) → superficie completa · best-effort: salta se nuclei assente"),
     ),
     # --- loop 1: inventario servizi (per-subnet) ---
     "fingerprint": StepMeta(
@@ -88,6 +95,18 @@ FLOWMETA: dict[str, StepMeta] = {
                "spider solo sugli host con una share READABLE non-default (IPC$/PRINT$/ADMIN$/C$ esclusi)",
                "best-effort: salta se nessuna 445 o netexec assente · brute-force/relay/coercion non wired"),
     ),
+    "ad_enum": StepMeta(
+        summary="LOOP 2 — enumerazione Active Directory SENZA credenziali via netexec sugli host con 445 "
+                "aperta: RID cycling (utenti/gruppi di dominio via null session, funziona anche con "
+                "RestrictAnonymous) + password policy (la soglia di lockout è il gate per lo spraying sicuro).",
+        commands=("nxc smb <host…> -u '' -p '' --rid-brute   # → parse_nxc_rid_brute (utenti/gruppi)",
+                  "nxc smb <host…> -u '' -p '' --pass-pol     # → parse_nxc_pass_pol (min length, lockout)",
+                  "# → ad-users-enumerated (high) + ad-password-policy (info) · loot: domain_users/groups.txt"),
+        outputs=("findings/ad_enum.jsonl",),
+        notes=("no-cred: RID cycling via SAMR lookupsids · complementare al dump LDAP (funziona anche se LDAP anon è chiuso)",
+               "la password policy prepara il futuro spraying (spray sotto-soglia = niente lockout)",
+               "best-effort: salta se nessuna 445 o netexec assente"),
+    ),
     "snmp_checks": StepMeta(
         summary="LOOP 2 — community di default SNMP (UDP/161) via onesixtyone su TUTTI gli host + LOOT. Una "
                 "community che risponde è un finding; da quella community poi snmpwalk di OID ad alto valore "
@@ -101,15 +120,19 @@ FLOWMETA: dict[str, StepMeta] = {
                "best-effort: salta se onesixtyone/snmpwalk assenti"),
     ),
     "ldap_checks": StepMeta(
-        summary="LOOP 2 — bind anonimo LDAP via ldapsearch sugli host con 389/636 aperta + LOOT: un rootDSE "
-                "che restituisce i naming context senza credenziali è un finding; dallo stesso bind anonimo "
-                "poi dump (bounded) dei nomi account come users loot file.",
-        commands=("ldapsearch -x -H ldap://<host> -s base -b '' namingContexts   # gated su 389/636",
-                  "ldapsearch -x -b <baseDN> -z 500 '(|(objectClass=user)(objectClass=person)…)' sAMAccountName uid",
-                  "# parse_naming_contexts + parse_ldap_accounts → ldap-anonymous-bind + ldap-anon-users"),
+        summary="LOOP 2 — postura + LOOT LDAP sugli host con 389/636 aperta, SENZA credenziali. Due passate "
+                "indipendenti: (1) signing/channel-binding dal banner core di netexec (superficie NTLM-relay "
+                "→ LDAP); (2) bind anonimo via ldapsearch → naming context + dump account/description.",
+        commands=("nxc ldap <host…> -u '' -p ''   # banner: (signing:None|Enforced) (channel binding:…)",
+                  "#   parse_nxc_ldap_signing → ldap-signing-not-required · ldaps-no-channel-binding",
+                  "ldapsearch -x -H ldap://<host> -s base -b '' namingContexts",
+                  "ldapsearch -x -b <baseDN> -z 500 '(|(objectClass=user)…)' sAMAccountName uid description",
+                  "#   → ldap-anonymous-bind · ldap-anon-users · ldap-user-description (password in desc)"),
         outputs=("findings/ldap.jsonl",),
-        notes=("dump bounded (-z LDAP_MAX_ENTRIES) sul primo naming context di dominio · read-only",
-               "best-effort: salta se nessuna 389/636 o ldapsearch assente"),
+        notes=("signing via il PROTOCOLLO core di nxc (il modulo ldap-checker è stato assorbito lì) — no-cred",
+               "signing:None + smb-signing-not-required = catena NTLM-relay → LDAP (RBCD/DCSync)",
+               "dump bounded (-z) · le description spesso contengono password temporanee · read-only",
+               "best-effort: ogni passata salta se il suo tool (netexec/ldapsearch) è assente"),
     ),
     "ftp_checks": StepMeta(
         summary="LOOP 2 — login FTP ANONIMO via netexec sugli host con 21 aperta (`-u anonymous -p ''`). "
@@ -144,6 +167,25 @@ FLOWMETA: dict[str, StepMeta] = {
         outputs=("findings/rsync.jsonl",),
         notes=("best-effort: salta se nessuna 873 o rsync assente",),
     ),
+    "netbios_checks": StepMeta(
+        summary="LOOP 2 — identità NetBIOS (137/UDP, quindi su TUTTI gli host del gruppo come SNMP, fuori "
+                "dal portscan TCP). nmap nbstat → hostname, utente loggato, MAC/vendor per host. Dati "
+                "d'identità cheap e no-cred.",
+        commands=("nmap -sU -Pn -n -p137 --script nbstat -oN - <host…>",
+                  "# parse_nbstat: 'NetBIOS name/user/MAC' → netbios-info"),
+        outputs=("findings/netbios.jsonl",),
+        notes=("su TUTTI gli host (137 UDP non è nel portscan) · best-effort: salta se nmap assente",),
+    ),
+    "dns_checks": StepMeta(
+        summary="LOOP 2 — zone transfer DNS (AXFR) sugli host con 53 aperta. Tenta le REVERSE zone del "
+                "subnet (derivate deterministicamente dal CIDR del gruppo): un server permissivo "
+                "restituisce la PTR map dell'intera subnet (inventario host). Finding high.",
+        commands=("dig +time=5 +tries=1 axfr <N.N.N.in-addr.arpa> @<host>   # reverse_zones(cidr)",
+                  "# parse_dig_axfr: record BIND → dns-zone-transfer (+ dump record in raw/dig/)"),
+        outputs=("findings/dns.jsonl",),
+        notes=("gated su 53 · reverse-zone dal CIDR (deterministico) · forward-zone via dominio = futuro",
+               "best-effort: salta se nessuna 53 o dig assente"),
+    ),
     "remote_desktop": StepMeta(
         summary="LOOP 2 — screenshot di RDP/VNC esposti con scrying (SENZA credenziali). Una sola run su "
                 "tutte le socket RDP (3389) + VNC (5900-5906) del gruppo cattura login screen / desktop; "
@@ -169,8 +211,9 @@ _FANIN = StepMeta(
     summary="Fan-in terminale DETERMINISTICO (consolidate): solleva i findings per-subnet in "
             "<activity>/findings/<tipo>.jsonl (un file per categoria, ogni record con app_id = slug). "
             "Aggrega inoltre i servizi web in web_targets.txt e (opt-in) fa l'hand-off alla pipeline webscan.",
-    outputs=("findings/cve.jsonl", "findings/smb.jsonl", "findings/snmp.jsonl", "findings/ldap.jsonl",
-             "findings/ftp.jsonl", "findings/telnet.jsonl", "findings/nfs.jsonl", "findings/rsync.jsonl",
+    outputs=("findings/cve.jsonl", "findings/smb.jsonl", "findings/ad_enum.jsonl", "findings/snmp.jsonl",
+             "findings/ldap.jsonl", "findings/ftp.jsonl", "findings/telnet.jsonl", "findings/nfs.jsonl",
+             "findings/rsync.jsonl", "findings/netbios.jsonl", "findings/dns.jsonl",
              "findings/remote_desktop.jsonl", "web_targets.txt"),
     notes=("nuclei_scope è già un finding a livello activity (whole-scope) e non viene sollevato qui",
            "web_targets_from: socket con porta HTTP(S) o banner http → scheme://ip:port (https per TLS)",
