@@ -16,19 +16,23 @@ the fan-out unit is a **scope subnet**, not a web app:
     fingerprint — nerva over the group's ip:port set (nmap -sV is the drop-in alternative)
                                                                     → scans/<subnet>/services.jsonl
 
-  nuclei_scope — SPANNING (whole-scope): full-template nuclei over every discovered socket, ONE
-                 rate-controlled process ∥ the loops → <activity>/findings/nuclei_scope.jsonl.
+  portscan_full — SPANNING (whole-scope): full 65535-port naabu → asset_discovery/ports_full.jsonl.
+  nuclei_scope  — SPANNING (whole-scope): full-template nuclei over every discovered socket (FULL-port
+                  set), ONE rate-controlled process ∥ the loops → <activity>/findings/nuclei_scope.jsonl.
 
-  LOOP 2 — low-hanging fruit (per-subnet, gated on the ports found in the breadth scan; all ∥,
-           best-effort, NON-destructive — no credentialed/brute-force checks, those are opt-in/future)
+  LOOP 2 — low-hanging fruit + enumeration (per-subnet, gated on the ports found in the breadth scan;
+           all ∥, best-effort, NON-destructive — no credentialed/brute-force checks, those are future)
     cve_lookup     — search_vulns over the service banners (OFFLINE)   → findings/cve.jsonl
     smb_checks     — netexec: signing/null-session/guest + share enum + metadata spider → findings/smb.jsonl
+    ad_enum        — netexec null-session RID cycling + password policy → findings/ad_enum.jsonl
     snmp_checks    — onesixtyone default community + snmpwalk loot      → findings/snmp.jsonl
-    ldap_checks    — ldapsearch: anonymous bind + account dump         → findings/ldap.jsonl
+    ldap_checks    — nxc ldap signing/channel-binding + ldapsearch anon bind/account dump → findings/ldap.jsonl
     ftp_checks     — netexec: anonymous FTP login                      → findings/ftp.jsonl
     telnet_checks  — nmap -sV: exposed cleartext telnet + banner       → findings/telnet.jsonl
     nfs_checks     — showmount -e: anonymously-readable NFS exports    → findings/nfs.jsonl
     rsync_checks   — rsync ://host/: anonymous rsync modules           → findings/rsync.jsonl
+    netbios_checks — nmap nbstat (137/UDP): hostname/user/MAC          → findings/netbios.jsonl
+    dns_checks     — dig axfr: reverse-zone transfer (subnet PTR map)  → findings/dns.jsonl
     remote_desktop — scrying: RDP/VNC screenshots of exposed services  → findings/remote_desktop.jsonl
                      (+ scans/<subnet>/screenshots/*.png)
 
@@ -95,11 +99,13 @@ SCRYING = _resolve("PTFLOW_SCRYING", "scrying")                          # RDP/V
 RSYNC = _resolve("PTFLOW_RSYNC", "rsync")
 SHOWMOUNT = _resolve("PTFLOW_SHOWMOUNT", "/usr/sbin/showmount", "showmount")  # nfs-utils (often /usr/sbin)
 SNMPWALK = _resolve("PTFLOW_SNMPWALK", "snmpwalk")                       # net-snmp (post-hit walk)
+DIG = _resolve("PTFLOW_DIG", "dig")                                       # DNS zone-transfer (AXFR)
 
 _CORE_TOOLS = {"mapcidr": MAPCIDR, "naabu": NAABU, "nmap": NMAP, "nerva": NERVA}
 _OPTIONAL_TOOLS = {"nuclei": NUCLEI, "netexec": NXC, "search_vulns": SEARCH_VULNS,
                    "onesixtyone": ONESIXTYONE, "ldapsearch": LDAPSEARCH,
-                   "scrying": SCRYING, "rsync": RSYNC, "showmount": SHOWMOUNT, "snmpwalk": SNMPWALK}
+                   "scrying": SCRYING, "rsync": RSYNC, "showmount": SHOWMOUNT, "snmpwalk": SNMPWALK,
+                   "dig": DIG}
 
 # --- tunables (rates conservative for live internal infra — legacy/OT gear is fragile) -----------
 # Aggregate load ~= concurrency x rate; a full connect-scan flood can knock over old devices and
@@ -147,8 +153,10 @@ PORT_LDAP = 389
 PORT_LDAPS = 636
 PORT_FTP = 21
 PORT_TELNET = 23
+PORT_DNS = 53
 PORT_NFS = 2049
 PORT_RSYNC = 873
+PORT_NETBIOS = 137
 PORT_RDP = 3389
 VNC_PORTS = frozenset(range(5900, 5907))          # VNC displays :0-:6 (5900-5906)
 _RD_PORTS = frozenset({PORT_RDP}) | VNC_PORTS     # remote-desktop sockets scrying screenshots
@@ -549,6 +557,143 @@ def parse_snmpwalk(out: str) -> dict:
     return {"entries": len(lines), "sysdescr": sysdescr}
 
 
+_RID_RE = re.compile(r"\b(\d+):\s+\S+\\([^()]+?)\s+\(SidType(\w+)\)")
+
+
+def parse_nxc_rid_brute(out: str) -> dict:
+    """netexec `--rid-brute` output → {users, groups} (pure). Lines are '<rid>: <DOMAIN>\\<name>
+    (SidType<X>)'; SidTypeUser → users, SidTypeGroup/Alias → groups. Domain-wide, deduped+sorted."""
+    users: list[str] = []
+    groups: list[str] = []
+    for raw in out.splitlines():
+        m = _RID_RE.search(raw)
+        if not m:
+            continue
+        name, sid_type = m.group(2).strip(), m.group(3)
+        if sid_type == "User":
+            users.append(name)
+        elif sid_type in ("Group", "Alias"):
+            groups.append(name)
+    return {"users": sorted(set(users)), "groups": sorted(set(groups))}
+
+
+def parse_nxc_pass_pol(out: str) -> dict:
+    """netexec `--pass-pol` output → the password-policy fields that matter for safe spraying (pure):
+    minimum length + account-lockout threshold/duration."""
+    pol: dict[str, str] = {}
+    for raw in out.splitlines():
+        low = raw.lower()
+        if "minimum password length" in low:
+            pol["min_length"] = raw.split(":")[-1].strip()
+        elif "account lockout threshold" in low:
+            pol["lockout_threshold"] = raw.split(":")[-1].strip()
+        elif "lockout duration" in low:
+            pol["lockout_duration"] = raw.split(":")[-1].strip()
+    return pol
+
+
+_LDAP_BANNER = re.compile(r"^LDAPS?\s+(\S+)\s+\d+\s+\S+\s+(.*)$")
+_LDAP_SIGNING = re.compile(r"signing:(\w+)", re.IGNORECASE)
+_LDAP_CBT = re.compile(r"channel binding:([^)]+)", re.IGNORECASE)
+
+
+def parse_nxc_ldap_signing(out: str) -> list[dict]:
+    """netexec core `nxc ldap` banner → LDAP signing / channel-binding findings (pure). The banner
+    carries '(signing:None|Enforced) (channel binding:Always|When Supported|Never|Unknown)'. signing:None
+    → ldap-signing-not-required (NTLM-relay-to-LDAP surface); channel binding ≠ Always/Unknown →
+    ldaps-no-channel-binding. Deduped per (host, kind) since a host may appear on 389 and 636."""
+    findings: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in out.splitlines():
+        m = _LDAP_BANNER.match(raw.strip())
+        if not m:
+            continue
+        host, rest = m.group(1), m.group(2)
+        sig = _LDAP_SIGNING.search(rest)
+        if sig and sig.group(1).lower() == "none" and (host, "sign") not in seen:
+            seen.add((host, "sign"))
+            findings.append({"type": "ldap-signing-not-required", "severity": "high",
+                             "host": host, "evidence": rest.strip()})
+        cbt = _LDAP_CBT.search(rest)
+        if cbt and (status := cbt.group(1).strip()).lower() not in ("always", "unknown") \
+                and (host, "cbt") not in seen:
+            seen.add((host, "cbt"))
+            findings.append({"type": "ldaps-no-channel-binding", "severity": "medium",
+                             "host": host, "channel_binding": status, "evidence": rest.strip()})
+    return findings
+
+
+def parse_ldap_descriptions(out: str) -> list[dict]:
+    """ldapsearch entries → [{account, description}] for accounts carrying a non-empty description
+    (pure; descriptions often leak temp passwords). Pairs sAMAccountName/uid with description per entry."""
+    entries: list[dict] = []
+    acct, desc = "", ""
+    for raw in [*out.splitlines(), ""]:            # trailing "" flushes the last entry
+        if not raw.strip():
+            if acct and desc:
+                entries.append({"account": acct, "description": desc})
+            acct, desc = "", ""
+            continue
+        attr, _, val = raw.partition(":")
+        key = attr.strip().lower()
+        if key in ("samaccountname", "uid"):
+            acct = val.strip()
+        elif key == "description":
+            desc = val.strip()
+    return entries
+
+
+def _nb_field(line: str, key: str) -> str:
+    m = re.search(rf"{re.escape(key)}:\s*([^,]+)", line)
+    return m.group(1).strip() if m else ""
+
+
+def parse_nbstat(out: str) -> list[dict]:
+    """nmap `--script nbstat` output → NetBIOS identity records (pure): name, logged-on user, MAC per
+    host. Tracks 'Nmap scan report for <ip>' for the host and reads the '| nbstat:' line."""
+    findings: list[dict] = []
+    host = ""
+    for raw in out.splitlines():
+        line = raw.strip()
+        if line.startswith("Nmap scan report for"):
+            host = line.rsplit(" ", 1)[-1].strip("()")
+        elif "nbstat:" in line:
+            findings.append({"type": "netbios-info", "severity": "info", "host": host,
+                             "name": _nb_field(line, "NetBIOS name"),
+                             "nb_user": _nb_field(line, "NetBIOS user"),
+                             "mac": _nb_field(line, "NetBIOS MAC"), "evidence": line})
+    return findings
+
+
+def reverse_zones(cidr: str) -> list[str]:
+    """The in-addr.arpa reverse zone(s) for a CIDR (pure): /24+ → 3 octets, /16 → 2, /8 → 1 (host
+    prefixes fall back to the /24 zone). E.g. 10.0.1.0/24 → ['1.0.10.in-addr.arpa']. [] if unparseable."""
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return []
+    if net.version != 4:  # noqa: PLR2004 — IPv6 reverse zones (ip6.arpa) are out of scope for v1
+        return []
+    octets = 3 if net.prefixlen >= 24 else (2 if net.prefixlen >= 16 else 1)  # noqa: PLR2004
+    parts = str(net.network_address).split(".")[:octets]
+    return [".".join(reversed(parts)) + ".in-addr.arpa"]
+
+
+def parse_dig_axfr(out: str) -> list[dict]:
+    """`dig axfr` output → [{name, rtype, value}] records (pure). BIND-format lines are
+    '<name> <ttl> IN <type> <value…>'; comment (';') and non-record lines are skipped. [] on a refused
+    transfer (the presence of records IS the success signal)."""
+    recs: list[dict] = []
+    for raw in out.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(";"):
+            continue
+        parts = line.split()
+        if len(parts) >= 5 and parts[2].upper() == "IN":  # noqa: PLR2004
+            recs.append({"name": parts[0], "rtype": parts[3], "value": " ".join(parts[4:])})
+    return recs
+
+
 # --- breadth stages (activity scope) -------------------------------------------------------------
 def _raw(activity: Activity, tool: str, label: str) -> Path:
     return activity.asset_discovery_raw(tool) / f"{label}.txt"
@@ -600,14 +745,31 @@ def portscan(activity: Activity) -> None:
              len(records), len({r["ip"] for r in records}))
 
 
-# --- spanning (whole-scope) — full-template nuclei ∥ the per-subnet loops ------------------------
+# --- spanning (whole-scope) — full-port scan + full-template nuclei ∥ the per-subnet loops --------
+def portscan_full(activity: Activity) -> None:
+    """SPANNING — full 65535-port naabu over the live hosts → asset_discovery/ports_full.jsonl. Off the
+    critical path (∥ cluster + loops): the per-subnet loot checks run on the fast curated set, while the
+    full scan feeds nuclei_scope so it sees services on non-standard ports. Same rate profile."""
+    canon = activity.asset_discovery_canonical
+    live = tools.read_lines(canon("live_hosts.txt"))
+    records: list[dict] = []
+    if live and shutil.which(NAABU):
+        out = _run([NAABU, "-silent", "-p", "-", "-c", NAABU_CONC, "-rate", NAABU_RATE],
+                   stdin="\n".join(live), dest=_raw(activity, "naabu", "ports_full"), label="ports_full")
+        records = parse_naabu(_lines(out))
+    tools.write_jsonl(canon("ports_full.jsonl"), records)
+    log.info("  → portscan_full — %d open (ip,port) across %d host(s)",
+             len(records), len({r["ip"] for r in records}))
+
+
 def nuclei_scope(activity: Activity) -> None:
     """SPANNING (whole-scope) — full-template nuclei over every discovered socket. ONE process with a
     single global rate cap (-rl) — the internal pipeline's own principle (one gentle global sweep beats
-    N per-subnet floods on fragile legacy/OT gear), and the analog of external's nuclei_scope. Runs ∥
-    cluster + all per-subnet loops, joined at the fan-in → <activity>/findings/nuclei_scope.jsonl.
-    Best-effort: skips if nuclei is absent. Full templates subsume the old per-subnet network-tag scan."""
-    ports = tools.read_jsonl(activity.asset_discovery_canonical("ports.jsonl"))
+    N per-subnet floods on fragile legacy/OT gear), and the analog of external's nuclei_scope. Reads the
+    FULL-port set (portscan_full, fallback to the fast set), runs ∥ cluster + all per-subnet loops,
+    joined at the fan-in → <activity>/findings/nuclei_scope.jsonl. Best-effort: skips if nuclei absent."""
+    canon = activity.asset_discovery_canonical
+    ports = tools.read_jsonl(canon("ports_full.jsonl")) or tools.read_jsonl(canon("ports.jsonl"))
     targets = tools.dedupe(f"{r['ip']}:{r['port']}" for r in ports if r.get("ip") and r.get("port"))
     if not targets or shutil.which(NUCLEI) is None:
         log.debug("  · skip nuclei_scope (no sockets / nuclei absent)")
@@ -838,41 +1000,85 @@ def snmp_checks(activity: Activity, app_id: str) -> None:
     log.info("  → snmp_checks [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
 
 
+def ad_enum(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — Active Directory enumeration WITHOUT credentials via netexec on hosts with 445 open:
+    RID cycling (`--rid-brute`, SAMR lookupsids works over a null session even when RestrictAnonymous
+    blocks `--users`) → domain users/groups loot, and the password policy (`--pass-pol`) whose lockout
+    threshold is the safe-spraying gate. Domain-wide, best-effort → findings/ad_enum.jsonl."""
+    ws = activity.app(app_id)
+    hosts = _hosts_with_port(ws, PORT_SMB)
+    if not hosts or shutil.which(NXC) is None:
+        log.debug("  · skip ad_enum [%s] (no 445 / netexec absent)", app_id)
+        return
+    findings: list[dict] = []
+    accounts = parse_nxc_rid_brute(_capture([NXC, "smb", *hosts, "-u", "", "-p", "", "--rid-brute"],
+                                            dest=ws.raw("netexec") / "rid_brute.txt", label="ad-rid"))
+    if accounts["users"] or accounts["groups"]:
+        tools.write_lines(ws.raw("netexec") / "domain_users.txt", accounts["users"])
+        tools.write_lines(ws.raw("netexec") / "domain_groups.txt", accounts["groups"])
+        findings.append({"type": "ad-users-enumerated", "severity": "high", "host": hosts[0],
+                         "users": len(accounts["users"]), "groups": len(accounts["groups"]),
+                         "sample": accounts["users"][:10],
+                         "evidence": f"{len(accounts['users'])} user(s) + {len(accounts['groups'])} "
+                                     "group(s) via null-session RID cycling"})
+    pol = parse_nxc_pass_pol(_capture([NXC, "smb", *hosts, "-u", "", "-p", "", "--pass-pol"],
+                                      dest=ws.raw("netexec") / "pass_pol.txt", label="ad-passpol"))
+    if pol:
+        findings.append({"type": "ad-password-policy", "severity": "info", "host": hosts[0], **pol,
+                         "evidence": f"password policy: {pol}"})
+    tools.write_jsonl(ws.findings / "ad_enum.jsonl", findings)
+    log.info("  → ad_enum [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
+
+
 def _ldap_dump(ws: AppWorkspace, host: str, contexts: list[str]) -> list[dict]:
     """Bounded anonymous account dump (ldapsearch -z LDAP_MAX_ENTRIES) over the first DOMAIN naming
     context → an ldap-anon-users finding + a users loot file. Read-only, best-effort ([] on nothing)."""
     base = next((c for c in contexts if "DC=" in c.upper()), contexts[0])
     out = _capture([LDAPSEARCH, "-x", "-H", f"ldap://{host}", "-b", base, "-z", LDAP_MAX_ENTRIES,
                     "(|(objectClass=user)(objectClass=person)(objectClass=inetOrgPerson))",
-                    "sAMAccountName", "uid"],
+                    "sAMAccountName", "uid", "description"],
                    dest=ws.raw("ldapsearch") / f"{host}_dump.txt", label="ldap-dump")
     accounts = parse_ldap_accounts(out)
-    if not accounts:
-        return []
-    tools.write_lines(ws.raw("ldapsearch") / f"{host}_accounts.txt", accounts)
-    return [{"type": "ldap-anon-users", "severity": "high", "host": host, "count": len(accounts),
-             "sample": accounts[:10], "evidence": f"{len(accounts)} account(s) via anonymous bind"}]
+    findings: list[dict] = []
+    if accounts:
+        tools.write_lines(ws.raw("ldapsearch") / f"{host}_accounts.txt", accounts)
+        findings.append({"type": "ldap-anon-users", "severity": "high", "host": host,
+                         "count": len(accounts), "sample": accounts[:10],
+                         "evidence": f"{len(accounts)} account(s) via anonymous bind"})
+    # account descriptions often leak temp passwords → surface each one
+    findings += [{"type": "ldap-user-description", "severity": "medium", "host": host,
+                  "account": d["account"], "description": d["description"],
+                  "evidence": f"{d['account']}: {d['description']}"}
+                 for d in parse_ldap_descriptions(out)]
+    return findings
 
 
 def ldap_checks(activity: Activity, app_id: str) -> None:
-    """LOOP 2 — LDAP anonymous bind + LOOT via ldapsearch on hosts with 389/636 open. A rootDSE that
-    returns naming contexts anonymously is a finding; from the same anonymous bind we then dump the
-    account names (bounded) as a users loot file. Best-effort → findings/ldap.jsonl."""
+    """LOOP 2 — LDAP posture + LOOT on hosts with 389/636 open, no credentials. Two independent,
+    best-effort passes → findings/ldap.jsonl:
+    (1) signing / channel binding via the netexec core `nxc ldap` banner (the NTLM-relay-to-LDAP
+        surface — signing:None → ldap-signing-not-required, channel binding ≠ Always → ldaps-no-cbt);
+    (2) anonymous bind via ldapsearch → rootDSE naming contexts + a bounded account/description dump."""
     ws = activity.app(app_id)
     hosts = sorted(set(_hosts_with_port(ws, PORT_LDAP)) | set(_hosts_with_port(ws, PORT_LDAPS)))
-    if not hosts or shutil.which(LDAPSEARCH) is None:
-        log.debug("  · skip ldap_checks [%s] (no 389/636 / ldapsearch absent)", app_id)
+    if not hosts:
+        log.debug("  · skip ldap_checks [%s] (no 389/636)", app_id)
         return
     findings: list[dict] = []
-    for host in hosts:
-        out = _capture([LDAPSEARCH, "-x", "-H", f"ldap://{host}", "-s", "base", "-b", "",
-                        "namingContexts"], dest=ws.raw("ldapsearch") / f"{host}.txt", label="ldap")
-        contexts = parse_naming_contexts(out)
-        if not contexts:
-            continue
-        findings.append({"type": "ldap-anonymous-bind", "severity": "medium", "host": host,
-                         "evidence": f"namingContexts: {contexts[0]}"})
-        findings += _ldap_dump(ws, host, contexts)
+    if shutil.which(NXC):  # (1) signing / channel binding — netexec core banner, no module, no creds
+        findings += parse_nxc_ldap_signing(
+            _capture([NXC, "ldap", *hosts, "-u", "", "-p", ""],
+                     dest=ws.raw("netexec") / "ldap.txt", label="ldap-sign"))
+    if shutil.which(LDAPSEARCH):  # (2) anonymous bind + account/description dump
+        for host in hosts:
+            out = _capture([LDAPSEARCH, "-x", "-H", f"ldap://{host}", "-s", "base", "-b", "",
+                            "namingContexts"], dest=ws.raw("ldapsearch") / f"{host}.txt", label="ldap")
+            contexts = parse_naming_contexts(out)
+            if not contexts:
+                continue
+            findings.append({"type": "ldap-anonymous-bind", "severity": "medium", "host": host,
+                             "evidence": f"namingContexts: {contexts[0]}"})
+            findings += _ldap_dump(ws, host, contexts)
     tools.write_jsonl(ws.findings / "ldap.jsonl", findings)
     log.info("  → ldap_checks [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
 
@@ -942,6 +1148,46 @@ def rsync_checks(activity: Activity, app_id: str) -> None:
     log.info("  → rsync_checks [%s] — %d host(s) → %d module(s)", app_id, len(hosts), len(findings))
 
 
+def netbios_checks(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — NetBIOS identity enumeration (137/UDP, so it runs over ALL group hosts like SNMP, not
+    the TCP portscan). nmap `nbstat` yields hostname, logged-on user and MAC/vendor per host — cheap,
+    no-cred identity data. Best-effort → findings/netbios.jsonl."""
+    ws = activity.app(app_id)
+    hosts = tools.read_lines(ws.hosts)
+    if not hosts or shutil.which(NMAP) is None:
+        log.debug("  · skip netbios_checks [%s] (no hosts / nmap absent)", app_id)
+        return
+    out = _capture([NMAP, "-sU", "-Pn", "-n", "-p", str(PORT_NETBIOS), "--script", "nbstat",
+                    "-oN", "-", *hosts], dest=ws.raw("nmap") / "nbstat.txt", label="netbios")
+    findings = parse_nbstat(out)
+    tools.write_jsonl(ws.findings / "netbios.jsonl", findings)
+    log.info("  → netbios_checks [%s] — %d host(s) → %d record(s)", app_id, len(hosts), len(findings))
+
+
+def dns_checks(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — DNS zone transfer (AXFR) against hosts with 53 open. Attempts the subnet's REVERSE
+    zone(s) — derived deterministically from the group CIDR — so a permissive server hands back the
+    PTR map of the whole subnet (a host inventory). Best-effort → findings/dns.jsonl."""
+    ws = activity.app(app_id)
+    hosts = _hosts_with_port(ws, PORT_DNS)
+    zones = reverse_zones(workspace.read_meta(ws.meta).get("cidr") or "")
+    if not hosts or not zones or shutil.which(DIG) is None:
+        log.debug("  · skip dns_checks [%s] (no 53 / no zone / dig absent)", app_id)
+        return
+    findings: list[dict] = []
+    for host in hosts:
+        for zone in zones:
+            recs = parse_dig_axfr(_capture([DIG, "+time=5", "+tries=1", "axfr", zone, f"@{host}"],
+                                           dest=ws.raw("dig") / f"{host}_{zone}.txt", label="dns-axfr"))
+            if recs:
+                tools.write_jsonl(ws.raw("dig") / f"{host}_{zone}.jsonl", recs)
+                findings.append({"type": "dns-zone-transfer", "severity": "high", "host": host,
+                                 "zone": zone, "records": len(recs),
+                                 "evidence": f"AXFR of {zone} from {host} → {len(recs)} record(s)"})
+    tools.write_jsonl(ws.findings / "dns.jsonl", findings)
+    log.info("  → dns_checks [%s] — %d DNS host(s) → %d transfer(s)", app_id, len(hosts), len(findings))
+
+
 def remote_desktop(activity: Activity, app_id: str) -> None:
     """LOOP 2 — screenshot exposed RDP/VNC with scrying (no credentials). One scrying run over the
     group's RDP (3389) + VNC (5900-5906) sockets captures each exposed login screen / desktop; a
@@ -987,6 +1233,9 @@ _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "telnet.jsonl": ("findings/telnet.jsonl",),
     "nfs.jsonl": ("findings/nfs.jsonl",),
     "rsync.jsonl": ("findings/rsync.jsonl",),
+    "ad_enum.jsonl": ("findings/ad_enum.jsonl",),
+    "netbios.jsonl": ("findings/netbios.jsonl",),
+    "dns.jsonl": ("findings/dns.jsonl",),
     "remote_desktop.jsonl": ("findings/remote_desktop.jsonl",),
 }
 # nuclei_scope is written whole-scope at the activity level (like external) — not lifted here.
