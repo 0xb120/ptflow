@@ -16,7 +16,7 @@ results into "application groups", then runs one or more per-app **loops** (dept
 that fan out under Prefect.
 
 > **Terminal step = deterministic `consolidate` (done); agent seam dormant.** The real terminal
-> fan-in is now `consolidate` (`pipelines/recon/tasks.consolidate`, an optional `Pipeline` hook the
+> fan-in is now `consolidate` (`pipelines/external/tasks.consolidate`, an optional `Pipeline` hook the
 > orchestrator calls like `preflight`): it lifts every app group's per-app findings into the
 > activity-level `<activity>/findings/<type>.jsonl`, one file per finding TYPE (`cve`/`dast` fold
 > their surface+deep passes). The old agent stage (`core/agent.py`, `HypothesisProvider`) still runs
@@ -36,7 +36,7 @@ uv run pytest tests/core/test_orchestrator.py          # one file
 uv run pytest tests/core/test_scope.py::test_classify  # one test
 ```
 
-- `<pipeline>` is `example` or `recon` (see below). Every external command (routed through
+- `<pipeline>` is `example`, `external`, `internal`, or `webscan` (see below). Every external command (routed through
   `tools.run`/`tools.pipe`) is logged, and the full run log — every command + output — is persisted
   to `<activity>/logs/run.log` regardless of console verbosity. `-v`/`--verbose` additionally surfaces
   commands and live tool stdout/stderr on the console.
@@ -75,7 +75,7 @@ without it (ephemeral).
 
 ```bash
 pipt serve                                             # start the Prefect server + UI → http://127.0.0.1:4200
-uv run pipt run recon <activity> <scope.txt> --observe # stream THIS run to that UI (run graph + states + logs)
+uv run pipt run external <activity> <scope.txt> --observe # stream THIS run to that UI (run graph + states + logs)
 ```
 
 - **`pipt serve`** wraps `prefect server start` (foreground; its own terminal). The UI reads the local
@@ -204,7 +204,7 @@ Two wordlist scopes (deliberately distinct names): `<activity>/wl_global/` is th
 shared/global INPUT lists; `scans/<app_id>/wl_custom/` is the wordlists GENERATED for
 that app from its own corpus (`Activity.wl_global` / `AppWorkspace.wl_custom`).
 
-**Global wordlists are resolved by ROLE, not hardcoded** (`pipelines/recon/wordlists.py`). The
+**Global wordlists are resolved by ROLE, not hardcoded** (`pipelines/external/wordlists.py`). The
 `provision_wl` breadth stage resolves each role (`content`, `wordpress`, `drupal`, `joomla`) to a
 concrete file and symlinks it into `wl_global/<role>.txt`; steps then read by role
 (`wordlists.role_path(activity, "content")`). Resolution order: BYO (`wl_global/<role>.txt` already
@@ -231,7 +231,7 @@ This is the load-bearing convention; a verbatim raw↔canonical copy is the bug 
 - **Nothing downstream ever reads `raw/`** — consumers read fixed canonical names (a stage may re-read
   its own `raw/` within the same call).
 
-In recon, `_run(tool, cmd, *, stdin, dest, label)` enforces this: it writes a tool's stdout to
+In external, `_run(tool, cmd, *, stdin, dest, label)` enforces this: it writes a tool's stdout to
 the single caller-chosen `dest`. Keep pure transforms (e.g. `honeypot_split`, `tokenize_urls`,
 `denoise`) module-level so they're unit-testable apart from subprocess plumbing.
 
@@ -277,11 +277,11 @@ residual (same-apex hosts
 with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) is what a future
 `recluster` deep-path confirmation pass would resolve. The example stub still hashes a fabricated sig.
 
-## The two pipelines
+## The pipelines
 
 - **`example`** — stub tasks (deterministic fake IPs/services, no external binaries). Dependency-free;
   this is what the test suite and CI exercise.
-- **`recon`** — the REAL ProjectDiscovery toolchain (`pipelines/recon/tasks.py`), a faithful port of
+- **`external`** — the REAL ProjectDiscovery toolchain (`pipelines/external/tasks.py`), a faithful port of
   bash recon scripts (`scope2surface.sh` breadth, `surfagr.sh` clustering). Stages:
   - **Breadth** (activity scope): `provision_wl` (resolve global wordlist roles → `wl_global/`) ∥
     `expand` → `resolve` → `portscan` (FAST: ~250 curated web ports `WEB_PORTS` → honeypot filter → `naabu_web.txt`) → `httpx`
@@ -341,6 +341,75 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     More finding-only scanners (nuclei tech-tags, `nikto`, …) dispatch here. Specialized scanners are
     split between loops by output role: **surface → `tech_enum`** (loop 3, feeds enum); **findings →
     `tech_vulnscan`** (loop 4).
+- **`internal`** — internal-network pentest (`pipelines/internal/tasks.py`): an **IP/CIDR-only** scope
+  swept **per-subnet** for classic perimeter low-hanging fruit. Maps onto the same breadth→cluster→loop
+  grammar with the **subnet as the fan-out unit** (not a web app) — zero `core/` changes. Stages:
+  - **Breadth** (activity scope, ONE rate-controlled pass): `expand` (mapcidr: CIDR → candidate IPs,
+    offline `net=False`) → `discover` (nmap `-sn` ping sweep → `asset_discovery/live_hosts.txt`; falls
+    back to all candidates when ICMP is filtered) → `portscan` (naabu over the curated `INTERNAL_PORTS`
+    set → `asset_discovery/ports.jsonl`). Whole-scope + rate-controlled on purpose — one global sweep is
+    gentler on fragile legacy/OT gear and switches than N per-subnet floods (aggregate load ≈ concurrency
+    × rate; `PIPT_PROFILE=home` throttles naabu, same lever as external).
+  - **`cluster`** — `assign_hosts` (pure, unit-tested) partitions the LIVE hosts by the **scope entry
+    that contains them**: the CIDR from the scope file, **longest-prefix wins** on overlap, a bare IP is
+    a /32; only entries with ≥1 live host become groups. `app_id` = the filesystem-safe CIDR slug
+    (`10.0.1.0-24`, `192.168.5.10-32`). Writes each group's `meta.json`/`hosts.txt` + its slice of
+    `ports.jsonl` → `scans/<subnet>/` = the per-subnet compartmentalisation. So the whole-scope scan and
+    the per-subnet output folders are NOT in tension — breadth scans once, `cluster` slices by subnet.
+  - **Loop 1 — inventory** (`phase=1`): `fingerprint` — `nerva --json` over the group's `ip:port` set
+    (nmap `-sV` is the drop-in alternative) → `services.jsonl`.
+  - **Loop 2 — low-hanging fruit** (`phase=2`, all ∥, gated on the loop-1 services): `cve_lookup`
+    (search_vulns over the service banners — OFFLINE `net=False`, same pattern as external) · `smb_checks`
+    (netexec: signing-not-required / SMBv1-enabled / null-session·guest·`Pwn3d!`) · `snmp_checks`
+    (onesixtyone default communities, UDP/161 so it sweeps all group hosts) · `ldap_checks` (ldapsearch
+    anonymous bind on 389/636) · `nuclei_net` (nuclei `-tags network,default-login`). Each best-effort
+    (missing binary / gated-out port → no finding, never aborts) → `scans/<subnet>/findings/<check>.jsonl`.
+  - **`consolidate`** lifts the per-subnet findings to `<activity>/findings/<type>.jsonl` (one file per
+    finding TYPE, each record stamped `app_id`), same deterministic terminal fan-in as external, AND
+    aggregates every group's web services (`ports.jsonl` ∩ HTTP(S) ports / a nerva `http` banner) into
+    `<activity>/web_targets.txt` (`scheme://ip:port`, https for a TLS port/banner — pure `web_targets_from`).
+  - **web hand-off (pipeline COMPOSITION)** — after the sweep, `internal.followups(activity)` (a
+    duck-typed `Pipeline` hook, like `consolidate`/`preflight`, returning `list[Followup]` from
+    `core/stage.py`) hands `web_targets.txt` to the **`webscan`** pipeline (see below) as a **nested
+    sub-activity** `<activity>/web_recon/`. The CLI runs each `Followup` as a **separate top-level
+    `orchestrate()`**, NOT a nested Prefect subflow — so each pipeline stays a clean flow with its own
+    runner/teardown and files-as-only-state holds (the hand-off crosses via the on-disk scope artifact).
+    **OPT-IN** via `PIPT_INTERNAL_WEB_HANDOFF` (default OFF): a full web-depth scan per service is long.
+    The aggregation artifact is always written; only the auto-run is gated.
+
+  **Design decisions:** grouping keys on the **scope CIDR** (the operator's own compartmentalisation),
+  not an arbitrary /24; the flow is **forward-only / acyclic** — a first-check sweep has no lateral
+  movement, so the orchestrator's no-cycle constraint doesn't bite (a credentialed re-entry / lateral
+  chain would need a different model, deliberately out of scope). **Status: SKELETON** — breadth,
+  `cluster`, `fingerprint`, `cve_lookup` and `smb_checks`/`snmp_checks` are real (their pure parsers +
+  `assign_hosts` unit-tested; e2e-smoke on loopback); `ldap_checks`/`nuclei_net` parsing and the
+  corpus-less `cve_lookup` banner extraction are still **best-effort/minimal** and want live internal
+  testing (the natural next lever: reuse external's `collect_software` for CVE, richer share/perms parsing
+  for SMB). Destructive/active checks (brute-force, responder/relay, coercion) and credentialed auth
+  (a future `PIPT_CREDS`) are deliberately **opt-in, not yet wired**. `internal` has **no `flowmeta`**
+  (the flow-map gate is external-only, verified) so the dev gate doesn't require one.
+- **`webscan`** — external's web-DEPTH loops over a **PRE-AGGREGATED web target list** (`pipelines/webscan/
+  pipeline.py`). This is the "dedicated external profile" the `internal` hand-off targets: given a list of
+  known web services (`scheme://host[:port]`, e.g. an internal run's `web_targets.txt`), it runs external's
+  crawl → catalog → DAST → fuzz depth, **skipping** scope EXPANSION (`expand`/`resolve` — subdomain/DNS/
+  TLS/OSINT), active NETWORK scan (`portscan`/`portscan_full`/`nerva`/`nuclei_scope`), and per-app OSINT
+  (`passive_probe`/`subenum`/`takeover`/`fetch_delta` — gau/urlfinder/subfinder/DNS). **It REUSES external's
+  task functions unchanged** — only the breadth is replaced by one `ingest` step
+  (`external.tasks.ingest_httpx`: httpx over the target list with **`-nfs`** so the explicit http/https +
+  port is honoured, → the same `httpx_full_metadata.jsonl` `cluster()`/the loops consume) and the stage
+  graph is curated (its own `Stage` objects wrap external's functions with rewired `needs`). Dropped stages'
+  artifacts are simply absent; external's **tolerant reads** (`read_lines`/`read_jsonl` → `[]`) degrade the
+  depth loops cleanly. **external itself is untouched** (no mode-conditionals sprinkled through it — a
+  sibling pipeline was chosen over an external mode flag precisely to keep the proven external DAG pristine and
+  match the pluggable-pipeline model). *Design decisions:* (1) sibling pipeline, NOT an external mode — one
+  place holds the web-mode composition, external stays single-purpose; (2) `-nfs` here (honour input scheme)
+  is correct where every target carries an explicit scheme+port, the inverse of external discovery's
+  https-default (external design note); (3) largely EGRESS-FREE with OSINT gone, but two external internals
+  still call out — `content_discovery`'s trufflehog `--results=verified` validates hits against the
+  credential's PROVIDER (external) — mind it on an air-gapped engagement. Verified end-to-end on a
+  loopback server: `ingest` (scheme+port honoured) → `cluster` → all four depth loops (the catalog
+  captured a POST form + query params), no expansion/OSINT artifacts written. Like `internal`, it needs
+  no `flowmeta` (flow-map gate is external-only).
 
 ### Fetch once, mine offline
 
@@ -699,7 +768,7 @@ aborting the run.
 
 ## Pipeline flow map (auto-generated, always current)
 
-`flowmeta.main()` writes THREE self-contained, always-up-to-date views of the recon pipeline's flow.
+`flowmeta.main()` writes THREE self-contained, always-up-to-date views of the external pipeline's flow.
 A git diff of any of them shows exactly how the flow changed:
 - **`docs/pipeline-flow.html`** — the detailed band "spec sheet" (bands, parallelism, barriers,
   per-step commands/outputs/notes, with the content-discovery fixpoint as its centerpiece).
@@ -711,20 +780,20 @@ A git diff of any of them shows exactly how the flow changed:
   via longest-path layering; `core/mermaidmap.py` emits the Mermaid flowchart (both generic,
   pipeline-agnostic, from the `Stage` objects — `needs`/`phase`/`per_app`/`spanning`/`cluster_scope`/
   `net` — plus the `MapSpec`). Output is deterministic (no timestamps).
-- **Per-step prose/commands/outputs live in `pipelines/recon/flowmeta.py`** (`FLOWMETA` + `SPEC`).
+- **Per-step prose/commands/outputs live in `pipelines/external/flowmeta.py`** (`FLOWMETA` + `SPEC`).
   This is the ONE thing you maintain by hand: **when you add or change a step, add/adjust its
   `StepMeta`.** `tests/pipelines/test_flowmap.py::test_flowmeta_covers_every_stage` fails the dev gate
   if any `Stage` lacks a `StepMeta`, so the maps can't silently drift.
 - **A hook regenerates them automatically.** `.claude/settings.json` runs `.claude/hooks/regen-flowmap.sh`
   (PostToolUse · Edit/Write/MultiEdit) which re-runs the generator whenever a file under
   `src/pipt/pipelines/` changes (where commands and execution order live). Regenerate by hand any time
-  with: `uv run python -m pipt.pipelines.recon.flowmeta`. (Edits to the generators themselves in
+  with: `uv run python -m pipt.pipelines.external.flowmeta`. (Edits to the generators themselves in
   `core/` aren't watched by the hook — regenerate manually after those.)
 
-## Recon environment gotchas
+## External environment gotchas
 
 - **`httpx` on PATH is the pyenv shim — use `~/go/bin/httpx`** (handled via the `HTTPX` constant in
-  recon tasks). Other tools (subfinder, dnsx, naabu, tlsx, mapcidr, shuffledns, katana, nerva,
+  external tasks). Other tools (subfinder, dnsx, naabu, tlsx, mapcidr, shuffledns, katana, nerva,
   assetfinder, gau, urlfinder, subjack, …) are in `~/go/bin`; feroxbuster in `~/.local/bin`.
 - Trusted resolvers: `/opt/resolvers/resolvers-trusted.txt`.
 - **DAST (`dast` step)** uses `nuclei -dast` with the fuzzing templates at `~/nuclei-templates/dast`
@@ -759,8 +828,8 @@ A git diff of any of them shows exactly how the flow changed:
   which `--single` skips), and that CSV's "Default Creds" column is what we parse, splitting the leads
   back per group by URL. Headless katana uses the bundled rod chromium, NOT system chrome
   (`-sc`/`-system-chrome` hangs for katana here — but works for httpx -screenshot).
-- Recon tunables (rates, port counts, honeypot threshold, crawl depths, wordlist constants) are at the
-  top of `pipelines/recon/tasks.py` — tuned conservatively for live infra; don't bump blindly.
+- External tunables (rates, port counts, honeypot threshold, crawl depths, wordlist constants) are at the
+  top of `pipelines/external/tasks.py` — tuned conservatively for live infra; don't bump blindly.
 - **Rate profile** (env **`PIPT_PROFILE`** ∈ `wide|home`, default `wide`, resolved at import — set it
   *before* launching): `wide` = today's rates (real bandwidth); `home` throttles naabu `-rate`
   (300 vs 1000 — the full-port packet flood that exhausts a consumer NAT/router), nuclei `-rl`
@@ -770,9 +839,9 @@ A git diff of any of them shows exactly how the flow changed:
 - **Authorized test scope only:** `https://ginandjuice.shop/` (PortSwigger demo), `scanme.nmap.org`
   (Nmap-sanctioned).
 
-## Recon design decisions (the *why*, and what was rejected)
+## External design decisions (the *why*, and what was rejected)
 
-The architecture sections above say *what* the recon pipeline does; this records *why* — and the
+The architecture sections above say *what* the external pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
 
 - **The catalog REALIGNS `raw` to the unioned params after the merge (`normalize_request`), and seeds a

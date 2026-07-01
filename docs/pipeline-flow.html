@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>pipt · pipeline recon</title>
+<title>pipt · pipeline external</title>
 <style>
 :root{
   --ground:#0b0f17; --ground-2:#111726; --inset:#0c111c;
@@ -59,7 +59,7 @@ a:focus-visible{outline:2px solid var(--ink);outline-offset:2px;}
 <body>
 <div class="wrap">
 <header class="masthead">
-<p class="eyebrow">pipt · pipeline recon</p>
+<p class="eyebrow">pipt · pipeline external</p>
 <h1>signal <span class="sep">/</span> flow</h1>
 <p class="thesis">Ogni stage comunica solo via file su disco. La breadth mappa l'intero scope, il cluster fa da pivot fan-out, poi i loop per-app vanno in profondità con una barriera globale tra loro: prima la SUPERFICIE ESPLORABILE (OSINT/crawl) e il suo DAST (frutti bassi), poi il guessing/fuzzing (fixpoint di content discovery: fuzz → download → mine → fuzz) e il DAST della superficie indovinata.</p>
 <div class="legend" aria-label="legenda">
@@ -150,7 +150,7 @@ nuclei -dast -im jsonl -l input_full.jsonl -t &lt;dast templates&gt; -fa low -rl
 # dedup_dast_findings: 1 record per (template, host, path, fuzz position), come in dast</div><div class="out"><span class="art">findings/dast_full.jsonl</span></div><ul class="notes"><li>nuclei costruisce la richiesta fuzzata dal campo `raw` → metodo/body/header arbitrari (POST/JSON)</li><li>param scoperti iniettati in richieste concrete (build_fuzz_requests): query/body/json/header</li><li>NON ri-DAST-a la superficie già coperta in FASE 2 · best-effort: salta se manca nuclei o i template dast</li><li>dedup per punto-di-iniezione (il delta è path-disgiunto dalla superficie → niente dup cross-fase)</li><li>il full-template whole-scope è nuclei_scope (breadth) · per-app findings → consolidate (pianificato)</li></ul></div><div class="node"><div class="top"><span class="idx">29</span><h3>xss_full</h3><span class="tag par-tag">∥ needs request_catalog_full, param_fuzz</span></div><p>FASE 4 — XSS dedicato (dalfox) sulla superficie INDOVINATA: il duale di dast_full. Fuzza solo il DELTA (catalogo full meno superficie, per request_key) + i request sintetizzati dai param scoperti — non ri-scansiona ciò che la FASE 2 ha già coperto.</p><div class="cmd"># candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)
 dalfox file &lt;raw&gt; --rawdata --format jsonl --skip-bav -w 30 --timeout 10 [--http] [-H auth]</div><div class="out"><span class="art">findings/xss_full.jsonl</span></div><ul class="notes"><li>needs request_catalog_full + param_fuzz · best-effort · cap wall-clock per-request</li><li>stesso runner di xss (FASE 2), sul delta indovinato + param nascosti</li><li>OAST opt-in (PIPT_OAST) anche qui: blind XSS via interactsh, callback per-request</li></ul></div><div class="node"><div class="top"><span class="idx">30</span><h3>sqli_full</h3><span class="tag par-tag">∥ needs request_catalog_full, param_fuzz</span></div><p>FASE 4 — SQLi dedicato (sqlmap) sulla superficie INDOVINATA: il duale di dast_full. -r sul `raw` del DELTA (full meno superficie) + i request dei param scoperti; --smart decide.</p><div class="cmd"># candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)
 sqlmap -r &lt;raw&gt; --batch --smart --level 1 --risk 1 --threads 4 --disable-coloring [-H auth]</div><div class="out"><span class="art">findings/sqli_full.jsonl</span></div><ul class="notes"><li>needs request_catalog_full + param_fuzz · best-effort · cap wall-clock per-request</li><li>stesso runner di sqli (FASE 2), sul delta indovinato + param nascosti</li></ul></div></div></section><section class="band" style="--tone:#8b8fa3"><h2 class="band-h"><span class="t">fan-in</span><span class="sub">join dello spanning, poi il fan-in terminale deterministico</span></h2><div class="lvl"><div class="node"><div class="top"><h3>consolidate</h3><span class="tag par-tag">∥ no needs</span></div><p>Fan-in terminale DETERMINISTICO (consolidate): solleva i findings per-app in &lt;activity&gt;/findings/&lt;tipo&gt;.jsonl — un file per categoria, ogni record con app_id. cve e dast uniscono superficie (fase 2) + deep (fase 4); takeover.txt → record. nuclei_scope è già a livello activity. Il seam dell'agente (StubProvider) resta dormiente accanto.</p><div class="out"><span class="art">findings/cve.jsonl</span><span class="art">findings/dast.jsonl</span><span class="art">findings/tilde_enum.jsonl</span><span class="art">findings/wpprobe.jsonl</span><span class="art">findings/secrets.jsonl</span><span class="art">findings/takeover.jsonl</span><span class="art">findings/default_creds.jsonl</span><span class="art">findings/hypotheses.jsonl</span></div></div></div></section>
-<footer>generato da <b>pipt.pipelines.recon.flowmeta</b> · non modificare a mano · struttura derivata dagli Stage objects</footer>
+<footer>generato da <b>pipt.pipelines.external.flowmeta</b> · non modificare a mano · struttura derivata dagli Stage objects</footer>
 </div>
 </body>
 </html>

@@ -1,6 +1,6 @@
-# pipt · pipeline recon — mappa concettuale (flowchart)
+# pipt · pipeline external — mappa concettuale (flowchart)
 
-> **Auto-generata** da `pipt.pipelines.recon.flowmeta` — **non modificare a mano**: un hook la
+> **Auto-generata** da `pipt.pipelines.external.flowmeta` — **non modificare a mano**: un hook la
 > rigenera a ogni modifica sotto `src/pipt/pipelines/`, quindi i comandi e l'ordine qui sotto
 > seguono il codice. Versione interattiva pan/zoom: [`pipeline-map.html`](pipeline-map.html).
 > Spec dettagliata per-step (summary/output/note): [`pipeline-flow.html`](pipeline-flow.html).

@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>pipt · pipeline recon · mappa</title>
-<!-- AUTO-GENERATA da pipt.pipelines.recon.flowmeta — non modificare a mano (un hook la rigenera).
+<title>pipt · pipeline external · mappa</title>
+<!-- AUTO-GENERATA da pipt.pipelines.external.flowmeta — non modificare a mano (un hook la rigenera).
      Unica dipendenza esterna: mermaid via CDN (serve connessione quando apri il file). -->
 <style>
   :root { --bg:#0f1419; --panel:#161b22; --ink:#e6edf3; --muted:#9aa7b4; --line:#2a3340;
@@ -39,7 +39,7 @@
 </head>
 <body>
 <header>
-  <h1>pipt · pipeline recon &nbsp;<small>mappa concettuale (scroll · pan · zoom)</small></h1>
+  <h1>pipt · pipeline external &nbsp;<small>mappa concettuale (scroll · pan · zoom)</small></h1>
   <div class="ctrls">
     <button id="zin" title="Zoom +">+</button>
     <button id="zout" title="Zoom out">&minus;</button>
@@ -74,7 +74,7 @@ mermaid.initialize({
 const diagram = document.getElementById('diagram');
 const canvas = document.getElementById('canvas');
 try {
-  const { svg } = await mermaid.render('reconGraph', graph);
+  const { svg } = await mermaid.render('externalGraph', graph);
   diagram.innerHTML = svg;
 } catch (e) {
   diagram.innerHTML = '<div class="loading">Errore nel rendering Mermaid: ' + e + '</div>';

@@ -1,4 +1,4 @@
-"""Recon flow-map metadata + the generator entrypoint.
+"""External pipeline flow-map metadata + the generator entrypoint.
 
 `FLOWMETA` is the per-step description (summary/commands/outputs/notes) the generic renderer
 (`pipt.core.flowmap`) can't derive from the Stage objects; `SPEC` bundles it with the titles, phase
@@ -9,7 +9,7 @@ When you add or change a step in `pipeline.py`/`tasks.py`, add/adjust its `StepM
 (`tests/pipelines/test_flowmap.py`) fails the dev gate if any Stage is missing one, and a hook
 regenerates `docs/pipeline-flow.html` whenever a file under `src/pipt/pipelines/` changes.
 
-Run manually:  uv run python -m pipt.pipelines.recon.flowmeta
+Run manually:  uv run python -m pipt.pipelines.external.flowmeta
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from pathlib import Path
 from pipt.core.flowmap import MapSpec, StepMeta, render
 from pipt.core.log import get_logger
 from pipt.core.mermaidmap import render_html, render_markdown
-from pipt.pipelines.recon.pipeline import PIPELINE
+from pipt.pipelines.external.pipeline import PIPELINE
 
 log = get_logger()
 
@@ -472,7 +472,7 @@ _FANIN = StepMeta(
 )
 
 SPEC = MapSpec(
-    title="pipt · pipeline recon",
+    title="pipt · pipeline external",
     thesis="Ogni stage comunica solo via file su disco. La breadth mappa l'intero scope, il cluster fa da "
            "pivot fan-out, poi i loop per-app vanno in profondità con una barriera globale tra loro: prima "
            "la SUPERFICIE ESPLORABILE (OSINT/crawl) e il suo DAST (frutti bassi), poi il guessing/fuzzing "
@@ -483,12 +483,12 @@ SPEC = MapSpec(
     fanin=("consolidate", _FANIN),
 )
 
-# docs/pipeline-flow.html at the repo root (flowmeta.py is src/pipt/pipelines/recon/ → parents[4]).
+# docs/pipeline-flow.html at the repo root (flowmeta.py is src/pipt/pipelines/external/ → parents[4]).
 _DEFAULT_OUT = Path(__file__).resolve().parents[4] / "docs" / "pipeline-flow.html"
 
 
 def main(out: str | None = None) -> None:
-    """Render the recon flow artifacts (all deterministic) into the docs dir of `out`:
+    """Render the external pipeline flow artifacts (all deterministic) into the docs dir of `out`:
     `pipeline-flow.html` (the detailed band spec sheet — `out` itself, default that path) plus the
     code-derived companions `pipeline-map.html` (pan/zoom flowchart) and `pipeline-map.md`."""
     dest = Path(out) if out else _DEFAULT_OUT

@@ -87,17 +87,36 @@ def _run(args: argparse.Namespace) -> int:
     runconfig.apply(resolved)
 
     from pipt.core.orchestrator import orchestrate  # noqa: PLC0415 — must follow runconfig.apply()
+    from pipt.core.paths import Activity  # noqa: PLC0415
     from pipt.pipelines import load_pipeline  # noqa: PLC0415 — (constants read PIPT_* at import)
 
+    pipeline = load_pipeline(args.pipeline)
     base, failures = orchestrate(
-        load_pipeline(args.pipeline), args.activity, args.scope, root=args.root,
+        pipeline, args.activity, args.scope, root=args.root,
         resume=args.resume, observe=args.observe,
     )
     runconfig.snapshot(Path(base), resolved)  # reproducibility: effective knobs next to the run
     print(base)  # noqa: T201
     if failures < 0:
         return 130  # interrupted (SIGINT) — partial results saved; resume with --resume
-    return 1 if failures else 0  # non-zero exit when any stage failed (CI/automation signal)
+    exit_code = 1 if failures else 0  # non-zero exit when any stage failed (CI/automation signal)
+
+    # Pipeline COMPOSITION: run any follow-on pipelines this one declares (e.g. internal → webscan on the
+    # aggregated web services), each as a SEPARATE top-level run nested under this activity's dir — NOT a
+    # nested Prefect subflow. Duck-typed like consolidate/preflight; absent by default.
+    get_followups = getattr(pipeline, "followups", None)
+    if callable(get_followups):
+        for fu in get_followups(Activity(Path(base))):
+            fu_base, fu_failures = orchestrate(
+                load_pipeline(fu.pipeline), fu.activity, fu.scope, root=str(base),
+                resume=args.resume, observe=args.observe,
+            )
+            runconfig.snapshot(Path(fu_base), resolved)
+            print(fu_base)  # noqa: T201
+            if fu_failures < 0:
+                return 130
+            exit_code = exit_code or (1 if fu_failures else 0)
+    return exit_code
 
 
 if __name__ == "__main__":

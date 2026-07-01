@@ -1,11 +1,11 @@
 from pipt.core import flowmap, mermaidmap
-from pipt.pipelines.recon import flowmeta
-from pipt.pipelines.recon.pipeline import PIPELINE
+from pipt.pipelines.external import flowmeta
+from pipt.pipelines.external.pipeline import PIPELINE
 
 
 def test_flowmeta_covers_every_stage():
     """The dev gate's guard against a stale map: every Stage MUST have a StepMeta. If this fails,
-    add the new step to FLOWMETA in pipelines/recon/flowmeta.py."""
+    add the new step to FLOWMETA in pipelines/external/flowmeta.py."""
     missing = [s.name for s in PIPELINE.stages if s.name not in flowmeta.FLOWMETA]
     assert missing == []
 
@@ -43,7 +43,7 @@ def test_main_writes_file(tmp_path):
     flowmeta.main(str(dest))
     text = dest.read_text(encoding="utf-8")
     assert "content_discovery" in text
-    assert "pipt · pipeline recon" in text
+    assert "pipt · pipeline external" in text
 
 
 def test_main_also_writes_concept_maps(tmp_path):

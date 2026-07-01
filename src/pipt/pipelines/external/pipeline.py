@@ -1,4 +1,4 @@
-"""The recon Pipeline object (real ProjectDiscovery toolchain), as a dependency DAG."""
+"""The external Pipeline object (real ProjectDiscovery toolchain), as a dependency DAG."""
 
 from __future__ import annotations
 
@@ -7,14 +7,14 @@ from typing import TYPE_CHECKING
 
 from pipt.core.agent import HypothesisProvider, StubProvider
 from pipt.core.stage import Stage
-from pipt.pipelines.recon import tasks
+from pipt.pipelines.external import tasks
 
 if TYPE_CHECKING:
     from pipt.core.paths import Activity
 
 
-class ReconPipeline:
-    name = "recon"
+class ExternalPipeline:
+    name = "external"
     stages: Sequence[Stage] = (
         # activity scope (whole-scope asset discovery)
         Stage("provision_wl", tasks.provision_wl, net=False),  # wordlist roles → wl_global/ (offline, ∥)
@@ -109,4 +109,4 @@ class ReconPipeline:
         tasks.preflight()
 
 
-PIPELINE = ReconPipeline()
+PIPELINE = ExternalPipeline()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from pipt.core.agent import HypothesisProvider
@@ -57,6 +57,22 @@ class Stage:
     global network-concurrency cap (``_NET_SLOTS``); set ``net=False`` for purely offline stages
     (wordlist tokenisation, response-store mining, wordlist provisioning) so they neither claim a
     network slot nor get the ``net`` tag."""
+
+
+class Followup(NamedTuple):
+    """A chained pipeline run a Pipeline can request AFTER its own run finishes — pipeline composition.
+
+    The CLI runs each Followup as a SEPARATE top-level ``orchestrate()`` (a sub-activity nested under the
+    parent activity dir), NOT as a nested Prefect subflow — so every pipeline stays a clean top-level flow
+    with its own task-runner/teardown, and the files-as-only-state invariant holds (the parent hands off
+    via an on-disk scope artifact it wrote). Same DUCK-TYPED convention as ``consolidate``/``preflight``:
+    a Pipeline MAY define ``followups(self, activity) -> list[Followup]``; it's read via ``getattr`` and
+    absent by default, so it stays off the Protocol and the core stays pipeline-agnostic.
+    """
+
+    pipeline: str   # a registered pipeline name (resolved with load_pipeline)
+    activity: str   # sub-activity name, nested under the parent activity's dir
+    scope: str      # path to the scope file the parent wrote (the hand-off artifact)
 
 
 class Pipeline(Protocol):
