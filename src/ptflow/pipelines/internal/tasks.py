@@ -16,14 +16,24 @@ the fan-out unit is a **scope subnet**, not a web app:
     fingerprint — nerva over the group's ip:port set (nmap -sV is the drop-in alternative)
                                                                     → scans/<subnet>/services.jsonl
 
-  LOOP 2 — low-hanging fruit (per-subnet, gated on the service found in loop 1)
-    cve_lookup  — search_vulns over the service banners (OFFLINE)  → findings/cve.jsonl
-    smb_checks  — netexec: signing / null-session / guest          → findings/smb.jsonl
-    snmp_checks — onesixtyone: default community strings           → findings/snmp.jsonl
-    ldap_checks — ldapsearch: anonymous bind                       → findings/ldap.jsonl
-    nuclei_net  — nuclei network templates                         → findings/nuclei_net.jsonl
+  nuclei_scope — SPANNING (whole-scope): full-template nuclei over every discovered socket, ONE
+                 rate-controlled process ∥ the loops → <activity>/findings/nuclei_scope.jsonl.
+
+  LOOP 2 — low-hanging fruit (per-subnet, gated on the ports found in the breadth scan; all ∥,
+           best-effort, NON-destructive — no credentialed/brute-force checks, those are opt-in/future)
+    cve_lookup     — search_vulns over the service banners (OFFLINE)   → findings/cve.jsonl
+    smb_checks     — netexec: signing / null-session / guest           → findings/smb.jsonl
+    snmp_checks    — onesixtyone: default community strings            → findings/snmp.jsonl
+    ldap_checks    — ldapsearch: anonymous bind                        → findings/ldap.jsonl
+    ftp_checks     — netexec: anonymous FTP login                      → findings/ftp.jsonl
+    telnet_checks  — nmap -sV: exposed cleartext telnet + banner       → findings/telnet.jsonl
+    nfs_checks     — showmount -e: anonymously-readable NFS exports    → findings/nfs.jsonl
+    rsync_checks   — rsync ://host/: anonymous rsync modules           → findings/rsync.jsonl
+    remote_desktop — scrying: RDP/VNC screenshots of exposed services  → findings/remote_desktop.jsonl
+                     (+ scans/<subnet>/screenshots/*.png)
 
   consolidate — lift the per-subnet findings/<type>.jsonl to the activity level, one file per type.
+                (nuclei_scope is already an activity-level finding and is left untouched.)
 
 Every tool output is written ONCE (raw/<tool>/ for provenance, canonical name for a downstream-read
 artifact). The loop-2 checks are BEST-EFFORT: a gated-out port, a missing binary, or a tool error
@@ -81,21 +91,28 @@ NXC = _resolve("PTFLOW_NETEXEC", f"{_HOME}/.local/bin/nxc", "nxc")
 SEARCH_VULNS = _resolve("PTFLOW_SEARCH_VULNS", f"{_HOME}/.local/bin/search_vulns", "search_vulns")
 ONESIXTYONE = _resolve("PTFLOW_ONESIXTYONE", "onesixtyone")
 LDAPSEARCH = _resolve("PTFLOW_LDAPSEARCH", "ldapsearch")
+SCRYING = _resolve("PTFLOW_SCRYING", "scrying")                          # RDP/VNC screenshotter
+RSYNC = _resolve("PTFLOW_RSYNC", "rsync")
+SHOWMOUNT = _resolve("PTFLOW_SHOWMOUNT", "/usr/sbin/showmount", "showmount")  # nfs-utils (often /usr/sbin)
 
 _CORE_TOOLS = {"mapcidr": MAPCIDR, "naabu": NAABU, "nmap": NMAP, "nerva": NERVA}
 _OPTIONAL_TOOLS = {"nuclei": NUCLEI, "netexec": NXC, "search_vulns": SEARCH_VULNS,
-                   "onesixtyone": ONESIXTYONE, "ldapsearch": LDAPSEARCH}
+                   "onesixtyone": ONESIXTYONE, "ldapsearch": LDAPSEARCH,
+                   "scrying": SCRYING, "rsync": RSYNC, "showmount": SHOWMOUNT}
 
 # --- tunables (rates conservative for live internal infra — legacy/OT gear is fragile) -----------
 # Aggregate load ~= concurrency x rate; a full connect-scan flood can knock over old devices and
 # saturate a switch, so one global rate-controlled sweep (breadth) beats N per-subnet floods.
 _HOME_NAABU = ("300", "20")   # (rate pkts/s, concurrency) — gentle for a domestic/constrained line
 _WIDE_NAABU = ("1000", "50")  # real bandwidth
-NAABU_RATE, NAABU_CONC = (
-    _HOME_NAABU if os.environ.get("PTFLOW_PROFILE", "").lower().strip() == "home" else _WIDE_NAABU)
+_IS_HOME = os.environ.get("PTFLOW_PROFILE", "").lower().strip() == "home"
+NAABU_RATE, NAABU_CONC = _HOME_NAABU if _IS_HOME else _WIDE_NAABU
+NUCLEI_RL = "50" if _IS_HOME else "150"   # whole-scope nuclei -rl (req/s, global) — profile-driven,
+                                          # same lever as external: gentler on fragile internal gear
 
 CHECK_TIMEOUT = 300   # per-invocation wall-clock cap (s) for the bounded loop-2 checks (a slow host
                       # must not hang the per-subnet chain; the long breadth scans stay timeout-free)
+SCRYING_TIMEOUT = 600  # one scrying run screenshots all a subnet's RDP/VNC sockets — give it headroom
 CVE_TOOL_TIMEOUT = 90
 _CVE_DESC_MAX = 300
 
@@ -115,6 +132,13 @@ INTERNAL_PORTS = (
 PORT_SMB = 445
 PORT_LDAP = 389
 PORT_LDAPS = 636
+PORT_FTP = 21
+PORT_TELNET = 23
+PORT_NFS = 2049
+PORT_RSYNC = 873
+PORT_RDP = 3389
+VNC_PORTS = frozenset(range(5900, 5907))          # VNC displays :0-:6 (5900-5906)
+_RD_PORTS = frozenset({PORT_RDP}) | VNC_PORTS     # remote-desktop sockets scrying screenshots
 
 # Web-service detection for the external hand-off (aggregate_web_targets). A socket is a web target if its
 # port is a known HTTP(S) port OR nerva's banner says http; the scheme is https for the TLS ports / a
@@ -361,6 +385,97 @@ def parse_nxc_smb(out: str) -> list[dict]:
     return findings
 
 
+# netexec ftp lines are "FTP  <ip>  21  <host>  <message>"; a '[+]' message = anon login succeeded.
+_NXC_FTP_LINE = re.compile(r"^FTP\s+(\S+)\s+\d+\s+\S+\s+(.*)$")
+
+
+def parse_nxc_ftp(out: str) -> list[dict]:
+    """netexec ftp output → anonymous-FTP findings (pure). We only try `-u anonymous -p ''`, so a
+    '[+]' line on an FTP host means the anonymous login succeeded → one 'ftp-anonymous' finding per
+    host. '[-]' failures and '[*]' banner lines are ignored."""
+    findings: list[dict] = []
+    for raw in out.splitlines():
+        m = _NXC_FTP_LINE.match(raw.strip())
+        if m and m.group(2).strip().startswith("[+]"):
+            findings.append({"type": "ftp-anonymous", "severity": "medium",
+                             "host": m.group(1), "evidence": m.group(2).strip()})
+    return findings
+
+
+def parse_showmount(out: str, host: str) -> list[dict]:
+    """showmount -e output → NFS export findings (pure). A real export line is '<path> <clients>' (the
+    path starts with '/'); the 'Export list for …' header and 'clnt_create: RPC …' error lines are
+    skipped. A world-readable export (clients '*'/'0.0.0.0', or none shown) is HIGH, a scoped one MEDIUM."""
+    findings: list[dict] = []
+    for raw in out.splitlines():
+        line = raw.strip()
+        if not line.startswith("/"):
+            continue
+        path, _, clients = line.partition(" ")
+        clients = clients.strip()
+        world = not clients or "*" in clients or "0.0.0.0/0" in clients
+        findings.append({"type": "nfs-export", "severity": "high" if world else "medium",
+                         "host": host, "export": path, "clients": clients or "*", "evidence": line})
+    return findings
+
+
+def parse_rsync_modules(out: str, host: str) -> list[dict]:
+    """`rsync rsync://host/` module listing → anonymous rsync-module findings (pure). Each line is
+    '<module><whitespace><comment>'; '@ERROR'/'rsync: …' status lines are skipped. Anonymously
+    listable modules frequently expose a filesystem tree to unauthenticated readers."""
+    findings: list[dict] = []
+    for raw in out.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("@") or line.lower().startswith("rsync"):
+            continue
+        parts = line.split(None, 1)
+        module = parts[0]
+        findings.append({"type": "rsync-module", "severity": "medium", "host": host,
+                         "module": module, "comment": parts[1].strip() if len(parts) > 1 else "",
+                         "evidence": line})
+    return findings
+
+
+def parse_telnet(grepable: str) -> list[dict]:
+    """nmap '-sV -p23 -oG -' output → telnet-exposed findings (pure). A Host line whose Ports field
+    carries '23/open/tcp' is exposed cleartext telnet — a finding on its own (credentials travel in
+    the clear); the version token from the grepable field (`23/open/tcp//telnet//<banner>/`) is kept
+    as evidence."""
+    findings: list[dict] = []
+    for line in grepable.splitlines():
+        if not line.startswith("Host:") or "Ports:" not in line:
+            continue
+        ip = line.split()[1]
+        for entry in line.split("Ports:", 1)[1].split(","):
+            fields = entry.strip().split("/")
+            if len(fields) >= 7 and fields[0] == str(PORT_TELNET) and fields[1] == "open":  # noqa: PLR2004
+                banner = fields[6] or fields[4] or "telnet"
+                findings.append({"type": "telnet-exposed", "severity": "medium",
+                                 "host": ip, "evidence": f"telnet open — {banner}"})
+    return findings
+
+
+_SCRYING_PNG = re.compile(r"^(?P<host>.+)-(?P<port>\d+)\.png$")
+_RD_SEVERITY = {"vnc": "high", "rdp": "info"}   # a captured VNC desktop ⇒ reachable; RDP login = recon
+
+
+def parse_scrying(pngs: list[Path]) -> list[dict]:
+    """scrying's captured PNGs → RDP/VNC screenshot findings (pure). Each png lives under
+    <out>/<proto>/<host>-<port>.png; only rdp/vnc are kept (web is screenshotted elsewhere). A captured
+    VNC framebuffer usually means the desktop is reachable without auth (HIGH); an RDP login screen is a
+    recon/exposure artifact (info). `screenshot` is the source png path — the stage re-homes it."""
+    findings: list[dict] = []
+    for png in pngs:
+        proto = png.parent.name
+        m = _SCRYING_PNG.match(png.name)
+        if proto not in _RD_SEVERITY or not m:
+            continue
+        findings.append({"type": f"{proto}-screenshot", "severity": _RD_SEVERITY[proto],
+                         "host": m.group("host"), "port": int(m.group("port")),
+                         "protocol": proto, "screenshot": str(png)})
+    return findings
+
+
 # --- breadth stages (activity scope) -------------------------------------------------------------
 def _raw(activity: Activity, tool: str, label: str) -> Path:
     return activity.asset_discovery_raw(tool) / f"{label}.txt"
@@ -412,6 +527,28 @@ def portscan(activity: Activity) -> None:
              len(records), len({r["ip"] for r in records}))
 
 
+# --- spanning (whole-scope) — full-template nuclei ∥ the per-subnet loops ------------------------
+def nuclei_scope(activity: Activity) -> None:
+    """SPANNING (whole-scope) — full-template nuclei over every discovered socket. ONE process with a
+    single global rate cap (-rl) — the internal pipeline's own principle (one gentle global sweep beats
+    N per-subnet floods on fragile legacy/OT gear), and the analog of external's nuclei_scope. Runs ∥
+    cluster + all per-subnet loops, joined at the fan-in → <activity>/findings/nuclei_scope.jsonl.
+    Best-effort: skips if nuclei is absent. Full templates subsume the old per-subnet network-tag scan."""
+    ports = tools.read_jsonl(activity.asset_discovery_canonical("ports.jsonl"))
+    targets = tools.dedupe(f"{r['ip']}:{r['port']}" for r in ports if r.get("ip") and r.get("port"))
+    if not targets or shutil.which(NUCLEI) is None:
+        log.debug("  · skip nuclei_scope (no sockets / nuclei absent)")
+        return
+    try:  # best-effort template update — skips cleanly on an air-gapped internal network
+        tools.run([NUCLEI, "-ut"], stream_stderr=is_verbose(), timeout=CHECK_TIMEOUT)
+    except (OSError, subprocess.SubprocessError, tools.AbortedError) as exc:
+        log.debug("  · nuclei -ut skipped: %s", exc)
+    out = _run([NUCLEI, "-silent", "-duc", "-j", "-stats", "-rl", NUCLEI_RL],
+               stdin="\n".join(targets), dest=activity.findings / "nuclei_scope.jsonl",
+               label="nuclei_scope")
+    log.info("  → nuclei_scope — %d finding(s) over %d socket(s)", len(_jsonl(out)), len(targets))
+
+
 # --- cluster (fan-out pivot) — partition live hosts by scope subnet ------------------------------
 def cluster(activity: Activity) -> list[str]:
     """Group live hosts by the scope entry that contains them → scans/<subnet_slug>/. Writes each
@@ -446,6 +583,13 @@ def _host_ports(ws: AppWorkspace) -> list[str]:
     """The group's open sockets as 'ip:port' lines (fingerprint / nuclei input)."""
     return [f"{r['ip']}:{r['port']}" for r in tools.read_jsonl(ws.canonical("ports.jsonl"))
             if r.get("ip") and r.get("port")]
+
+
+def _sockets_with_ports(ws: AppWorkspace, ports: frozenset[int]) -> list[tuple[str, int]]:
+    """The group's open sockets whose port ∈ `ports`, as sorted (ip, port) tuples."""
+    return sorted({(str(r["ip"]), int(r["port"]))
+                   for r in tools.read_jsonl(ws.canonical("ports.jsonl"))
+                   if r.get("ip") and isinstance(r.get("port"), int) and r["port"] in ports})
 
 
 def _run(cmd: list[str], *, stdin: str, dest: Path, label: str) -> str:
@@ -591,19 +735,104 @@ def ldap_checks(activity: Activity, app_id: str) -> None:
     log.info("  → ldap_checks [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
 
 
-def nuclei_net(activity: Activity, app_id: str) -> None:
-    """LOOP 2 — nuclei network/default-login templates over the group's open sockets → findings/
-    nuclei_net.jsonl. Best-effort (skips if nuclei absent)."""
+def ftp_checks(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — anonymous-FTP login via netexec on hosts with 21 open (`-u anonymous -p ''`). A '[+]'
+    success is a finding. Best-effort → findings/ftp.jsonl."""
     ws = activity.app(app_id)
-    sockets = _host_ports(ws)
-    if not sockets or shutil.which(NUCLEI) is None:
-        log.debug("  · skip nuclei_net [%s] (no sockets / nuclei absent)", app_id)
+    hosts = _hosts_with_port(ws, PORT_FTP)
+    if not hosts or shutil.which(NXC) is None:
+        log.debug("  · skip ftp_checks [%s] (no 21 / netexec absent)", app_id)
         return
-    out = _run([NUCLEI, "-silent", "-duc", "-j", "-tags", "network,default-login"],
-               stdin="\n".join(sockets), dest=ws.raw("nuclei") / "net.jsonl", label="nuclei_net")
-    findings = _jsonl(out)
-    tools.write_jsonl(ws.findings / "nuclei_net.jsonl", findings)
-    log.info("  → nuclei_net [%s] — %d finding(s)", app_id, len(findings))
+    out = _capture([NXC, "ftp", *hosts, "-u", "anonymous", "-p", ""],
+                   dest=ws.raw("netexec") / "ftp.txt", label="ftp")
+    findings = parse_nxc_ftp(out)
+    tools.write_jsonl(ws.findings / "ftp.jsonl", findings)
+    log.info("  → ftp_checks [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
+
+
+def telnet_checks(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — exposed cleartext telnet on hosts with 23 open (nmap -sV for the banner). An open
+    telnet port is a finding on its own (credentials travel in the clear). Best-effort → findings/
+    telnet.jsonl. NOTE: reliable no-auth detection needs a login attempt (opt-in/future); v1 reports
+    the exposure + banner."""
+    ws = activity.app(app_id)
+    hosts = _hosts_with_port(ws, PORT_TELNET)
+    if not hosts or shutil.which(NMAP) is None:
+        log.debug("  · skip telnet_checks [%s] (no 23 / nmap absent)", app_id)
+        return
+    out = _capture([NMAP, "-Pn", "-n", "-sV", "-p", str(PORT_TELNET), "-oG", "-", *hosts],
+                   dest=ws.raw("nmap") / "telnet.txt", label="telnet")
+    findings = parse_telnet(out)
+    tools.write_jsonl(ws.findings / "telnet.jsonl", findings)
+    log.info("  → telnet_checks [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
+
+
+def nfs_checks(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — anonymously-readable NFS exports via showmount -e on hosts with 2049 open. A
+    world-readable export is high-value LHF (backups/home dirs). Best-effort → findings/nfs.jsonl."""
+    ws = activity.app(app_id)
+    hosts = _hosts_with_port(ws, PORT_NFS)
+    if not hosts or shutil.which(SHOWMOUNT) is None:
+        log.debug("  · skip nfs_checks [%s] (no 2049 / showmount absent)", app_id)
+        return
+    findings: list[dict] = []
+    for host in hosts:
+        out = _capture([SHOWMOUNT, "-e", host], dest=ws.raw("showmount") / f"{host}.txt", label="nfs")
+        findings += parse_showmount(out, host)
+    tools.write_jsonl(ws.findings / "nfs.jsonl", findings)
+    log.info("  → nfs_checks [%s] — %d host(s) → %d export(s)", app_id, len(hosts), len(findings))
+
+
+def rsync_checks(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — anonymous rsync modules via `rsync rsync://host/` on hosts with 873 open. Anonymously
+    listable modules often expose a filesystem tree. Best-effort → findings/rsync.jsonl."""
+    ws = activity.app(app_id)
+    hosts = _hosts_with_port(ws, PORT_RSYNC)
+    if not hosts or shutil.which(RSYNC) is None:
+        log.debug("  · skip rsync_checks [%s] (no 873 / rsync absent)", app_id)
+        return
+    findings: list[dict] = []
+    for host in hosts:
+        out = _capture([RSYNC, "--contimeout=10", f"rsync://{host}/"],
+                       dest=ws.raw("rsync") / f"{host}.txt", label="rsync")
+        findings += parse_rsync_modules(out, host)
+    tools.write_jsonl(ws.findings / "rsync.jsonl", findings)
+    log.info("  → rsync_checks [%s] — %d host(s) → %d module(s)", app_id, len(hosts), len(findings))
+
+
+def remote_desktop(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — screenshot exposed RDP/VNC with scrying (no credentials). One scrying run over the
+    group's RDP (3389) + VNC (5900-5906) sockets captures each exposed login screen / desktop; a
+    captured VNC framebuffer usually means the desktop is reachable without auth. The shots are
+    re-homed to scans/<subnet>/screenshots/ and referenced from findings/remote_desktop.jsonl.
+    Best-effort → skips if scrying is absent or the group has no RDP/VNC socket."""
+    from pathlib import Path  # noqa: PLC0415 — local so the module keeps no path literal at import
+
+    ws = activity.app(app_id)
+    sockets = _sockets_with_ports(ws, _RD_PORTS)
+    if not sockets or shutil.which(SCRYING) is None:
+        log.debug("  · skip remote_desktop [%s] (no RDP/VNC / scrying absent)", app_id)
+        return
+    outdir = ws.raw("scrying")
+    outdir.mkdir(parents=True, exist_ok=True)
+    targets = [f"{'rdp' if port == PORT_RDP else 'vnc'}://{ip}:{port}" for ip, port in sockets]
+    tfile = outdir / "targets.txt"
+    tools.write_lines(tfile, targets)
+    try:
+        tools.run([SCRYING, "-f", str(tfile), "-o", str(outdir), "--silent", "--disable-report"],
+                  timeout=SCRYING_TIMEOUT, stream_stderr=is_verbose())
+    except (OSError, subprocess.SubprocessError, tools.AbortedError) as exc:
+        log.debug("  · remote_desktop [%s] scrying failed: %s", app_id, exc)
+    findings = parse_scrying(sorted(outdir.glob("*/*.png")))
+    shots = ws.root / "screenshots"
+    for f in findings:  # re-home each capture next to the group's data, path relative to the activity
+        dst = shots / f"{f['protocol']}-{f['host']}-{f['port']}.png"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(f["screenshot"]), dst)
+        f["screenshot"] = str(dst.relative_to(activity.base))
+    tools.write_jsonl(ws.findings / "remote_desktop.jsonl", findings)
+    log.info("  → remote_desktop [%s] — %d RDP/VNC socket(s) → %d screenshot(s)",
+             app_id, len(sockets), len(findings))
 
 
 # --- consolidate (terminal fan-in) ---------------------------------------------------------------
@@ -612,8 +841,13 @@ _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "smb.jsonl": ("findings/smb.jsonl",),
     "snmp.jsonl": ("findings/snmp.jsonl",),
     "ldap.jsonl": ("findings/ldap.jsonl",),
-    "nuclei_net.jsonl": ("findings/nuclei_net.jsonl",),
+    "ftp.jsonl": ("findings/ftp.jsonl",),
+    "telnet.jsonl": ("findings/telnet.jsonl",),
+    "nfs.jsonl": ("findings/nfs.jsonl",),
+    "rsync.jsonl": ("findings/rsync.jsonl",),
+    "remote_desktop.jsonl": ("findings/remote_desktop.jsonl",),
 }
+# nuclei_scope is written whole-scope at the activity level (like external) — not lifted here.
 
 
 def aggregate_web_targets(activity: Activity) -> list[str]:

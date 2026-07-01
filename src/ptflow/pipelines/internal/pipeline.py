@@ -23,15 +23,23 @@ class InternalPipeline:
         Stage("expand", tasks.expand, net=False),           # mapcidr: CIDR → candidate IPs (offline transform)
         Stage("discover", tasks.discover, needs=("expand",)),   # nmap -sn: live hosts
         Stage("portscan", tasks.portscan, needs=("discover",)),  # naabu: open internal-service ports
+        # whole-scope full-template nuclei — SPANNING: ONE rate-controlled process ∥ cluster + all
+        # per-subnet loops, joined at the fan-in (gentler than per-subnet on fragile legacy/OT gear).
+        Stage("nuclei_scope", tasks.nuclei_scope, needs=("portscan",), spanning=True),
         # LOOP 1 — service inventory (per-subnet)
         Stage("fingerprint", tasks.fingerprint, per_app=True, phase=1),
-        # LOOP 2 — low-hanging fruit (per-subnet), gated on the loop-1 service inventory. All ∥ (no
-        # cross-needs): cve_lookup is OFFLINE (net=False); the rest are best-effort network checks.
+        # LOOP 2 — low-hanging fruit (per-subnet), gated on the ports found in the breadth scan. All ∥
+        # (no cross-needs), best-effort, NON-destructive: cve_lookup is OFFLINE (net=False); the rest are
+        # anonymous/no-auth checks + RDP/VNC screenshots (credentialed/brute-force checks are future).
         Stage("cve_lookup", tasks.cve_lookup, per_app=True, phase=2, net=False),
         Stage("smb_checks", tasks.smb_checks, per_app=True, phase=2),
         Stage("snmp_checks", tasks.snmp_checks, per_app=True, phase=2),
         Stage("ldap_checks", tasks.ldap_checks, per_app=True, phase=2),
-        Stage("nuclei_net", tasks.nuclei_net, per_app=True, phase=2),
+        Stage("ftp_checks", tasks.ftp_checks, per_app=True, phase=2),
+        Stage("telnet_checks", tasks.telnet_checks, per_app=True, phase=2),
+        Stage("nfs_checks", tasks.nfs_checks, per_app=True, phase=2),
+        Stage("rsync_checks", tasks.rsync_checks, per_app=True, phase=2),
+        Stage("remote_desktop", tasks.remote_desktop, per_app=True, phase=2),
     )
 
     def cluster(self, activity: Activity) -> list[str]:
