@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from pipt.core.paths import Activity
-from pipt.pipelines.recon import wordlists
+from pipt.pipelines.external import wordlists
 
 
 def test_search_dirs_prepends_env_and_filters_missing(tmp_path, monkeypatch):

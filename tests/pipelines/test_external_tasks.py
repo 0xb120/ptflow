@@ -1,7 +1,7 @@
 import json
 
 from pipt.core.scope import Target
-from pipt.pipelines.recon import tasks
+from pipt.pipelines.external import tasks
 
 
 def test_extract_bodies_skips_missing_indexed_file(tmp_path):
@@ -179,9 +179,9 @@ def test_select_unique_webapps_dedups_by_signature():
 
 
 def test_pipeline_object_shape():
-    from pipt.pipelines.recon.pipeline import PIPELINE
+    from pipt.pipelines.external.pipeline import PIPELINE
 
-    assert PIPELINE.name == "recon"
+    assert PIPELINE.name == "external"
     activity = [s.name for s in PIPELINE.stages
                 if not s.per_app and not s.spanning and not s.cluster_scope]
     spanning = [s.name for s in PIPELINE.stages if s.spanning]
@@ -223,7 +223,7 @@ def test_pipeline_object_shape():
 def test_pipeline_phase_wiring():
     """The 4-phase surface-first/DAST-first per-app model: phase numbers + intra-phase `needs`
     (cross-phase ordering is the barrier, never `needs`)."""
-    from pipt.pipelines.recon.pipeline import PIPELINE
+    from pipt.pipelines.external.pipeline import PIPELINE
 
     by_name = {s.name: s for s in PIPELINE.stages}
     # PHASE 1 = explorable surface (OSINT + crawl, NO guessing): crawl/headless + delta fetch + offline
@@ -1752,9 +1752,9 @@ def test_consolidate_no_findings_returns_empty(tmp_path):
     assert tasks.consolidate(act) == {}
 
 
-def test_recon_pipeline_exposes_consolidate(tmp_path):
+def test_external_pipeline_exposes_consolidate(tmp_path):
     from pipt.core.paths import Activity
-    from pipt.pipelines.recon.pipeline import PIPELINE
+    from pipt.pipelines.external.pipeline import PIPELINE
 
     act = Activity.named("demo", root=tmp_path).ensure()
     act.app("app-1").ensure()

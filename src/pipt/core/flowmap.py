@@ -3,14 +3,14 @@
 The STRUCTURE (bands, phases, parallelism, barriers) is DERIVED from the Stage objects
 (`name`/`needs`/`phase`/`per_app`/`spanning`) via longest-path layering — stages at the same
 dependency depth within a scope run in parallel and render side by side. Per-step prose, commands
-and outputs come from a caller-supplied `StepMeta` table (see `pipelines/recon/flowmeta.py`).
+and outputs come from a caller-supplied `StepMeta` table (see `pipelines/external/flowmeta.py`).
 
 Output is DETERMINISTIC (no timestamps) so a git diff of the rendered file tracks exactly how the
 flow changed. A test (`tests/pipelines/test_flowmap.py`) asserts every Stage has a `StepMeta`, so a
 newly added step can't silently drift out of the map — the dev gate fails until it's documented.
 
 No pipeline is imported here: the renderer depends only on the `Stage` attributes + `StepMeta`, so
-it stays generic. The recon entrypoint wires `PIPELINE` + its metadata and writes the file.
+it stays generic. The external pipeline entrypoint wires `PIPELINE` + its metadata and writes the file.
 """
 
 from __future__ import annotations
@@ -274,7 +274,7 @@ _DOC = """<!doctype html>
 </div>
 </header>
 {body}
-<footer>generato da <b>pipt.pipelines.recon.flowmeta</b> · non modificare a mano · struttura derivata dagli Stage objects</footer>
+<footer>generato da <b>pipt.pipelines.external.flowmeta</b> · non modificare a mano · struttura derivata dagli Stage objects</footer>
 </div>
 </body>
 </html>

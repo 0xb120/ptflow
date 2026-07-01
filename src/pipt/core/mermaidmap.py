@@ -231,7 +231,7 @@ def render_markdown(stages: Sequence[Stage], spec: MapSpec) -> str:
 
 _MD = """# __TITLE__ — mappa concettuale (flowchart)
 
-> **Auto-generata** da `pipt.pipelines.recon.flowmeta` — **non modificare a mano**: un hook la
+> **Auto-generata** da `pipt.pipelines.external.flowmeta` — **non modificare a mano**: un hook la
 > rigenera a ogni modifica sotto `src/pipt/pipelines/`, quindi i comandi e l'ordine qui sotto
 > seguono il codice. Versione interattiva pan/zoom: [`pipeline-map.html`](pipeline-map.html).
 > Spec dettagliata per-step (summary/output/note): [`pipeline-flow.html`](pipeline-flow.html).
@@ -247,7 +247,7 @@ _HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__ · mappa</title>
-<!-- AUTO-GENERATA da pipt.pipelines.recon.flowmeta — non modificare a mano (un hook la rigenera).
+<!-- AUTO-GENERATA da pipt.pipelines.external.flowmeta — non modificare a mano (un hook la rigenera).
      Unica dipendenza esterna: mermaid via CDN (serve connessione quando apri il file). -->
 <style>
   :root { --bg:#0f1419; --panel:#161b22; --ink:#e6edf3; --muted:#9aa7b4; --line:#2a3340;
@@ -317,7 +317,7 @@ mermaid.initialize({
 const diagram = document.getElementById('diagram');
 const canvas = document.getElementById('canvas');
 try {
-  const { svg } = await mermaid.render('reconGraph', graph);
+  const { svg } = await mermaid.render('externalGraph', graph);
   diagram.innerHTML = svg;
 } catch (e) {
   diagram.innerHTML = '<div class="loading">Errore nel rendering Mermaid: ' + e + '</div>';

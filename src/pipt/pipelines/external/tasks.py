@@ -32,7 +32,7 @@ from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urljoin, u
 
 from pipt.core import scope, tools, workspace
 from pipt.core.log import get_logger, is_verbose
-from pipt.pipelines.recon import wordlists
+from pipt.pipelines.external import wordlists
 
 if TYPE_CHECKING:
     from pipt.core.paths import Activity, AppWorkspace
@@ -1824,6 +1824,32 @@ def httpx_fingerprint(activity: Activity) -> None:
         log.info("  → scope: excluded %d raw-IP CDN/cloud target(s) (hostnames kept) → excluded_cdn.jsonl",
                  len(dropped))
     tools.write_lines(canon("unique_webapps.txt"), select_unique_webapps(kept))
+
+
+def ingest_httpx(activity: Activity) -> None:
+    """WEB-MODE breadth entry (the `webscan` pipeline) — fingerprint a PRE-AGGREGATED web target list,
+    skipping ALL scope expansion (subdomain/DNS/TLS OSINT) and active network scan (portscan/nerva/
+    whole-scope nuclei). Reads the scope URLs verbatim (scheme://host[:port]) and probes them with httpx
+    honouring the input scheme via ``-nfs`` — so an explicit http/https + port from the hand-off is
+    respected (unlike the discovery fingerprint, which defaults to https). Produces the SAME
+    httpx_full_metadata.jsonl + unique_webapps.txt that ``cluster()`` and the per-app depth loops consume,
+    so the rest of the external pipeline runs unchanged on top of it. Every in-scope host is treated as
+    in-scope for the CDN filter (these ARE the chosen targets), so nothing is dropped."""
+    canon = activity.asset_discovery_canonical
+    targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8", errors="replace"))
+    tools.write_lines(activity.scope_urls, [t.raw for t in targets if t.kind == "url"])
+    out = _run(
+        "httpx",
+        [HTTPX, "-silent", "-nfs", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
+         "-favicon", "-location", "-fr", "-irh", "-j"],
+        stdin="\n".join(t.raw for t in targets),
+        dest=activity.asset_discovery_raw("httpx") / "ingest.jsonl", label="ingest",
+    )
+    records = _jsonl_str(out)
+    kept, _ = split_cdn_ip_records(records, {t.normalized for t in targets})  # all targets are in-scope
+    tools.write_jsonl(canon("httpx_full_metadata.jsonl"), kept)
+    tools.write_lines(canon("unique_webapps.txt"), select_unique_webapps(kept))
+    log.info("  → ingest — %d target(s) → %d live web app(s)", len(targets), len(kept))
 
 
 def nerva_fingerprint(activity: Activity) -> None:

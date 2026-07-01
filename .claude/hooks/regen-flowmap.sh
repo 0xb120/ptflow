@@ -13,5 +13,5 @@ esac
 
 root="${CLAUDE_PROJECT_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}"
 cd "$root" 2>/dev/null || exit 0
-uv run python -m pipt.pipelines.recon.flowmeta >/dev/null 2>&1 || true
+uv run python -m pipt.pipelines.external.flowmeta >/dev/null 2>&1 || true
 exit 0

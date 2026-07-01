@@ -1,0 +1,87 @@
+"""The `webscan` Pipeline — external's web-DEPTH loops over a PRE-AGGREGATED web target list.
+
+This is the dedicated "external profile" the internal pipeline hands off to (via `Followup`): it takes an
+already-known list of web services (`scheme://host[:port]`, e.g. `<internal-activity>/web_targets.txt`)
+and runs external's crawl → catalog → DAST → fuzz depth on them, **skipping**:
+  - scope EXPANSION — `expand`/`resolve` (subdomain/DNS/TLS/OSINT enumeration);
+  - active NETWORK scan — `portscan`/`portscan_full`/`nerva`/`nuclei_scope`;
+  - per-app OSINT — `passive_probe`/`subenum`/`takeover`/`fetch_delta` (gau/urlfinder/subfinder/DNS).
+
+It reuses external's task functions unchanged — only the breadth is replaced by a single `ingest` step
+(httpx over the target list, honouring the input scheme) and the stage graph is curated. Dropped stages'
+artifacts are simply absent; external's tolerant reads (`read_lines`/`read_jsonl` → `[]`) degrade cleanly,
+so the depth loops run without them. external itself is untouched.
+
+Egress note: with the OSINT stages gone this is largely egress-free, but two external internals still call
+out — `content_discovery`'s trufflehog runs `--results=verified` (validates hits against the credential's
+PROVIDER) and nuclei/CVE read local data only. On a strictly air-gapped engagement, mind trufflehog.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+from pipt.core.agent import HypothesisProvider, StubProvider
+from pipt.core.stage import Stage
+from pipt.pipelines.external import tasks as external
+
+if TYPE_CHECKING:
+    from pipt.core.paths import Activity
+
+
+class WebscanPipeline:
+    name = "webscan"
+    stages: Sequence[Stage] = (
+        # BREADTH — minimal: no expansion, no active network scan. Just fingerprint the given targets.
+        Stage("provision_wl", external.provision_wl, net=False),
+        Stage("ingest", external.ingest_httpx, needs=("provision_wl",)),  # httpx over the aggregated list
+        # post-cluster spanning — unified screenshot gallery (∥ the loops), as in external
+        Stage("screenshot", external.screenshot_all, cluster_scope=True),
+        # ── LOOP 1 — EXPLORABLE SURFACE (crawl only; OSINT stages dropped) ───────────────────────────
+        Stage("crawl", external.crawl, per_app=True, phase=1),
+        Stage("crawl_headless", external.crawl_headless, needs=("crawl",), per_app=True, phase=1),
+        Stage("api_spec", external.api_spec, per_app=True, phase=1),
+        # mine the crawl corpus offline (fetch_delta is dropped → it mines only katana's -srd store)
+        Stage("mine_responses", external.mine_responses, needs=("crawl_headless",), per_app=True, phase=1,
+              net=False),
+        Stage("request_catalog", external.request_catalog,
+              needs=("crawl_headless", "mine_responses", "api_spec"), per_app=True, phase=1, net=False),
+        # ── LOOP 2 — DAST the explorable surface ─────────────────────────────────────────────────────
+        Stage("dast", external.dast, per_app=True, phase=2),
+        Stage("xss", external.xss, per_app=True, phase=2),
+        Stage("sqli", external.sqli, per_app=True, phase=2),
+        Stage("cve_lookup", external.cve_lookup, per_app=True, phase=2, net=False),
+        # ── LOOP 3 — guessing / surface expansion ────────────────────────────────────────────────────
+        Stage("wordlist", external.build_wordlist, per_app=True, phase=3, net=False),
+        Stage("tech_enum", external.tech_enum, needs=("wordlist",), per_app=True, phase=3),
+        Stage("content_discovery", external.content_discovery, needs=("wordlist", "tech_enum"),
+              per_app=True, phase=3),
+        Stage("recrawl", external.recrawl, needs=("content_discovery",), per_app=True, phase=3),
+        # ── LOOP 4 — DAST the guessed surface ────────────────────────────────────────────────────────
+        Stage("request_catalog_full", external.request_catalog_full, per_app=True, phase=4, net=False),
+        Stage("param_fuzz", external.param_fuzz, needs=("request_catalog_full",), per_app=True, phase=4),
+        Stage("dast_full", external.dast_full, needs=("request_catalog_full", "param_fuzz"),
+              per_app=True, phase=4),
+        Stage("xss_full", external.xss_full, needs=("request_catalog_full", "param_fuzz"),
+              per_app=True, phase=4),
+        Stage("sqli_full", external.sqli_full, needs=("request_catalog_full", "param_fuzz"),
+              per_app=True, phase=4),
+        Stage("cve_lookup_full", external.cve_lookup_full, per_app=True, phase=4, net=False),
+        Stage("tech_vulnscan", external.tech_vulnscan, per_app=True, phase=4),
+    )
+
+    def cluster(self, activity: Activity) -> list[str]:
+        return external.cluster(activity)
+
+    def consolidate(self, activity: Activity) -> dict[str, int]:
+        return external.consolidate(activity)
+
+    def preflight(self) -> None:
+        external.preflight()
+
+    def provider(self) -> HypothesisProvider:
+        return StubProvider()
+
+
+PIPELINE = WebscanPipeline()
