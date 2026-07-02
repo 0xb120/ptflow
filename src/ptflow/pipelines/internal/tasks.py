@@ -182,7 +182,9 @@ DATASTORE_PORTS = frozenset({PORT_REDIS, PORT_MEMCACHED, PORT_MSSQL}) | MONGODB_
 # port is a known HTTP(S) port OR nerva's banner says http; the scheme is https for the TLS ports / a
 # tls|ssl|https banner. Port-based is a heuristic — the nerva banner (when present) refines it.
 HTTP_PORTS = frozenset({
-    80, 81, 88, 280, 443, 591, 593, 2082, 2083, 3000, 5000, 5601, 5985, 5986, 7001, 7070, 7080,
+    # 88 (Kerberos) deliberately EXCLUDED — every DC has it open, and it's not HTTP; promoting it would
+    # send the webscan hand-off crawling/DAST-ing the KDC. Only a real 'http' nerva banner promotes it.
+    80, 81, 280, 443, 591, 593, 2082, 2083, 3000, 5000, 5601, 5985, 5986, 7001, 7070, 7080,
     8000, 8008, 8080, 8081, 8082, 8083, 8085, 8088, 8089, 8090, 8161, 8180, 8200, 8280, 8443, 8500,
     8834, 8880, 8888, 8983, 9000, 9080, 9090, 9200, 9443, 10000, 15672, 50000,
 })
@@ -328,11 +330,42 @@ def delta_sockets(full: list[dict], fast: list[dict]) -> list[str]:
     return [f"{ip}:{port}" for ip, port in sorted(socks(full) - socks(fast))]
 
 
+# Curated banner → (product, version) patterns for the non-HTTP services nerva fingerprints on the
+# internal network. Tried BEFORE the generic 'token<sep>version' regex: service banners use an '_'
+# separator the generic pattern can't anchor — on 'SSH-2.0-OpenSSH_8.9p1' the generic regex matches
+# nothing (no space/slash) → every SSH CVE lost, and naively adding '_' would grab the whole
+# 'SSH-2.0-OpenSSH' prefix as the product. Anchored per-product patterns avoid both. Precision-first,
+# version-pinned (≥ X.Y). Mirrors external's _BANNER_PATTERNS deliberately (internal stays decoupled).
+_BANNER_PRODUCTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"OpenSSH[_/ -]?v?(\d+\.\d[\w.]*)", re.IGNORECASE), "OpenSSH"),
+    (re.compile(r"vsFTPd[_/ -]?v?(\d+\.\d[\w.]*)", re.IGNORECASE), "vsftpd"),
+    (re.compile(r"ProFTPD[_/ -]?v?(\d+\.\d[\w.]*)", re.IGNORECASE), "ProFTPD"),
+    (re.compile(r"Exim[_/ -]?v?(\d+\.\d[\w.]*)", re.IGNORECASE), "Exim"),
+    (re.compile(r"Sendmail[_/ -]?v?(\d+\.\d[\w.]*)", re.IGNORECASE), "Sendmail"),
+    (re.compile(r"MariaDB[_/ -]?v?(\d+\.\d[\w.]*)", re.IGNORECASE), "MariaDB"),
+    (re.compile(r"MySQL[_/ -]?v?(\d+\.\d[\w.]*)", re.IGNORECASE), "MySQL"),
+    (re.compile(r"PostgreSQL[_/ -]?v?(\d+\.\d[\w.]*)", re.IGNORECASE), "PostgreSQL"),
+    (re.compile(r"Redis(?:[_/ -]?server)?[_/ -]?v?(\d+\.\d[\w.]*)", re.IGNORECASE), "Redis"),
+)
+_BANNER_GENERIC_RE = re.compile(r"([A-Za-z][A-Za-z0-9.+_-]*?)[ /]v?(\d+\.\d[\w.]*)")
+
+
+def _banner_product(banner: str) -> tuple[str | None, str | None]:
+    """(product, version) from a non-HTTP service banner: curated patterns first (they anchor the
+    '_'-separated forms like 'OpenSSH_8.9p1' the generic regex can't), else a generic 'token<space|/>
+    version' fallback (e.g. 'Apache/2.4.49'). (None, None) if no version. Pure, precision-first."""
+    for rx, product in _BANNER_PRODUCTS:
+        if (m := rx.search(banner)):
+            return product, m.group(1)
+    if (m := _BANNER_GENERIC_RE.search(banner)):
+        return m.group(1), m.group(2)
+    return None, None
+
+
 def software_from_services(records: list[dict]) -> list[dict]:
     """Best-effort (product, version) leads from service records → [{product, version, hosts}].
-    Uses an explicit product+version when nerva provides them, else a conservative banner regex
-    (a token immediately followed by a dotted version). Version-pinned only. Pure."""
-    banner_re = re.compile(r"([A-Za-z][A-Za-z0-9.+_-]*?)[ /]v?(\d+\.\d[\w.]*)")
+    Uses an explicit product+version when nerva provides them, else a banner match (_banner_product:
+    curated non-HTTP patterns first, then a generic 'token version' regex). Version-pinned only. Pure."""
     by_pv: dict[tuple[str, str], set[str]] = {}
     for r in records:
         host = str(r.get("host") or r.get("ip") or "")
@@ -341,8 +374,7 @@ def software_from_services(records: list[dict]) -> list[dict]:
         if not (product and version):
             meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
             banner = str((meta or {}).get("banner") or r.get("banner") or "")
-            if (m := banner_re.search(banner)):
-                product, version = m.group(1), m.group(2)
+            product, version = _banner_product(banner)
         if product and version:
             by_pv.setdefault((str(product).lower(), str(version)), set()).add(where)
     return [{"product": p, "version": v, "hosts": sorted(w for w in hs if w)}
@@ -646,6 +678,17 @@ def parse_asrep_roast(out: str) -> list[dict]:
                          "host": hp.group(1) if hp else "", "account": m.group(1),
                          "hash": m.group(0), "evidence": f"AS-REP roastable account: {m.group(1)}"})
     return findings
+
+
+def _dedup_asrep(findings: list[dict]) -> list[dict]:
+    """Dedup AS-REP findings by hash token, preferring a record that already carries a host (netexec's
+    'LDAP <ip> …' stdout prefix) over a bare one (from the -o hash file). Pure, order-preserving."""
+    best: dict[str, dict] = {}
+    for f in findings:
+        key = f.get("hash", "")
+        if key not in best or (not best[key].get("host") and f.get("host")):
+            best[key] = f
+    return list(best.values())
 
 
 # datastore NSE → (service family, finding type, severity). A datastore script that returns data at all
@@ -1212,10 +1255,12 @@ def kerberoast_asrep(activity: Activity, app_id: str) -> None:
     if not dcs or not tools.read_lines(userfile) or shutil.which(NXC) is None:
         log.debug("  · skip kerberoast_asrep [%s] (no KDC / no userlist / netexec absent)", app_id)
         return
-    out = _capture([NXC, "ldap", *dcs, "-u", str(userfile), "-p", "",
-                    "--asreproast", str(ws.raw("netexec") / "asrep_hashes.txt")],
+    hashfile = ws.raw("netexec") / "asrep_hashes.txt"
+    out = _capture([NXC, "ldap", *dcs, "-u", str(userfile), "-p", "", "--asreproast", str(hashfile)],
                    dest=ws.raw("netexec") / "asreproast.txt", label="asrep")
-    findings = parse_asrep_roast(out)
+    # netexec version-dependently writes the '$krb5asrep$…' hashes to stdout, the -o file, or both →
+    # parse BOTH and dedup by hash (a stdout line carries the KDC host prefix; a bare -o line doesn't).
+    findings = _dedup_asrep(parse_asrep_roast("\n".join([out, *tools.read_lines(hashfile)])))
     for f in findings:                                         # attribute a bare (prefix-less) hash to the KDC
         f["host"] = f["host"] or dcs[0]
     tools.write_jsonl(ws.findings / "asrep.jsonl", findings)
@@ -1480,16 +1525,19 @@ def consolidate(activity: Activity) -> dict[str, int]:
     """TERMINAL fan-in (deterministic, OFFLINE) — lift every subnet group's per-app findings into
     <activity>/findings/<type>.jsonl, one file per finding TYPE, each record stamped with its app_id
     (the subnet slug). Also aggregates the web services into <activity>/web_targets.txt (the external
-    hand-off scope). Empty types write no file. Idempotent: overwrites each run / --resume."""
+    hand-off scope). A type with no results this run REMOVES any stale activity-level file (idempotent:
+    overwrites/clears each run / --resume — a re-run with fewer findings never leaves ghosts)."""
     apps = activity.list_apps()
     counts: dict[str, int] = {}
     for out_name, sources in _CONSOLIDATE_SOURCES.items():
         records = [{"app_id": ws.root.name, **rec}
                    for ws in apps for src in sources
                    for rec in tools.read_jsonl(ws.root / src)]
+        out_path = activity.findings / out_name
         if records:
-            counts[out_name.removesuffix(".jsonl")] = tools.write_jsonl(
-                activity.findings / out_name, records)
+            counts[out_name.removesuffix(".jsonl")] = tools.write_jsonl(out_path, records)
+        else:
+            out_path.unlink(missing_ok=True)   # drop a prior run's now-empty type (no stale findings)
     web = aggregate_web_targets(activity)
     log.info("  → consolidate — %s · %d web service(s) → %s",
              ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "no per-subnet findings",

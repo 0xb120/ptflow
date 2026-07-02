@@ -66,6 +66,16 @@ def test_software_from_services_explicit_and_banner():
     assert all(s["product"] != "no" for s in sw)  # the version-less banner yields nothing
 
 
+def test_software_from_services_matches_underscore_ssh_banner():
+    # SSH banners use an '_' separator ('SSH-2.0-OpenSSH_8.9p1') the old '[ /]' regex missed entirely,
+    # dropping every SSH CVE. The curated banner pass must extract (openssh, 8.9p1) — and crucially NOT
+    # the whole 'ssh-2.0-openssh' protocol prefix as the product.
+    records = [{"host": "10.0.0.1", "port": 22,
+                "metadata": {"banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1"}}]
+    sw = tasks.software_from_services(records)
+    assert {"product": "openssh", "version": "8.9p1", "hosts": ["10.0.0.1:22"]} in sw
+
+
 def test_parse_nxc_smb_banner_and_auth():
     out = (
         "SMB  10.0.0.1  445  DC01     [*] Windows Server 2019 x64 (name:DC01) (domain:corp.local) "
@@ -338,6 +348,29 @@ def test_parse_asrep_roast_extracts_account_hash_and_host():
     assert by["svc_sql"]["host"] == ""                               # bare line → no host (stage fills it)
 
 
+def test_kerberoast_asrep_reads_hashes_from_output_file(tmp_path, monkeypatch):
+    # netexec may write the '$krb5asrep$…' hashes ONLY to the --asreproast <file> (version-dependent),
+    # leaving stdout with just status lines. The stage must parse that file, not just stdout.
+    act = Activity.named("intdemo", root=tmp_path).ensure()
+    ws = act.app("10.0.1.0-24").ensure()
+    tools.write_jsonl(ws.canonical("ports.jsonl"), [{"ip": "10.0.0.1", "port": 88}])   # a KDC
+    tools.write_lines(ws.raw("netexec") / "domain_users.txt", ["svc_web", "svc_sql"])
+    monkeypatch.setattr(tasks.shutil, "which", lambda _p: "/usr/bin/nxc")
+
+    def fake_capture(cmd, *, dest, label):                            # noqa: ARG001
+        # simulate netexec writing the hash to the -o file, nothing useful on stdout
+        tools.write_lines(ws.raw("netexec") / "asrep_hashes.txt",
+                          ["$krb5asrep$23$svc_web@CORP.LOCAL:aabbccddee0011223344"])
+        return "LDAP 10.0.0.1 389 DC01 [*] Total of records returned 2\n"
+
+    monkeypatch.setattr(tasks, "_capture", fake_capture)
+    tasks.kerberoast_asrep(act, "10.0.1.0-24")
+    findings = tools.read_jsonl(ws.findings / "asrep.jsonl")
+    assert len(findings) == 1
+    assert findings[0]["account"] == "svc_web"
+    assert findings[0]["host"] == "10.0.0.1"                          # bare file line → stage fills the KDC
+
+
 def test_parse_datastore_nse_maps_scripts_to_findings():
     out = (
         "Nmap scan report for 10.0.0.5\n"
@@ -407,6 +440,21 @@ def test_consolidate_lifts_per_subnet_findings(tmp_path):
     assert lifted == [{"app_id": "10.0.1.0-24", "type": "smb-signing-disabled", "evidence": "x"}]
 
 
+def test_consolidate_removes_stale_findings_on_rerun(tmp_path):
+    # A type produced last run but NOT this run must not leave a stale activity-level file (the docstring
+    # promises "overwrites each run"): a re-run/--resume with fewer results would otherwise report ghosts.
+    act = Activity.named("intdemo", root=tmp_path).ensure()
+    ws = act.app("10.0.1.0-24").ensure()
+    smb = ws.findings / "smb.jsonl"
+    tools.write_jsonl(smb, [{"type": "smb-signing-disabled", "evidence": "x"}])
+    tasks.consolidate(act)
+    assert (act.findings / "smb.jsonl").exists()
+    smb.unlink()                                        # the rescan found nothing this run
+    counts = tasks.consolidate(act)
+    assert "smb" not in counts
+    assert not (act.findings / "smb.jsonl").exists()    # the stale lifted file is gone
+
+
 # --- web-service aggregation + external hand-off (pipeline composition) ---------------------------
 def test_web_targets_from_scheme_and_filter():
     ports = [
@@ -422,6 +470,13 @@ def test_web_targets_from_scheme_and_filter():
     assert tasks.web_targets_from(ports, services) == [
         "http://10.0.0.1:80", "http://10.0.0.3:7777", "https://10.0.0.1:443",
     ]
+
+
+def test_web_targets_excludes_kerberos_port_88():
+    # 88 is Kerberos (every DC has it open) — it must NOT be a web target, else the webscan hand-off
+    # would crawl/DAST the KDC. Only a real http banner (not the bare port) may promote such a socket.
+    ports = [{"ip": "10.0.0.1", "port": 88}, {"ip": "10.0.0.1", "port": 8080}]
+    assert tasks.web_targets_from(ports, []) == ["http://10.0.0.1:8080"]
 
 
 def test_consolidate_writes_web_targets(tmp_path):
