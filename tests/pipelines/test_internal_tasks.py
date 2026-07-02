@@ -248,6 +248,22 @@ def test_parse_nxc_pass_pol():
     assert pol["lockout_threshold"] == "None"
 
 
+def test_parse_enum_ca_ca_and_esc8():
+    out = (
+        "SMB  10.0.0.1  445  DC01  [*] Windows Server 2019\n"
+        "SMB  10.0.0.1  445  DC01  Active Directory Certificate Services Found.\n"
+        "SMB  10.0.0.1  445  DC01  http://10.0.0.1/certsrv/certfnsh.asp\n"
+        "SMB  10.0.0.1  445  DC01  Web enrollment found on HTTP (ESC8).\n"
+        "SMB  10.0.0.2  445  WS01  [*] Windows 10\n"
+    )
+    findings = tasks.parse_enum_ca(out)
+    by = {(f["host"], f["type"]) for f in findings}
+    assert ("10.0.0.1", "adcs-ca-found") in by
+    assert ("10.0.0.1", "adcs-esc8-web-enrollment") in by
+    assert all(f["host"] != "10.0.0.2" for f in findings)     # no CA on the workstation
+    assert next(f for f in findings if f["type"] == "adcs-esc8-web-enrollment")["severity"] == "high"
+
+
 def test_parse_nxc_ldap_signing():
     out = (
         "LDAP  10.0.0.1  389  DC01  Windows Server 2019 (name:DC01) (domain:corp.local) "
@@ -303,6 +319,62 @@ def test_parse_dig_axfr():
     assert "SOA" in types
     assert {r["name"] for r in recs if r["rtype"] == "A"} == {"dc01.corp.local.", "ws01.corp.local."}
     assert tasks.parse_dig_axfr("; Transfer failed.") == []
+
+
+# --- loop-2 additions: AS-REP roasting · unauthenticated datastores ----------------------------
+def test_parse_asrep_roast_extracts_account_hash_and_host():
+    out = (
+        "LDAP  10.0.0.1  389  DC01  $krb5asrep$23$svc_web@CORP.LOCAL:aabbccddee0011223344\n"
+        "LDAP  10.0.0.1  389  DC01  [*] Total of records returned 5\n"
+        "$krb5asrep$23$svc_sql@CORP.LOCAL:1122334455667788\n"          # bare hash (no nxc prefix)
+        "LDAP  10.0.0.2  389  DC02  [-] no ASREPRoastable users\n"
+    )
+    findings = tasks.parse_asrep_roast(out)
+    by = {f["account"]: f for f in findings}
+    assert set(by) == {"svc_web", "svc_sql"}                          # only the two krb5asrep lines
+    assert all(f["type"] == "asrep-roastable" and f["severity"] == "high" for f in findings)
+    assert by["svc_web"]["host"] == "10.0.0.1"                        # host read from the LDAP prefix
+    assert by["svc_web"]["hash"].startswith("$krb5asrep$23$svc_web@CORP.LOCAL:")
+    assert by["svc_sql"]["host"] == ""                               # bare line → no host (stage fills it)
+
+
+def test_parse_datastore_nse_maps_scripts_to_findings():
+    out = (
+        "Nmap scan report for 10.0.0.5\n"
+        "6379/tcp  open  redis\n"
+        "| redis-info: \n"
+        "|   Version: 6.0.5\n"
+        "27017/tcp open  mongodb\n"
+        "| mongodb-databases: \n"
+        "|   ok = 1.0\n"
+        "| mongodb-info: \n"
+        "|_  version: 4.4\n"
+        "Nmap scan report for 10.0.0.6\n"
+        "11211/tcp open  memcached\n"
+        "|_memcached-info: STAT version 1.6.9\n"
+        "1433/tcp  open  ms-sql-s\n"
+        "| ms-sql-info: \n"
+        "|_  Version: 15.0\n"
+    )
+    findings = tasks.parse_datastore_nse(out)
+    by = {(f["host"], f["service"]): f for f in findings}
+    assert by[("10.0.0.5", "redis")]["type"] == "redis-unauth-access"
+    assert by[("10.0.0.5", "redis")]["severity"] == "high"
+    # mongodb has BOTH mongodb-databases (high, unauth listing) and mongodb-info (medium) → keep the strongest
+    assert by[("10.0.0.5", "mongodb")]["type"] == "mongodb-unauth-access"
+    assert by[("10.0.0.5", "mongodb")]["severity"] == "high"
+    assert by[("10.0.0.6", "memcached")]["type"] == "memcached-unauth-access"
+    assert by[("10.0.0.6", "mssql")]["type"] == "mssql-exposed"
+    assert by[("10.0.0.6", "mssql")]["severity"] == "info"
+    assert len(findings) == 4                                        # one per (host, service family)
+
+
+def test_delta_sockets_excludes_the_fast_set():
+    full = [{"ip": "10.0.0.1", "port": 80}, {"ip": "10.0.0.1", "port": 12345},
+            {"ip": "10.0.0.2", "port": 8081}, {"ip": "bad"}]         # malformed record dropped
+    fast = [{"ip": "10.0.0.1", "port": 80}]                          # already fingerprinted in loop 1
+    # only the sockets NOT in the fast curated set, sorted 'ip:port' (the full-port delta)
+    assert tasks.delta_sockets(full, fast) == ["10.0.0.1:12345", "10.0.0.2:8081"]
 
 
 # --- cluster() end-to-end (no external tools) --------------------------------------------------
@@ -362,6 +434,23 @@ def test_consolidate_writes_web_targets(tmp_path):
     assert tools.read_lines(act.base / "web_targets.txt") == ["http://10.0.1.5:8080"]
 
 
+def test_aggregate_web_targets_includes_full_port_web_services(tmp_path):
+    act = Activity.named("intdemo", root=tmp_path).ensure()
+    ws = act.app("10.0.1.0-24").ensure()
+    # fast per-subnet set: a standard web port in the group
+    tools.write_jsonl(ws.canonical("ports.jsonl"), [{"ip": "10.0.1.5", "port": 8080}])
+    tools.write_jsonl(ws.canonical("services.jsonl"), [])
+    # the full-port (spanning) scan found a web service on a NON-standard port; fingerprint_full's
+    # banner says http, so aggregate_web_targets must recognise it and pass it to the external hand-off
+    canon = act.asset_discovery_canonical
+    tools.write_jsonl(canon("ports_full.jsonl"), [{"ip": "10.0.1.5", "port": 12345}])
+    tools.write_jsonl(canon("services_full.jsonl"),
+                      [{"ip": "10.0.1.5", "port": 12345, "metadata": {"banner": "HTTP/1.1 200 OK"}}])
+    urls = tasks.aggregate_web_targets(act)
+    assert "http://10.0.1.5:8080" in urls           # standard web port from the fast per-subnet set
+    assert "http://10.0.1.5:12345" in urls          # non-standard port surfaced by the full-port scan
+
+
 def test_followups_opt_in(tmp_path, monkeypatch):
     act = Activity.named("intdemo", root=tmp_path).ensure()
     tools.write_lines(act.base / "web_targets.txt", ["http://10.0.1.5:8080"])
@@ -387,21 +476,31 @@ def test_pipeline_object_shape():
 
     assert PIPELINE.name == "internal"
     names = [s.name for s in PIPELINE.stages]
-    assert names == ["expand", "discover", "portscan", "portscan_full", "nuclei_scope", "fingerprint",
-                     "cve_lookup", "smb_checks", "ad_enum", "snmp_checks", "ldap_checks", "ftp_checks",
-                     "telnet_checks", "nfs_checks", "rsync_checks", "netbios_checks", "dns_checks",
-                     "remote_desktop"]
+    assert names == ["expand", "discover", "portscan", "portscan_full", "nuclei_scope",
+                     "fingerprint_full", "cve_lookup_full", "fingerprint",
+                     "cve_lookup", "smb_checks", "ad_enum", "adcs_checks", "kerberoast_asrep",
+                     "datastore_checks", "snmp_checks", "ldap_checks", "ftp_checks", "telnet_checks",
+                     "nfs_checks", "rsync_checks", "netbios_checks", "dns_checks", "remote_desktop"]
     by_name = {s.name: s for s in PIPELINE.stages}
     assert by_name["fingerprint"].per_app is True
     assert by_name["fingerprint"].phase == 1
     assert all(by_name[n].phase == 2 for n in
-               ("cve_lookup", "smb_checks", "ad_enum", "ftp_checks", "netbios_checks", "dns_checks",
-                "remote_desktop"))
+               ("cve_lookup", "smb_checks", "ad_enum", "adcs_checks", "kerberoast_asrep",
+                "datastore_checks", "ftp_checks", "netbios_checks", "dns_checks", "remote_desktop"))
     # full-port scan + whole-scope nuclei run ∥ the loops as SPANNING stages (off the critical path)
     assert by_name["portscan_full"].spanning is True
     assert by_name["nuclei_scope"].spanning is True
     assert by_name["nuclei_scope"].needs == ("portscan_full",)  # nuclei scans the COMPLETE surface
     assert "nuclei_net" not in by_name
+    # full-port DELTA fingerprint + CVE — SPANNING too, off the critical path; CVE is OFFLINE
+    assert by_name["fingerprint_full"].spanning is True
+    assert by_name["fingerprint_full"].needs == ("portscan_full",)
+    assert by_name["cve_lookup_full"].spanning is True
+    assert by_name["cve_lookup_full"].needs == ("fingerprint_full",)
+    assert by_name["cve_lookup_full"].net is False
+    # AS-REP roasting reuses ad_enum's userlist → intra-loop dep (same phase, NOT cross-loop)
+    assert by_name["kerberoast_asrep"].needs == ("ad_enum",)
+    assert by_name["kerberoast_asrep"].phase == 2
     assert by_name["cve_lookup"].net is False  # offline CVE correlation
     assert by_name["expand"].net is False
 

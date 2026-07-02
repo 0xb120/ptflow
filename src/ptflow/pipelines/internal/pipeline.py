@@ -28,6 +28,11 @@ class InternalPipeline:
         # gear. nuclei scans the FULL-port surface (portscan_full), not just the fast curated set.
         Stage("portscan_full", tasks.portscan_full, needs=("portscan",), spanning=True),
         Stage("nuclei_scope", tasks.nuclei_scope, needs=("portscan_full",), spanning=True),
+        # full-port DELTA fingerprint + known-CVE correlation — SPANNING too (∥ cluster + loops, joined
+        # at the fan-in). services_full.jsonl gives banners for non-standard-port services; cve_lookup_full
+        # is the whole-scope, OFFLINE CVE gemini of the per-subnet cve_lookup (activity-level, like nuclei_scope).
+        Stage("fingerprint_full", tasks.fingerprint_full, needs=("portscan_full",), spanning=True),
+        Stage("cve_lookup_full", tasks.cve_lookup_full, needs=("fingerprint_full",), spanning=True, net=False),
         # LOOP 1 — service inventory (per-subnet)
         Stage("fingerprint", tasks.fingerprint, per_app=True, phase=1),
         # LOOP 2 — low-hanging fruit (per-subnet), gated on the ports found in the breadth scan. All ∥
@@ -36,6 +41,10 @@ class InternalPipeline:
         Stage("cve_lookup", tasks.cve_lookup, per_app=True, phase=2, net=False),
         Stage("smb_checks", tasks.smb_checks, per_app=True, phase=2),
         Stage("ad_enum", tasks.ad_enum, per_app=True, phase=2),          # null-session AD enumeration
+        Stage("adcs_checks", tasks.adcs_checks, per_app=True, phase=2),   # ADCS CA discovery + ESC8 (no-cred)
+        # AS-REP roasting reuses ad_enum's user list → intra-loop `needs` (same phase; NOT a cross-loop dep)
+        Stage("kerberoast_asrep", tasks.kerberoast_asrep, needs=("ad_enum",), per_app=True, phase=2),
+        Stage("datastore_checks", tasks.datastore_checks, per_app=True, phase=2),  # unauth Redis/Mongo/Memcached + MSSQL
         Stage("snmp_checks", tasks.snmp_checks, per_app=True, phase=2),
         Stage("ldap_checks", tasks.ldap_checks, per_app=True, phase=2),
         Stage("ftp_checks", tasks.ftp_checks, per_app=True, phase=2),

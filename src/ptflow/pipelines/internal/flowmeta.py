@@ -61,6 +61,29 @@ FLOWMETA: dict[str, StepMeta] = {
         notes=("-rl = profilo (wide 150 · home 50) · finding a livello activity (come external), non per-subnet",
                "legge ports_full.jsonl (portscan_full) → superficie completa · best-effort: salta se nuclei assente"),
     ),
+    "fingerprint_full": StepMeta(
+        summary="SPANNING — fingerprint del DELTA full-port (le socket che portscan_full trova OLTRE il set "
+                "veloce) whole-scope con nerva → services_full.jsonl. ∥ cluster + loop (join al fan-in): un "
+                "servizio su porta non standard ottiene un banner senza serializzare un fingerprint full-scan "
+                "davanti al lavoro per-subnet. I banner alimentano cve_lookup_full E il rilevamento web dell'hand-off.",
+        commands=("nerva --json   # stdin = delta_sockets(ports_full meno il set veloce), whole-scope",),
+        outputs=("asset_discovery/services_full.jsonl",),
+        notes=("delta puro/unit-tested: le porte veloci sono già fingerprinted nel loop 1 (niente doppioni)",
+               "un web server su porta non standard è riconosciuto SOLO via banner → serve questo stage per l'hand-off",
+               "best-effort: salta se nerva assente o delta vuoto"),
+    ),
+    "cve_lookup_full": StepMeta(
+        summary="SPANNING (OFFLINE, net=False) — CVE NOTE sul software del DELTA full-port (services_full.jsonl) "
+                "contro il DB locale di search_vulns → findings/cve_full.jsonl a LIVELLO ACTIVITY (come "
+                "nuclei_scope; NON sollevato da consolidate). Il gemello whole-scope del cve_lookup per-subnet: "
+                "copre le porte non standard che quello non vede.",
+        commands=("# software_from_services sul delta → search_vulns -q '<Prodotto Versione>' -f json",
+                  "#   --ignore-general-product-vulns --use-created-product-ids · cache memo process-wide"),
+        outputs=("findings/cve_full.jsonl",),
+        notes=("net=False: gira ∥ tutto, l'overlap col pass per-subnet è gratis via la memo condivisa",
+               "delta naturale (solo socket oltre il set veloce) → nessun doppione con findings/cve.jsonl",
+               "best-effort: salta se search_vulns/DB assenti"),
+    ),
     # --- loop 1: inventario servizi (per-subnet) ---
     "fingerprint": StepMeta(
         summary="LOOP 1 — fingerprint dei servizi sulle socket aperte del gruppo (nerva --json; nmap -sV "
@@ -106,6 +129,40 @@ FLOWMETA: dict[str, StepMeta] = {
         notes=("no-cred: RID cycling via SAMR lookupsids · complementare al dump LDAP (funziona anche se LDAP anon è chiuso)",
                "la password policy prepara il futuro spraying (spray sotto-soglia = niente lockout)",
                "best-effort: salta se nessuna 445 o netexec assente"),
+    ),
+    "adcs_checks": StepMeta(
+        summary="LOOP 2 — enumerazione ADCS SENZA credenziali via netexec `-M enum_ca` sugli host con 445 "
+                "aperta: scoperta CA anonima (RPC epmapper su 135) + rilevamento ESC8 (il modulo stesso "
+                "sonda /certsrv per il web enrollment HTTP → superficie di NTLM relay verso la CA).",
+        commands=("nxc smb <host…> -u '' -p '' -M enum_ca   # CA discovery anonima + probe ESC8",
+                  "# parse_enum_ca: 'Certificate Services Found' → adcs-ca-found · 'ESC8' → adcs-esc8-web-enrollment"),
+        outputs=("findings/adcs.jsonl",),
+        notes=("ESC8 (relay-based) è l'ESC no-cred — si accoppia con le liste smb/ldap-signing",
+               "gli ESC su template (ESC1-7) richiedono un bind autenticato → fase con credenziali (certipy find)",
+               "best-effort: salta se nessuna 445 o netexec assente"),
+    ),
+    "kerberoast_asrep": StepMeta(
+        summary="LOOP 2 — AS-REP roasting SENZA credenziali via netexec sui KDC del gruppo (host con 88 "
+                "aperta). Passa a `nxc ldap --asreproast` la userlist che ad_enum ha già prodotto "
+                "(needs=ad_enum, dip. INTRA-loop) e chiede l'AS-REP per gli account DONT_REQ_PREAUTH: nessuna "
+                "password inviata, nessun login tentato. Gli hash '$krb5asrep$…' sono loot crackabile offline.",
+        commands=("nxc ldap <kdc…> -u domain_users.txt -p '' --asreproast asrep_hashes.txt   # gated su 88",
+                  "# parse_asrep_roast: token $krb5asrep$<etype>$<user>@<REALM>:<hash> → asrep-roastable (high)"),
+        outputs=("findings/asrep.jsonl",),
+        notes=("no-cred: sfrutta il flag DONT_REQ_PREAUTH · userlist da ad_enum (RID cycling) via needs intra-loop",
+               "best-effort: salta senza KDC (88) / userlist vuota / netexec assente"),
+    ),
+    "datastore_checks": StepMeta(
+        summary="LOOP 2 — datastore esposti SENZA autenticazione sulle socket datastore del gruppo (Redis "
+                "6379 / MongoDB 27017-8 / Memcached 11211 / MSSQL 1433, tutte nel set veloce). UNA run nmap "
+                "NSE i cui script rispondono con dati solo se lo store risponde SENZA auth. Elasticsearch (9200) "
+                "è HTTP → lasciato all'hand-off web + nuclei_scope. Non-distruttivo (nessun login).",
+        commands=("nmap -Pn -n -sV -p <porte> --script redis-info,mongodb-info,mongodb-databases,memcached-info,"
+                  "ms-sql-info -oN - <host…>",
+                  "# parse_datastore_nse: '| <script>:' → *-unauth-access · mongodb-databases (high) > mongodb-info"),
+        outputs=("findings/datastore.jsonl",),
+        notes=("tiene il segnale più forte per (host, famiglia) · ms-sql-info = sola esposizione (info)",
+               "best-effort: salta senza porta datastore aperta / nmap assente"),
     ),
     "snmp_checks": StepMeta(
         summary="LOOP 2 — community di default SNMP (UDP/161) via onesixtyone su TUTTI gli host + LOOT. Una "
@@ -211,12 +268,13 @@ _FANIN = StepMeta(
     summary="Fan-in terminale DETERMINISTICO (consolidate): solleva i findings per-subnet in "
             "<activity>/findings/<tipo>.jsonl (un file per categoria, ogni record con app_id = slug). "
             "Aggrega inoltre i servizi web in web_targets.txt e (opt-in) fa l'hand-off alla pipeline webscan.",
-    outputs=("findings/cve.jsonl", "findings/smb.jsonl", "findings/ad_enum.jsonl", "findings/snmp.jsonl",
-             "findings/ldap.jsonl", "findings/ftp.jsonl", "findings/telnet.jsonl", "findings/nfs.jsonl",
-             "findings/rsync.jsonl", "findings/netbios.jsonl", "findings/dns.jsonl",
-             "findings/remote_desktop.jsonl", "web_targets.txt"),
-    notes=("nuclei_scope è già un finding a livello activity (whole-scope) e non viene sollevato qui",
-           "web_targets_from: socket con porta HTTP(S) o banner http → scheme://ip:port (https per TLS)",
+    outputs=("findings/cve.jsonl", "findings/smb.jsonl", "findings/ad_enum.jsonl", "findings/adcs.jsonl",
+             "findings/asrep.jsonl", "findings/datastore.jsonl", "findings/snmp.jsonl", "findings/ldap.jsonl",
+             "findings/ftp.jsonl", "findings/telnet.jsonl", "findings/nfs.jsonl", "findings/rsync.jsonl",
+             "findings/netbios.jsonl", "findings/dns.jsonl", "findings/remote_desktop.jsonl", "web_targets.txt"),
+    notes=("nuclei_scope E cve_full (delta full-port) sono già finding a livello activity — non sollevati qui",
+           "web_targets: socket web per-subnet (set veloce) UNIONE full-port (ports_full + services_full) → "
+           "un web server su porta NON standard, riconosciuto via banner, raggiunge l'hand-off",
            "hand-off webscan OPT-IN (PTFLOW_INTERNAL_WEB_HANDOFF): crawl/catalog/DAST/fuzz per servizio web",
            "web_targets.txt sempre scritto; solo l'auto-run è gated · seam agente (StubProvider) dormiente accanto"),
 )
