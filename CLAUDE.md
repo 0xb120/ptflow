@@ -382,6 +382,18 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     set → `asset_discovery/ports.jsonl`). Whole-scope + rate-controlled on purpose — one global sweep is
     gentler on fragile legacy/OT gear and switches than N per-subnet floods (aggregate load ≈ concurrency
     × rate; `PTFLOW_PROFILE=home` throttles naabu, same lever as external).
+  - **Spanning** (whole-scope, ∥ cluster + the loops, joined at the fan-in — OFF the critical path so the
+    heavy full scan never serializes in front of the per-subnet work): `portscan_full` (naabu full 65535 →
+    `asset_discovery/ports_full.jsonl`) → `nuclei_scope` (full-template nuclei over every discovered socket,
+    ONE rate-limited process → `<activity>/findings/nuclei_scope.jsonl`); PLUS the full-port CVE chain
+    `fingerprint_full` (nerva over the full-port **delta** — sockets beyond the fast `INTERNAL_PORTS` set →
+    `asset_discovery/services_full.jsonl`) → `cve_lookup_full` (search_vulns over that delta's software,
+    OFFLINE `net=False` → `<activity>/findings/cve_full.jsonl`, activity-level like `nuclei_scope`). This is
+    how inventory/CVE — and web-service detection for the hand-off — reach services on **non-standard ports**
+    the curated fast set misses. **Why spanning, not a per-app loop-3:** `portscan_full` is awaited only at
+    the fan-in (it runs ∥ the loops), so a per-app phase-3 stage reading `ports_full.jsonl` would race it —
+    no barrier guarantees it present. `consolidate` runs AFTER the spanning join, so the web aggregation
+    reads the full-port set safely; the full-port CVE lives at activity scope (the gemini of `nuclei_scope`).
   - **`cluster`** — `assign_hosts` (pure, unit-tested) partitions the LIVE hosts by the **scope entry
     that contains them**: the CIDR from the scope file, **longest-prefix wins** on overlap, a bare IP is
     a /32; only entries with ≥1 live host become groups. `app_id` = the filesystem-safe CIDR slug
@@ -390,16 +402,24 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     the per-subnet output folders are NOT in tension — breadth scans once, `cluster` slices by subnet.
   - **Loop 1 — inventory** (`phase=1`): `fingerprint` — `nerva --json` over the group's `ip:port` set
     (nmap `-sV` is the drop-in alternative) → `services.jsonl`.
-  - **Loop 2 — low-hanging fruit** (`phase=2`, all ∥, gated on the loop-1 services): `cve_lookup`
-    (search_vulns over the service banners — OFFLINE `net=False`, same pattern as external) · `smb_checks`
-    (netexec: signing-not-required / SMBv1-enabled / null-session·guest·`Pwn3d!`) · `snmp_checks`
-    (onesixtyone default communities, UDP/161 so it sweeps all group hosts) · `ldap_checks` (ldapsearch
-    anonymous bind on 389/636) · `nuclei_net` (nuclei `-tags network,default-login`). Each best-effort
-    (missing binary / gated-out port → no finding, never aborts) → `scans/<subnet>/findings/<check>.jsonl`.
+  - **Loop 2 — low-hanging fruit + enumeration** (`phase=2`, all ∥ save one intra-loop dep, gated on the
+    breadth-scan ports, best-effort, NON-destructive — no brute-force/relay/coercion, those are future):
+    `cve_lookup` (search_vulns, OFFLINE) · `smb_checks` (signing/SMBv1/null-session/guest/`Pwn3d!` + share
+    enum + metadata spider) · `ad_enum` (null-session RID cycling + pass-pol) · `adcs_checks` (enum_ca CA
+    discovery + ESC8) · **`kerberoast_asrep`** (nxc `--asreproast`, no-cred — `needs` ad_enum's userlist, an
+    INTRA-loop dep) · **`datastore_checks`** (ONE nmap NSE run: unauth Redis/MongoDB/Memcached + MSSQL
+    exposure; Elasticsearch is HTTP → left to the hand-off) · `snmp_checks` (onesixtyone + snmpwalk loot,
+    UDP/161 over all hosts) · `ldap_checks` (nxc signing/CBT + ldapsearch anon bind/account dump) ·
+    `ftp_checks` · `telnet_checks` · `nfs_checks` · `rsync_checks` · `netbios_checks` (137/UDP) · `dns_checks`
+    (reverse-zone AXFR) · `remote_desktop` (RDP/VNC scrying). Each → `scans/<subnet>/findings/<check>.jsonl`.
+    (Whole-scope `nuclei` is the spanning `nuclei_scope`, not a per-subnet `nuclei_net`.)
   - **`consolidate`** lifts the per-subnet findings to `<activity>/findings/<type>.jsonl` (one file per
     finding TYPE, each record stamped `app_id`), same deterministic terminal fan-in as external, AND
-    aggregates every group's web services (`ports.jsonl` ∩ HTTP(S) ports / a nerva `http` banner) into
-    `<activity>/web_targets.txt` (`scheme://ip:port`, https for a TLS port/banner — pure `web_targets_from`).
+    aggregates web services into `<activity>/web_targets.txt` (`scheme://ip:port`, https for a TLS
+    port/banner — pure `web_targets_from`): each group's fast-set services (`ports.jsonl`/`services.jsonl`)
+    **unioned with the whole-scope full-port scan** (`ports_full.jsonl` + `fingerprint_full`'s
+    `services_full.jsonl`), so a web server on a NON-standard port — recognised via its fingerprint banner —
+    reaches the external hand-off too. (`nuclei_scope`/`cve_full` are already activity-level → not lifted.)
   - **web hand-off (pipeline COMPOSITION)** — after the sweep, `internal.followups(activity)` (a
     duck-typed `Pipeline` hook, like `consolidate`/`preflight`, returning `list[Followup]` from
     `core/stage.py`) hands `web_targets.txt` to the **`webscan`** pipeline (see below) as a **nested
@@ -414,10 +434,12 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
   movement, so the orchestrator's no-cycle constraint doesn't bite (a credentialed re-entry / lateral
   chain would need a different model, deliberately out of scope). **Status: SKELETON** — breadth,
   `cluster`, `fingerprint`, `cve_lookup` and `smb_checks`/`snmp_checks` are real (their pure parsers +
-  `assign_hosts` unit-tested; e2e-smoke on loopback); `ldap_checks`/`nuclei_net` parsing and the
-  corpus-less `cve_lookup` banner extraction are still **best-effort/minimal** and want live internal
-  testing (the natural next lever: reuse external's `collect_software` for CVE, richer share/perms parsing
-  for SMB). Destructive/active checks (brute-force, responder/relay, coercion) and credentialed auth
+  `assign_hosts` unit-tested; e2e-smoke on loopback); `ldap_checks` and the corpus-less `cve_lookup` banner
+  extraction — plus the newer `kerberoast_asrep` (nxc `--asreproast` output) / `datastore_checks` (nmap NSE)
+  parsers — are **best-effort/minimal** and want live internal testing (their pure parsers ARE unit-tested;
+  the tool-output formats vary by version). Natural next levers: reuse external's `collect_software` for CVE,
+  richer share/perms parsing for SMB. Destructive/active checks (brute-force, responder/relay, coercion) and
+  credentialed auth
   (a future `PTFLOW_CREDS`) are deliberately **opt-in, not yet wired**. `internal` ships its own flow map
   (`pipelines/internal/flowmeta.py` → `docs/internal-pipeline-*`), like every non-stub pipeline.
 - **`webscan`** — external's web-DEPTH loops over a **PRE-AGGREGATED web target list** (`pipelines/webscan/

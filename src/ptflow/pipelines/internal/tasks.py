@@ -16,15 +16,22 @@ the fan-out unit is a **scope subnet**, not a web app:
     fingerprint — nerva over the group's ip:port set (nmap -sV is the drop-in alternative)
                                                                     → scans/<subnet>/services.jsonl
 
-  portscan_full — SPANNING (whole-scope): full 65535-port naabu → asset_discovery/ports_full.jsonl.
-  nuclei_scope  — SPANNING (whole-scope): full-template nuclei over every discovered socket (FULL-port
-                  set), ONE rate-controlled process ∥ the loops → <activity>/findings/nuclei_scope.jsonl.
+  portscan_full  — SPANNING (whole-scope): full 65535-port naabu → asset_discovery/ports_full.jsonl.
+  nuclei_scope   — SPANNING (whole-scope): full-template nuclei over every discovered socket (FULL-port
+                   set), ONE rate-controlled process ∥ the loops → <activity>/findings/nuclei_scope.jsonl.
+  fingerprint_full — SPANNING (whole-scope): nerva over the FULL-port DELTA (sockets beyond the fast
+                   set) → asset_discovery/services_full.jsonl (banners for non-standard-port services).
+  cve_lookup_full — SPANNING (whole-scope, OFFLINE): search_vulns over the full-port delta software →
+                   <activity>/findings/cve_full.jsonl (activity-level, like nuclei_scope).
 
   LOOP 2 — low-hanging fruit + enumeration (per-subnet, gated on the ports found in the breadth scan;
            all ∥, best-effort, NON-destructive — no credentialed/brute-force checks, those are future)
     cve_lookup     — search_vulns over the service banners (OFFLINE)   → findings/cve.jsonl
     smb_checks     — netexec: signing/null-session/guest + share enum + metadata spider → findings/smb.jsonl
     ad_enum        — netexec null-session RID cycling + password policy → findings/ad_enum.jsonl
+    adcs_checks    — netexec enum_ca: anonymous CA discovery + ESC8      → findings/adcs.jsonl
+    kerberoast_asrep — nxc ldap --asreproast (no-cred, needs ad_enum's userlist) → findings/asrep.jsonl
+    datastore_checks — nmap NSE: unauth Redis/MongoDB/Memcached + MSSQL exposure → findings/datastore.jsonl
     snmp_checks    — onesixtyone default community + snmpwalk loot      → findings/snmp.jsonl
     ldap_checks    — nxc ldap signing/channel-binding + ldapsearch anon bind/account dump → findings/ldap.jsonl
     ftp_checks     — netexec: anonymous FTP login                      → findings/ftp.jsonl
@@ -158,8 +165,18 @@ PORT_NFS = 2049
 PORT_RSYNC = 873
 PORT_NETBIOS = 137
 PORT_RDP = 3389
+PORT_KERBEROS = 88                                # KDC — a host with 88 open is a domain controller
 VNC_PORTS = frozenset(range(5900, 5907))          # VNC displays :0-:6 (5900-5906)
 _RD_PORTS = frozenset({PORT_RDP}) | VNC_PORTS     # remote-desktop sockets scrying screenshots
+
+# unauthenticated-datastore ports (datastore_checks) — all already in the fast INTERNAL_PORTS set, so
+# the per-subnet loop gates on them directly. Elasticsearch (9200/9300) is HTTP → left to the web
+# hand-off + nuclei_scope, not here.
+PORT_REDIS = 6379
+PORT_MEMCACHED = 11211
+PORT_MSSQL = 1433
+MONGODB_PORTS = frozenset({27017, 27018})
+DATASTORE_PORTS = frozenset({PORT_REDIS, PORT_MEMCACHED, PORT_MSSQL}) | MONGODB_PORTS
 
 # Web-service detection for the external hand-off (aggregate_web_targets). A socket is a web target if its
 # port is a known HTTP(S) port OR nerva's banner says http; the scheme is https for the TLS ports / a
@@ -299,6 +316,16 @@ def web_targets_from(ports: list[dict], services: list[dict]) -> list[str]:
         https = port in HTTPS_PORTS or any(t in info for t in ("https", "ssl", "tls"))
         urls.add(f"{'https' if https else 'http'}://{ip}:{port}")
     return sorted(urls)
+
+
+def delta_sockets(full: list[dict], fast: list[dict]) -> list[str]:
+    """Sockets in the FULL-port scan but NOT in the fast curated set, as sorted 'ip:port' lines (pure).
+    The fast set is already fingerprinted per-subnet (loop 1), so fingerprint_full covers only this
+    delta — services on non-standard ports. Malformed records (missing ip / non-int port) are dropped."""
+    def socks(records: list[dict]) -> set[tuple[str, int]]:
+        return {(str(r["ip"]), int(r["port"])) for r in records
+                if r.get("ip") and isinstance(r.get("port"), int)}
+    return [f"{ip}:{port}" for ip, port in sorted(socks(full) - socks(fast))]
 
 
 def software_from_services(records: list[dict]) -> list[dict]:
@@ -577,6 +604,89 @@ def parse_nxc_rid_brute(out: str) -> dict:
     return {"users": sorted(set(users)), "groups": sorted(set(groups))}
 
 
+def parse_enum_ca(out: str) -> list[dict]:
+    """netexec `-M enum_ca` output → ADCS findings (pure). The module highlights 'Active Directory
+    Certificate Services Found.' per CA host and 'Web enrollment found on HTTP (ESC8).' when the CA
+    exposes HTTP web enrollment (the NTLM-relay-to-CA surface). Deduped per (host, kind)."""
+    findings: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in out.splitlines():
+        m = _NXC_SMB_LINE.match(raw.strip())
+        if not m:
+            continue
+        host, msg = m.group(1), m.group(2).strip()
+        if "Certificate Services Found" in msg and (host, "ca") not in seen:
+            seen.add((host, "ca"))
+            findings.append({"type": "adcs-ca-found", "severity": "info", "host": host, "evidence": msg})
+        elif "ESC8" in msg and (host, "esc8") not in seen:
+            seen.add((host, "esc8"))
+            findings.append({"type": "adcs-esc8-web-enrollment", "severity": "high", "host": host,
+                             "evidence": "HTTP web enrollment (ESC8) — NTLM relay to CA → cert → DC auth"})
+    return findings
+
+
+_ASREP_HASH = re.compile(r"\$krb5asrep\$\d+\$([^@\s]+)@\S+")
+_LDAP_HOST_PREFIX = re.compile(r"^LDAP\s+(\S+)\s+\d+")
+
+
+def parse_asrep_roast(out: str) -> list[dict]:
+    """netexec `nxc ldap --asreproast` (or GetNPUsers) output → asrep-roastable findings (pure). Each
+    roastable account yields a '$krb5asrep$<etype>$<user>@<REALM>:<hash>' token; the user is the
+    principal before '@' and the whole token is kept as loot. The host is read from netexec's
+    'LDAP <ip> <port> …' line prefix when present ('' for a bare GetNPUsers line — the stage fills it).
+    AS-REP roasting is a no-cred attack (accounts flagged DONT_REQ_PREAUTH)."""
+    findings: list[dict] = []
+    for raw in out.splitlines():
+        line = raw.strip()
+        m = _ASREP_HASH.search(line)
+        if not m:
+            continue
+        hp = _LDAP_HOST_PREFIX.match(line)
+        findings.append({"type": "asrep-roastable", "severity": "high",
+                         "host": hp.group(1) if hp else "", "account": m.group(1),
+                         "hash": m.group(0), "evidence": f"AS-REP roastable account: {m.group(1)}"})
+    return findings
+
+
+# datastore NSE → (service family, finding type, severity). A datastore script that returns data at all
+# usually means the store answered WITHOUT auth; ms-sql-info is exposure only. mongodb-databases (an
+# unauth DB listing) outranks mongodb-info — the strongest signal per (host, family) wins.
+_DATASTORE_NSE = "redis-info,mongodb-info,mongodb-databases,memcached-info,ms-sql-info"
+_DATASTORE_SIGNALS: dict[str, tuple[str, str, str]] = {
+    "redis-info": ("redis", "redis-unauth-access", "high"),
+    "mongodb-databases": ("mongodb", "mongodb-unauth-access", "high"),
+    "mongodb-info": ("mongodb", "mongodb-exposed", "medium"),
+    "memcached-info": ("memcached", "memcached-unauth-access", "medium"),
+    "ms-sql-info": ("mssql", "mssql-exposed", "info"),
+}
+_SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+_NSE_LINE = re.compile(r"^\|_?\s*([a-z0-9-]+):")
+
+
+def parse_datastore_nse(out: str) -> list[dict]:
+    """nmap NSE output (`-oN -`) → unauthenticated-datastore findings (pure). Tracks the current host
+    ('Nmap scan report for <ip>') and maps each datastore script-result line ('| <script>:' /
+    '|_<script>:') to a finding via _DATASTORE_SIGNALS, keeping the STRONGEST signal per (host, service
+    family). Non-datastore scripts and value sub-lines are ignored."""
+    best: dict[tuple[str, str], dict] = {}
+    host = ""
+    for raw in out.splitlines():
+        line = raw.strip()
+        if line.startswith("Nmap scan report for"):
+            host = line.rsplit(" ", 1)[-1].strip("()")
+            continue
+        m = _NSE_LINE.match(line)
+        if not m or m.group(1) not in _DATASTORE_SIGNALS:
+            continue
+        family, ftype, sev = _DATASTORE_SIGNALS[m.group(1)]
+        key = (host, family)
+        prev = best.get(key)
+        if prev is None or _SEV_RANK[sev] > _SEV_RANK[prev["severity"]]:
+            best[key] = {"type": ftype, "severity": sev, "host": host, "service": family,
+                         "evidence": f"{m.group(1)} responded (nmap NSE)"}
+    return sorted(best.values(), key=lambda f: (f["host"], f["service"]))
+
+
 def parse_nxc_pass_pol(out: str) -> dict:
     """netexec `--pass-pol` output → the password-policy fields that matter for safe spraying (pure):
     minimum length + account-lockout threshold/duration."""
@@ -782,6 +892,48 @@ def nuclei_scope(activity: Activity) -> None:
                stdin="\n".join(targets), dest=activity.findings / "nuclei_scope.jsonl",
                label="nuclei_scope")
     log.info("  → nuclei_scope — %d finding(s) over %d socket(s)", len(_jsonl(out)), len(targets))
+
+
+def fingerprint_full(activity: Activity) -> None:
+    """SPANNING — fingerprint the FULL-port DELTA (sockets portscan_full found beyond the fast curated
+    set) whole-scope with nerva → asset_discovery/services_full.jsonl. Runs ∥ cluster + the loops
+    (joined at the fan-in), so a service on a non-standard port gets a banner without serialising a
+    full-scan fingerprint in front of the per-subnet work. Those banners feed cve_lookup_full AND the
+    web-service detection for the external hand-off (a web server on an odd port is recognised via its
+    banner). Best-effort: skips if nerva is absent or there is no delta."""
+    canon = activity.asset_discovery_canonical
+    sockets = delta_sockets(tools.read_jsonl(canon("ports_full.jsonl")),
+                            tools.read_jsonl(canon("ports.jsonl")))
+    records: list[dict] = []
+    if sockets and shutil.which(NERVA):
+        out = _run([NERVA, "--json"], stdin="\n".join(sockets),
+                   dest=activity.asset_discovery_raw("nerva") / "fingerprint_full.jsonl",
+                   label="fingerprint_full")
+        records = _jsonl(out)
+    tools.write_jsonl(canon("services_full.jsonl"), records)
+    log.info("  → fingerprint_full — %d non-standard-port service(s) over %d delta socket(s)",
+             len(records), len(sockets))
+
+
+def cve_lookup_full(activity: Activity) -> None:
+    """SPANNING — known-CVE correlation of the FULL-port delta software (fingerprint_full's
+    services_full.jsonl) against search_vulns' LOCAL DB → <activity>/findings/cve_full.jsonl. An
+    activity-level finding (whole-scope, like nuclei_scope — NOT lifted by consolidate), the delta of
+    the per-subnet cve_lookup (non-standard ports it never saw). OFFLINE (net=False); the process-wide
+    memo makes the overlap with cve_lookup free. Runs ∥ everything, joined at the fan-in. Best-effort:
+    skips if search_vulns / its DB is absent."""
+    canon = activity.asset_discovery_canonical
+    if shutil.which(SEARCH_VULNS) is None:
+        log.debug("  · skip cve_lookup_full (search_vulns absent)")
+        return
+    software = software_from_services(tools.read_jsonl(canon("services_full.jsonl")))
+    findings: list[dict] = []
+    for sw in software:
+        findings += [{**cve, "hosts": sw["hosts"]} for cve in _query_cve(sw["product"], sw["version"])]
+    findings.sort(key=_cve_sort_key)
+    tools.write_jsonl(activity.findings / "cve_full.jsonl", findings)
+    log.info("  → cve_lookup_full — %d software → %d CVE(s) (full-port delta)",
+             len(software), len(findings))
 
 
 # --- cluster (fan-out pivot) — partition live hosts by scope subnet ------------------------------
@@ -1030,6 +1182,47 @@ def ad_enum(activity: Activity, app_id: str) -> None:
     log.info("  → ad_enum [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
 
 
+def adcs_checks(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — ADCS enumeration WITHOUT credentials via netexec `-M enum_ca` on hosts with 445 open:
+    anonymous CA discovery (RPC epmapper) + ESC8 detection (the module itself probes /certsrv for HTTP
+    web enrollment). ESC8 is the relay-based ESC — pairs with the smb/ldap-signing surface. The
+    template ESCs (ESC1-7) need an authenticated bind → deferred to the credentialed phase.
+    Best-effort → findings/adcs.jsonl."""
+    ws = activity.app(app_id)
+    hosts = _hosts_with_port(ws, PORT_SMB)
+    if not hosts or shutil.which(NXC) is None:
+        log.debug("  · skip adcs_checks [%s] (no 445 / netexec absent)", app_id)
+        return
+    out = _capture([NXC, "smb", *hosts, "-u", "", "-p", "", "-M", "enum_ca"],
+                   dest=ws.raw("netexec") / "enum_ca.txt", label="adcs")
+    findings = parse_enum_ca(out)
+    tools.write_jsonl(ws.findings / "adcs.jsonl", findings)
+    log.info("  → adcs_checks [%s] — %d host(s) → %d finding(s)", app_id, len(hosts), len(findings))
+
+
+def kerberoast_asrep(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — AS-REP roasting WITHOUT credentials via netexec on the group's KDC(s) (hosts with 88
+    open). Feeds `nxc ldap --asreproast` the domain user list ad_enum already produced (needs=ad_enum,
+    an intra-loop dependency) and requests an AS-REP for accounts flagged DONT_REQ_PREAUTH — no
+    password is sent and no login is attempted. The '$krb5asrep$…' hashes are offline-crackable loot.
+    Best-effort → findings/asrep.jsonl (skips with no KDC / empty userlist / netexec absent)."""
+    ws = activity.app(app_id)
+    dcs = _hosts_with_port(ws, PORT_KERBEROS)
+    userfile = ws.raw("netexec") / "domain_users.txt"          # written by ad_enum (same phase)
+    if not dcs or not tools.read_lines(userfile) or shutil.which(NXC) is None:
+        log.debug("  · skip kerberoast_asrep [%s] (no KDC / no userlist / netexec absent)", app_id)
+        return
+    out = _capture([NXC, "ldap", *dcs, "-u", str(userfile), "-p", "",
+                    "--asreproast", str(ws.raw("netexec") / "asrep_hashes.txt")],
+                   dest=ws.raw("netexec") / "asreproast.txt", label="asrep")
+    findings = parse_asrep_roast(out)
+    for f in findings:                                         # attribute a bare (prefix-less) hash to the KDC
+        f["host"] = f["host"] or dcs[0]
+    tools.write_jsonl(ws.findings / "asrep.jsonl", findings)
+    log.info("  → kerberoast_asrep [%s] — %d KDC(s) → %d roastable account(s)",
+             app_id, len(dcs), len(findings))
+
+
 def _ldap_dump(ws: AppWorkspace, host: str, contexts: list[str]) -> list[dict]:
     """Bounded anonymous account dump (ldapsearch -z LDAP_MAX_ENTRIES) over the first DOMAIN naming
     context → an ldap-anon-users finding + a users loot file. Read-only, best-effort ([] on nothing)."""
@@ -1148,6 +1341,27 @@ def rsync_checks(activity: Activity, app_id: str) -> None:
     log.info("  → rsync_checks [%s] — %d host(s) → %d module(s)", app_id, len(hosts), len(findings))
 
 
+def datastore_checks(activity: Activity, app_id: str) -> None:
+    """LOOP 2 — unauthenticated datastore exposure on the group's datastore sockets (Redis 6379 /
+    MongoDB 27017-8 / Memcached 11211 / MSSQL 1433 — all in the fast port set). ONE nmap NSE run whose
+    scripts return data only when the store answers WITHOUT auth (redis-info / mongodb-databases /
+    memcached-info; ms-sql-info is exposure-only). Elasticsearch (9200) is HTTP → left to the web
+    hand-off + nuclei_scope. Non-destructive (no login attempt). Best-effort → findings/datastore.jsonl."""
+    ws = activity.app(app_id)
+    sockets = _sockets_with_ports(ws, DATASTORE_PORTS)
+    if not sockets or shutil.which(NMAP) is None:
+        log.debug("  · skip datastore_checks [%s] (no datastore port / nmap absent)", app_id)
+        return
+    hosts = sorted({ip for ip, _ in sockets})
+    ports = ",".join(str(p) for p in sorted({p for _, p in sockets}))
+    out = _capture([NMAP, "-Pn", "-n", "-sV", "-p", ports, "--script", _DATASTORE_NSE,
+                    "-oN", "-", *hosts], dest=ws.raw("nmap") / "datastore.txt", label="datastore")
+    findings = parse_datastore_nse(out)
+    tools.write_jsonl(ws.findings / "datastore.jsonl", findings)
+    log.info("  → datastore_checks [%s] — %d socket(s) → %d finding(s)",
+             app_id, len(sockets), len(findings))
+
+
 def netbios_checks(activity: Activity, app_id: str) -> None:
     """LOOP 2 — NetBIOS identity enumeration (137/UDP, so it runs over ALL group hosts like SNMP, not
     the TCP portscan). nmap `nbstat` yields hostname, logged-on user and MAC/vendor per host — cheap,
@@ -1234,21 +1448,30 @@ _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "nfs.jsonl": ("findings/nfs.jsonl",),
     "rsync.jsonl": ("findings/rsync.jsonl",),
     "ad_enum.jsonl": ("findings/ad_enum.jsonl",),
+    "adcs.jsonl": ("findings/adcs.jsonl",),
+    "asrep.jsonl": ("findings/asrep.jsonl",),
+    "datastore.jsonl": ("findings/datastore.jsonl",),
     "netbios.jsonl": ("findings/netbios.jsonl",),
     "dns.jsonl": ("findings/dns.jsonl",),
     "remote_desktop.jsonl": ("findings/remote_desktop.jsonl",),
 }
-# nuclei_scope is written whole-scope at the activity level (like external) — not lifted here.
+# nuclei_scope AND cve_full are written whole-scope at the activity level (like external) — not lifted
+# here (the full-port CVE delta is activity-scoped, the gemini of the whole-scope nuclei_scope).
 
 
 def aggregate_web_targets(activity: Activity) -> list[str]:
-    """Aggregate every subnet group's web services into <activity>/web_targets.txt (scheme://ip:port),
-    the scope artifact the external hand-off consumes. Reads each group's ports.jsonl + services.jsonl.
-    Idempotent. Returns the URL list."""
-    urls = tools.dedupe(
-        u for ws in activity.list_apps()
-        for u in web_targets_from(tools.read_jsonl(ws.canonical("ports.jsonl")),
-                                  tools.read_jsonl(ws.canonical("services.jsonl"))))
+    """Aggregate every web service into <activity>/web_targets.txt (scheme://ip:port), the scope
+    artifact the external hand-off consumes. Two sources, unioned: (1) each subnet group's fast-set
+    ports.jsonl + services.jsonl (per-subnet); (2) the whole-scope FULL-port scan (ports_full.jsonl +
+    fingerprint_full's services_full.jsonl), so a web server on a NON-standard port — recognised only
+    via its fingerprint banner — reaches the hand-off too. Idempotent, sorted. Returns the URL list."""
+    canon = activity.asset_discovery_canonical
+    per_subnet = [u for ws in activity.list_apps()
+                  for u in web_targets_from(tools.read_jsonl(ws.canonical("ports.jsonl")),
+                                            tools.read_jsonl(ws.canonical("services.jsonl")))]
+    full_port = web_targets_from(tools.read_jsonl(canon("ports_full.jsonl")),
+                                 tools.read_jsonl(canon("services_full.jsonl")))
+    urls = sorted({*per_subnet, *full_port})
     tools.write_lines(activity.base / WEB_SCOPE_FILE, urls)
     return urls
 
