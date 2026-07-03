@@ -440,19 +440,22 @@ def test_consolidate_lifts_per_subnet_findings(tmp_path):
     assert lifted == [{"app_id": "10.0.1.0-24", "type": "smb-signing-disabled", "evidence": "x"}]
 
 
-def test_consolidate_removes_stale_findings_on_rerun(tmp_path):
-    # A type produced last run but NOT this run must not leave a stale activity-level file (the docstring
-    # promises "overwrites each run"): a re-run/--resume with fewer results would otherwise report ghosts.
+def test_consolidate_preserves_prior_findings_on_empty_rerun(tmp_path):
+    # --resume MUST NOT destroy prior findings: if a type has no per-app records this run, consolidate
+    # leaves the prior activity-level file UNTOUCHED (findings are precious in a pentest; a resume keeps
+    # skipped stages' per-app files anyway, so this only guards a re-run from silently deleting results).
     act = Activity.named("intdemo", root=tmp_path).ensure()
     ws = act.app("10.0.1.0-24").ensure()
     smb = ws.findings / "smb.jsonl"
     tools.write_jsonl(smb, [{"type": "smb-signing-disabled", "evidence": "x"}])
     tasks.consolidate(act)
-    assert (act.findings / "smb.jsonl").exists()
-    smb.unlink()                                        # the rescan found nothing this run
-    counts = tasks.consolidate(act)
-    assert "smb" not in counts
-    assert not (act.findings / "smb.jsonl").exists()    # the stale lifted file is gone
+    lifted = act.findings / "smb.jsonl"
+    assert lifted.exists()
+    smb.unlink()                                        # a re-run where the per-app source is gone
+    tasks.consolidate(act)
+    assert lifted.exists()                              # prior finding preserved, NOT deleted
+    assert tools.read_jsonl(lifted) == [
+        {"app_id": "10.0.1.0-24", "type": "smb-signing-disabled", "evidence": "x"}]
 
 
 # --- web-service aggregation + external hand-off (pipeline composition) ---------------------------

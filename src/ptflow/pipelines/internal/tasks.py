@@ -1525,19 +1525,19 @@ def consolidate(activity: Activity) -> dict[str, int]:
     """TERMINAL fan-in (deterministic, OFFLINE) — lift every subnet group's per-app findings into
     <activity>/findings/<type>.jsonl, one file per finding TYPE, each record stamped with its app_id
     (the subnet slug). Also aggregates the web services into <activity>/web_targets.txt (the external
-    hand-off scope). A type with no results this run REMOVES any stale activity-level file (idempotent:
-    overwrites/clears each run / --resume — a re-run with fewer findings never leaves ghosts)."""
+    hand-off scope). A type with no results this run LEAVES any prior findings/<type>.jsonl UNTOUCHED:
+    --resume MUST NOT destroy prior findings (precious in a pentest; skipped stages keep their per-app
+    files, so a resume reproduces the same aggregate) — for a clean aggregate, consolidate into a fresh
+    activity dir. Empty types write no file. Idempotent overwrite of a non-empty type."""
     apps = activity.list_apps()
     counts: dict[str, int] = {}
     for out_name, sources in _CONSOLIDATE_SOURCES.items():
         records = [{"app_id": ws.root.name, **rec}
                    for ws in apps for src in sources
                    for rec in tools.read_jsonl(ws.root / src)]
-        out_path = activity.findings / out_name
-        if records:
-            counts[out_name.removesuffix(".jsonl")] = tools.write_jsonl(out_path, records)
-        else:
-            out_path.unlink(missing_ok=True)   # drop a prior run's now-empty type (no stale findings)
+        if records:                            # never delete on empty — see docstring (--resume safety)
+            counts[out_name.removesuffix(".jsonl")] = tools.write_jsonl(
+                activity.findings / out_name, records)
     web = aggregate_web_targets(activity)
     log.info("  → consolidate — %s · %d web service(s) → %s",
              ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "no per-subnet findings",
