@@ -1243,9 +1243,10 @@ def test_dead_url_keys_only_paths_seen_exclusively_as_404():
 
 
 def test_assemble_catalog_drops_dead_get_keeps_post(tmp_path):
-    from ptflow.core.paths import AppWorkspace
+    from ptflow.core.paths import Activity
 
-    ws = AppWorkspace(tmp_path / "app").ensure()
+    act = Activity.named("assemble-dead", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
     ws.responses.mkdir(parents=True, exist_ok=True)
     ws.hosts.write_text("https://a.com\n")
     (ws.responses / "index.txt").write_text(
@@ -1260,7 +1261,7 @@ def test_assemble_catalog_drops_dead_get_keeps_post(tmp_path):
         json.dumps({"method": "POST", "url": "https://a.com/dead", "body": "u=1",
                     "raw": "POST /dead HTTP/1.1\r\nHost: a.com\r\n\r\nu=1", "sources": ["katana"]}),
     ]) + "\n")
-    catalog, _mined, n_dead = tasks._assemble_catalog(ws, include_guessed=False)
+    catalog, _mined, n_dead = tasks._assemble_catalog(act, ws, include_guessed=False)
     shapes = {(r["method"], tasks._url_pathkey(r["url"])) for r in catalog}
     assert ("GET", "a.com/dead") not in shapes        # dead GET dropped
     assert ("GET", "a.com/login") in shapes           # alive GET kept
@@ -1926,3 +1927,37 @@ def test_cross_group_surface_excludes_own_group(tmp_path):
     tools.write_lines(b.canonical("endpoints_js.txt"), ["https://api.company.com/self"])
     # only B exists; its own artifacts must not be harvested
     assert tasks._cross_group_surface(act, b) == []
+
+
+def test_request_catalog_full_routes_cross_group(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("xref3", root=tmp_path).ensure()
+    a = act.app("attack.com-aaaa").ensure()
+    b = act.app("api.company.com-bbbb").ensure()
+    tools.write_lines(a.hosts, ["https://attack.com"])
+    tools.write_lines(b.hosts, ["https://api.company.com"])
+    tools.write_lines(a.canonical("endpoints_js.txt"), ["https://api.company.com/v1/users"])
+    # phase-4 full catalog for B must include the endpoint discovered under A
+    tasks.request_catalog_full(act, "api.company.com-bbbb")
+    full = [r["url"] for r in tools.read_jsonl(b.canonical("requests_full.jsonl"))]
+    assert any("api.company.com/v1/users" in u for u in full)
+    # phase-1 surface catalog for B must NOT route cross-group
+    tasks.request_catalog(act, "api.company.com-bbbb")
+    surface = [r["url"] for r in tools.read_jsonl(b.canonical("requests.jsonl"))]
+    assert not any("api.company.com/v1/users" in u for u in surface)
+
+
+def test_request_catalog_full_single_group_unchanged(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    # a lone group has no other groups to harvest from → routing is a no-op
+    act = Activity.named("xref4", root=tmp_path).ensure()
+    b = act.app("only").ensure()
+    tools.write_lines(b.hosts, ["https://api.company.com"])
+    tools.write_lines(b.canonical("endpoints_js.txt"), ["https://api.company.com/own"])
+    tasks.request_catalog_full(act, "only")
+    full = [r["url"] for r in tools.read_jsonl(b.canonical("requests_full.jsonl"))]
+    assert any("api.company.com/own" in u for u in full)   # its own endpoint still present

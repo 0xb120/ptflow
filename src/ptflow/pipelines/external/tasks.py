@@ -3763,7 +3763,7 @@ def _cross_group_surface(activity: Activity, ws: AppWorkspace) -> list[dict]:
     return out
 
 
-def _assemble_catalog(ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[dict], int, int]:
+def _assemble_catalog(activity: Activity, ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[dict], int, int]:
     """Assemble a per-app request catalog → (catalog records, count mined from corpus, count dropped as
     dead/404). Pure-ish (reads disk only). Three contributions, all deduped by request shape
     (`merge_requests`):
@@ -3802,6 +3802,7 @@ def _assemble_catalog(ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[
                 *tools.read_lines(ws.canonical("endpoints_headless.txt"))]
     if include_guessed:
         request_recs += tools.read_jsonl(ws.canonical("requests_recrawl.jsonl"))  # re-seed crawl (if on)
+        request_recs += _cross_group_surface(activity, ws)  # endpoints discovered in OTHER in-scope groups
         get_urls += [r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
                      if r.get("url") and 200 <= (r.get("status") or 0) < 300]  # noqa: PLR2004
     catalog = catalog_records(request_recs, get_urls, in_scope, schemes)
@@ -3821,7 +3822,7 @@ def request_catalog(activity: Activity, app_id: str) -> None:
     Offline (net=False); needs crawl_headless/mine_responses/api_spec so the records + extracted corpus
     are present. A bare URL list can only fuzz GET query — this catalog is what unlocks POST/JSON/body."""
     ws = activity.app(app_id)
-    catalog, n_mined, n_dead = _assemble_catalog(ws, include_guessed=False)
+    catalog, n_mined, n_dead = _assemble_catalog(activity, ws, include_guessed=False)
     n = tools.write_jsonl(ws.canonical("requests.jsonl"), catalog)
     methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
     log.info("  → request_catalog (%s) — %d surface request shape(s) [%s] (mined %d from corpus,"
@@ -3836,7 +3837,7 @@ def request_catalog_full(activity: Activity, app_id: str) -> None:
     responses/recrawl/ — re-extracted idempotently). Offline (net=False); reads phase-1 + phase-3
     artifacts across the barriers, so it sees the COMPLETE corpus. Feeds param_fuzz + dast_full."""
     ws = activity.app(app_id)
-    catalog, n_mined, n_dead = _assemble_catalog(ws, include_guessed=True)
+    catalog, n_mined, n_dead = _assemble_catalog(activity, ws, include_guessed=True)
     n = tools.write_jsonl(ws.canonical("requests_full.jsonl"), catalog)
     methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
     log.info("  → request_catalog_full (%s) — %d request shape(s) [%s] (mined %d from corpus,"
