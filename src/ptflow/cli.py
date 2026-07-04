@@ -110,14 +110,21 @@ def _doctor(pipeline_name: str) -> int:
     return report.exit_code
 
 
+def _apply_ai_flag(overrides: list[str], *, ai: bool) -> list[str]:
+    """Append ``ai=on`` for the ``--ai`` convenience flag — but only when the user did not already
+    pass an explicit ``ai=`` via ``--set``. ``--set`` must win over the flag (documented precedence:
+    ``--set`` > env > config; ``--ai`` is sugar for ``--set ai=on``, not a higher-precedence override)."""
+    if ai and not any(o.split("=", 1)[0].strip() == "ai" for o in overrides):
+        return [*overrides, "ai=on"]
+    return overrides
+
+
 def _run(args: argparse.Namespace) -> int:
     setup_logging(verbose=args.verbose)
     # Resolve operator config (--set > env > file) and write it into os.environ BEFORE importing the
     # pipeline — its module-level constants read PTFLOW_* at import time.
     try:
-        overrides = list(args.overrides or [])
-        if args.ai:
-            overrides.append("ai=on")
+        overrides = _apply_ai_flag(list(args.overrides or []), ai=args.ai)
         resolved = runconfig.resolve(runconfig.load_config(args.config), os.environ, overrides)
     except runconfig.ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)  # noqa: T201
