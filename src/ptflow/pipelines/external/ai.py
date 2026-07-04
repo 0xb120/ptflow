@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel
 
-from ptflow.core import tools
+from ptflow.core import tools, workspace
 from ptflow.core.agent import HypothesisDraft
 from ptflow.core.ai.client import make_client
 from ptflow.core.log import get_logger
@@ -105,3 +105,49 @@ def report(activity: Activity) -> None:
     if text:
         (activity.base / "report.md").write_text(text, encoding="utf-8")
         log.info("  → report.md (%d findings, %d hypotheses)", len(records), len(hyps))
+
+
+# --- ai_wordlist (phase 2, net=False) --------------------------------------------------------------
+
+_WORDLIST_MAX_ENDPOINTS = 200
+_WORDLIST_MAX_CANDIDATES = 300
+
+WORDLIST_SYSTEM = (
+    "You generate content-discovery wordlist candidates for a web app. Given a sample of its observed "
+    "endpoints and detected tech stack, propose likely UNLINKED path segments, file names, and "
+    "parameter names to brute-force — tailored to what the app appears to do (e.g. an e-commerce app: "
+    "coupon, voucher, giftcard, promo). Output single tokens only (no slashes, no scheme, no host), "
+    "lowercase, deduplicated. Be specific to this app; do not emit generic filler."
+)
+
+
+class WordlistOut(BaseModel):
+    candidates: list[str]
+
+
+def _wordlist_user(endpoints: list[str], tech: list[str], apex: str | None) -> str:
+    return (f"apex: {apex or 'unknown'}\ntech: {', '.join(tech) or 'unknown'}\n"
+            "observed endpoints:\n" + "\n".join(endpoints[:_WORDLIST_MAX_ENDPOINTS]))
+
+
+def ai_wordlist(activity: Activity, app_id: str) -> None:
+    """PHASE 2 (net=False) — contextual content-discovery seed. Reads the phase-1 corpus (endpoints +
+    tech) and asks the model for app-specific candidate tokens → wl_custom/ai_seed.txt. The phase-3
+    barrier guarantees this file exists before build_content_wordlist folds it in. Best-effort no-op
+    when AI is off/unavailable or there is nothing to seed from."""
+    client = make_client()
+    if client is None:
+        return
+    ws = activity.app(app_id)
+    endpoints = tools.read_lines(ws.canonical("endpoints.txt"))
+    meta = workspace.read_meta(ws.meta)
+    tech = meta.get("tech") or []
+    hosts = meta.get("hosts") or []
+    if not endpoints and not tech:
+        return
+    apex = hosts[0] if hosts else None
+    out = client.complete_json(WORDLIST_SYSTEM, _wordlist_user(endpoints, tech, apex), WordlistOut)
+    if out is None:
+        return
+    n = tools.write_lines(ws.wl_custom / "ai_seed.txt", out.candidates[:_WORDLIST_MAX_CANDIDATES])
+    log.info("  → ai_wordlist (%s) — %d candidate token(s) → ai_seed.txt", app_id, n)

@@ -3308,6 +3308,7 @@ def build_content_wordlist(activity: Activity, ws: AppWorkspace, tech: list[str]
     app_id = ws.root.name
     # stage 0 custom (app-derived, high signal) — always full, first
     custom = [*tools.read_lines(ws.wl_custom / "seed.txt"),                 # build_wordlist app tokens
+              *tools.read_lines(ws.wl_custom / "ai_seed.txt"),              # ai_wordlist contextual tokens (--ai)
               *tools.read_lines(ws.wl_custom / "shortnames.txt"),           # tech_enum surface (8.3 names)
               *tokenize_urls(tools.read_lines(ws.canonical("endpoints_js.txt")))]  # mine_responses
 

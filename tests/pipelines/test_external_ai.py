@@ -1,3 +1,4 @@
+import json
 
 from ptflow.core import tools
 from ptflow.core.paths import Activity
@@ -54,3 +55,35 @@ def test_report_noop_when_client_none(tmp_path, monkeypatch):
     monkeypatch.setattr(ai, "make_client", lambda: None)
     ai.report(act)
     assert not (act.base / "report.md").exists()
+
+
+def test_ai_wordlist_writes_seed(tmp_path, monkeypatch):
+    act = Activity.named("w", root=tmp_path).ensure()
+    ws = act.app("shop-1a2b").ensure()
+    tools.write_lines(ws.canonical("endpoints.txt"), ["https://x/checkout", "https://x/cart"])
+    (ws.meta).write_text(json.dumps({"tech": ["php"], "hosts": ["shop.example"]}), encoding="utf-8")
+    out = ai.WordlistOut(candidates=["coupon", "giftcard", "voucher"])
+    monkeypatch.setattr(ai, "make_client", lambda: _FakeClient(json_out=out))
+    ai.ai_wordlist(act, "shop-1a2b")
+    assert tools.read_lines(ws.wl_custom / "ai_seed.txt") == ["coupon", "giftcard", "voucher"]
+
+
+def test_ai_wordlist_noop_when_client_none(tmp_path, monkeypatch):
+    act = Activity.named("w2", root=tmp_path).ensure()
+    ws = act.app("a").ensure()
+    tools.write_lines(ws.canonical("endpoints.txt"), ["https://x/y"])
+    monkeypatch.setattr(ai, "make_client", lambda: None)
+    ai.ai_wordlist(act, "a")
+    assert not (ws.wl_custom / "ai_seed.txt").exists()
+
+
+def test_build_content_wordlist_folds_ai_seed(tmp_path):
+    from ptflow.pipelines.external import tasks
+
+    act = Activity.named("wl", root=tmp_path).ensure()
+    ws = act.app("a").ensure()
+    tools.write_lines(ws.wl_custom / "seed.txt", ["login"])
+    tools.write_lines(ws.wl_custom / "ai_seed.txt", ["coupon"])
+    combined = tasks.build_content_wordlist(act, ws, [])
+    assert "coupon" in combined
+    assert "login" in combined
