@@ -3730,6 +3730,39 @@ def recrawl(activity: Activity, app_id: str) -> None:
              app_id, len(seeds), n)
 
 
+# Cross-group endpoint routing: discovery artifacts (JS/XHR/crawl-derived) that can carry a reference to
+# a DIFFERENT in-scope group's host — e.g. attack.com's frontend calling api.company.com's API.
+_XREF_REQUEST_FILES = ("requests_crawl.jsonl", "requests_headless.jsonl", "requests_api.jsonl")
+_XREF_ENDPOINT_FILES = ("endpoints.txt", "endpoints_js.txt", "endpoints_headless.txt")
+
+
+def _cross_group_surface(activity: Activity, ws: AppWorkspace) -> list[dict]:
+    """Request records discovered in OTHER app groups whose host belongs to `ws` — cross-group routing
+    that carries an API host's surface (only discoverable from another group's frontend JS) into that
+    host's OWN group. Returns request records (bare endpoints converted to GET via _url_to_get_request),
+    each with `xref:<origin app_id>` appended to `sources`. Reads only other groups' DERIVED discovery
+    artifacts (no re-mining, no network). RoE-safe: only hosts owned by `ws` are kept, so a host that is
+    no group's host is never routed. Pure-ish (reads disk only)."""
+    mine = {url_host(h) for h in tools.read_lines(ws.hosts)}
+    if not mine:
+        return []
+    out: list[dict] = []
+    for other in activity.list_apps():
+        origin = other.root.name
+        if origin == ws.root.name:
+            continue
+        tag = f"xref:{origin}"
+        for fname in _XREF_REQUEST_FILES:
+            out.extend({**rec, "sources": [*(rec.get("sources") or []), tag]}
+                       for rec in tools.read_jsonl(other.canonical(fname))
+                       if url_host(rec.get("url") or "") in mine)
+        for fname in _XREF_ENDPOINT_FILES:
+            out.extend(_url_to_get_request(u, tag)
+                       for u in tools.read_lines(other.canonical(fname))
+                       if url_host(u) in mine)
+    return out
+
+
 def _assemble_catalog(ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[dict], int, int]:
     """Assemble a per-app request catalog → (catalog records, count mined from corpus, count dropped as
     dead/404). Pure-ish (reads disk only). Three contributions, all deduped by request shape

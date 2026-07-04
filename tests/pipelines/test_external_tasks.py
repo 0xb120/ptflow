@@ -1889,3 +1889,40 @@ def test_cloud_findings_public_beats_exists():
     assert by["https://a.s3.amazonaws.com"]["type"] == "cloud-bucket-public"
     assert by["https://a.s3.amazonaws.com"]["severity"] == "high"
     assert by["https://b.s3.amazonaws.com"]["type"] == "cloud-bucket-exists"   # 403 only
+
+
+def test_cross_group_surface_routes_by_owning_host(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("xref1", root=tmp_path).ensure()
+    a = act.app("attack.com-aaaa").ensure()
+    b = act.app("api.company.com-bbbb").ensure()
+    tools.write_lines(a.hosts, ["https://attack.com"])
+    tools.write_lines(b.hosts, ["https://api.company.com"])
+    # discovered under A: one endpoint on B's host, one on a host owned by no group
+    tools.write_lines(a.canonical("endpoints_js.txt"),
+                      ["https://api.company.com/v1/users", "https://third.example/x"])
+    tools.write_jsonl(a.canonical("requests_crawl.jsonl"),
+                      [{"method": "POST", "url": "https://api.company.com/v1/login",
+                        "headers": {}, "body": "u=1", "params": [], "raw": "r", "sources": ["katana"]}])
+    routed = tasks._cross_group_surface(act, b)
+    urls = {r["url"] for r in routed}
+    assert "https://api.company.com/v1/users" in urls   # endpoint routed into B
+    assert "https://api.company.com/v1/login" in urls    # request routed into B
+    assert "https://third.example/x" not in urls         # no group owns it → dropped (RoE)
+    login = next(r for r in routed if r["url"].endswith("/login"))
+    assert login["method"] == "POST"                     # request shape preserved
+    assert any(s.startswith("xref:attack.com") for s in login["sources"])  # provenance tag
+
+
+def test_cross_group_surface_excludes_own_group(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("xref2", root=tmp_path).ensure()
+    b = act.app("b").ensure()
+    tools.write_lines(b.hosts, ["https://api.company.com"])
+    tools.write_lines(b.canonical("endpoints_js.txt"), ["https://api.company.com/self"])
+    # only B exists; its own artifacts must not be harvested
+    assert tasks._cross_group_surface(act, b) == []
