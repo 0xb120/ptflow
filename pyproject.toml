@@ -11,6 +11,11 @@ dependencies = [
 [project.scripts]
 ptflow = "ptflow.cli:main"
 
+[project.optional-dependencies]
+ai = [
+    "anthropic>=0.116.0",
+]
+
 [build-system]
 requires = ["uv_build"]
 build-backend = "uv_build"
