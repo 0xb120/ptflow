@@ -3730,7 +3730,40 @@ def recrawl(activity: Activity, app_id: str) -> None:
              app_id, len(seeds), n)
 
 
-def _assemble_catalog(ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[dict], int, int]:
+# Cross-group endpoint routing: discovery artifacts (JS/XHR/crawl-derived) that can carry a reference to
+# a DIFFERENT in-scope group's host — e.g. attack.com's frontend calling api.company.com's API.
+_XREF_REQUEST_FILES = ("requests_crawl.jsonl", "requests_headless.jsonl", "requests_api.jsonl")
+_XREF_ENDPOINT_FILES = ("endpoints.txt", "endpoints_js.txt", "endpoints_headless.txt")
+
+
+def _cross_group_surface(activity: Activity, ws: AppWorkspace) -> list[dict]:
+    """Request records discovered in OTHER app groups whose host belongs to `ws` — cross-group routing
+    that carries an API host's surface (only discoverable from another group's frontend JS) into that
+    host's OWN group. Returns request records (bare endpoints converted to GET via _url_to_get_request),
+    each with `xref:<origin app_id>` appended to `sources`. Reads only other groups' DERIVED discovery
+    artifacts (no re-mining, no network). RoE-safe: only hosts owned by `ws` are kept, so a host that is
+    no group's host is never routed. Pure-ish (reads disk only)."""
+    mine = {url_host(h) for h in tools.read_lines(ws.hosts)}
+    if not mine:
+        return []
+    out: list[dict] = []
+    for other in activity.list_apps():
+        origin = other.root.name
+        if origin == ws.root.name:
+            continue
+        tag = f"xref:{origin}"
+        for fname in _XREF_REQUEST_FILES:
+            out.extend({**rec, "sources": [*(rec.get("sources") or []), tag]}
+                       for rec in tools.read_jsonl(other.canonical(fname))
+                       if url_host(rec.get("url") or "") in mine)
+        for fname in _XREF_ENDPOINT_FILES:
+            out.extend(_url_to_get_request(u, tag)
+                       for u in tools.read_lines(other.canonical(fname))
+                       if url_host(u) in mine)
+    return out
+
+
+def _assemble_catalog(activity: Activity, ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[dict], int, int]:
     """Assemble a per-app request catalog → (catalog records, count mined from corpus, count dropped as
     dead/404). Pure-ish (reads disk only). Three contributions, all deduped by request shape
     (`merge_requests`):
@@ -3769,6 +3802,7 @@ def _assemble_catalog(ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[
                 *tools.read_lines(ws.canonical("endpoints_headless.txt"))]
     if include_guessed:
         request_recs += tools.read_jsonl(ws.canonical("requests_recrawl.jsonl"))  # re-seed crawl (if on)
+        request_recs += _cross_group_surface(activity, ws)  # endpoints discovered in OTHER in-scope groups
         get_urls += [r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
                      if r.get("url") and 200 <= (r.get("status") or 0) < 300]  # noqa: PLR2004
     catalog = catalog_records(request_recs, get_urls, in_scope, schemes)
@@ -3788,7 +3822,7 @@ def request_catalog(activity: Activity, app_id: str) -> None:
     Offline (net=False); needs crawl_headless/mine_responses/api_spec so the records + extracted corpus
     are present. A bare URL list can only fuzz GET query — this catalog is what unlocks POST/JSON/body."""
     ws = activity.app(app_id)
-    catalog, n_mined, n_dead = _assemble_catalog(ws, include_guessed=False)
+    catalog, n_mined, n_dead = _assemble_catalog(activity, ws, include_guessed=False)
     n = tools.write_jsonl(ws.canonical("requests.jsonl"), catalog)
     methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
     log.info("  → request_catalog (%s) — %d surface request shape(s) [%s] (mined %d from corpus,"
@@ -3803,7 +3837,7 @@ def request_catalog_full(activity: Activity, app_id: str) -> None:
     responses/recrawl/ — re-extracted idempotently). Offline (net=False); reads phase-1 + phase-3
     artifacts across the barriers, so it sees the COMPLETE corpus. Feeds param_fuzz + dast_full."""
     ws = activity.app(app_id)
-    catalog, n_mined, n_dead = _assemble_catalog(ws, include_guessed=True)
+    catalog, n_mined, n_dead = _assemble_catalog(activity, ws, include_guessed=True)
     n = tools.write_jsonl(ws.canonical("requests_full.jsonl"), catalog)
     methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
     log.info("  → request_catalog_full (%s) — %d request shape(s) [%s] (mined %d from corpus,"

@@ -360,6 +360,7 @@ FLOWMETA: dict[str, StepMeta] = {
         commands=(
             "# _assemble_catalog(include_guessed=True): requests_crawl/headless/api + requests_recrawl",
             "#   + shape minati dal corpus completo + endpoint URL-only (incl. content_discovery 2xx) come GET",
+            "#   + endpoint scoperti in ALTRI gruppi in-scope che appartengono a questo host (routing xref:<origin>)",
             "# dedup per shape (request_key = metodo + path-template) → merge_requests · scheme raggiungibile · in-scope",
             "# DROP delle shape GET dead/404 (dead_url_keys, sul corpus ora esteso da content_discovery/recrawl)",
         ),
