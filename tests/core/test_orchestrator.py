@@ -113,3 +113,32 @@ def test_per_app_loops_groups_by_phase_in_order():
     loops = orchestrator.per_app_loops(stages)
     assert [phase for phase, _ in loops] == [1, 2]
     assert [[s.name for s in ss] for _, ss in loops] == [["a", "b"], ["c"]]
+
+
+def test_terminal_fanin_isolates_agent_and_calls_report(tmp_path):
+    from ptflow.core import orchestrator
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("t", root=tmp_path).ensure()
+    called = {"report": False}
+
+    class P:
+        name = "p"
+
+        def provider(self):
+            class Prov:
+                name = "boom"
+
+                def propose(self, records):  # noqa: ARG002
+                    msg = "agent blew up"
+                    raise RuntimeError(msg)
+
+            return Prov()
+
+        def report(self, activity):  # noqa: ARG002
+            called["report"] = True
+
+    failures: list[str] = []
+    orchestrator._terminal_fanin(P(), act, failures)
+    assert "agent" in failures          # agent failure isolated, not raised
+    assert called["report"] is True     # report hook still ran

@@ -216,8 +216,9 @@ def _run_loops(  # noqa: PLR0913
 def _terminal_fanin(pipeline: Pipeline, activity: Activity, failures: list[str]) -> None:
     """Deterministic terminal fan-in, run after every loop + spanning join: (1) `consolidate` — an
     OPTIONAL pipeline hook (like preflight) that lifts per-app findings into <activity>/findings/<type>
-    .jsonl, failure-isolated so it can't sink the run; (2) the DORMANT agent seam (StubProvider), kept
-    in place — the real findings come from consolidate."""
+    .jsonl, failure-isolated so it can't sink the run; (2) the agent seam (`propose_hypotheses`),
+    failure-isolated — a Claude-backed provider can raise, and must not abort the run — followed by an
+    OPTIONAL `report(activity)` pipeline hook (duck-typed like consolidate), also failure-isolated."""
     do_consolidate = getattr(pipeline, "consolidate", None)
     if callable(do_consolidate):
         log.info("▶ consolidate")
@@ -227,8 +228,20 @@ def _terminal_fanin(pipeline: Pipeline, activity: Activity, failures: list[str])
             log.exception("⚠ consolidate failed")
             failures.append("consolidate")
     log.info("▶ agent")
-    n = propose_hypotheses(activity, pipeline.provider())
-    log.info("  → %d hypothesis(es)", n)
+    try:
+        n = propose_hypotheses(activity, pipeline.provider())
+        log.info("  → %d hypothesis(es)", n)
+    except Exception:  # a Claude-backed provider can raise; must not abort the run
+        log.exception("⚠ agent failed")
+        failures.append("agent")
+    do_report = getattr(pipeline, "report", None)  # optional AI report hook (duck-typed like consolidate)
+    if callable(do_report):
+        log.info("▶ report")
+        try:
+            do_report(activity)
+        except Exception:  # terminal reporting must not abort the whole run
+            log.exception("⚠ report failed")
+            failures.append("report")
 
 
 @flow(task_runner=ThreadPoolTaskRunner(max_workers=CONFIG.fanout.max_workers))  # ty: ignore[no-matching-overload]
