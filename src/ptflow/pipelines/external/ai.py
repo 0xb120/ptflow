@@ -95,7 +95,7 @@ def report(activity: Activity) -> None:
     client = make_client()
     if client is None:
         return
-    from ptflow.core.agent import gather_records  # noqa: PLC0415 (avoid an import cycle at load)
+    from ptflow.core.agent import gather_records  # noqa: PLC0415 (lazy — load-time hygiene)
 
     records = gather_records(activity)
     hyps = tools.read_jsonl(activity.findings / "hypotheses.jsonl")

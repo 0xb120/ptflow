@@ -117,6 +117,7 @@ def test_apply_ai_flag_appends_when_absent():
 
 def test_cli_run_set_ai_off_beats_ai_flag(tmp_path, monkeypatch):
     # End-to-end: `--set ai=off --ai` must resolve to PTFLOW_AI=off, not be silently clobbered by --ai.
+    monkeypatch.setenv("PTFLOW_AI", "off")
     monkeypatch.setattr("ptflow.core.orchestrator.orchestrate", lambda *_a, **_k: (tmp_path, 0))
     monkeypatch.delenv("PTFLOW_AI", raising=False)
     scope_file = _scope(tmp_path)
