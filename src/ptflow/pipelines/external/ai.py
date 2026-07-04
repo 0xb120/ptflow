@@ -151,3 +151,52 @@ def ai_wordlist(activity: Activity, app_id: str) -> None:
         return
     n = tools.write_lines(ws.wl_custom / "ai_seed.txt", out.candidates[:_WORDLIST_MAX_CANDIDATES])
     log.info("  → ai_wordlist (%s) — %d candidate token(s) → ai_seed.txt", app_id, n)
+
+
+# --- ai_secret_triage (phase 4, net=False) ---------------------------------------------------------
+
+_SECRETS_MAX = 100
+
+SECRET_SYSTEM = (
+    "You triage secret-scanner leads from a web recon run. For each numbered secret, judge whether it "  # noqa: S105
+    "is a REAL live credential, a TEST/example/placeholder value, or NOISE (false positive). Use the "
+    "kind, value shape, and any context. Return one verdict per input index."
+)
+
+
+class SecretVerdict(BaseModel):
+    index: int
+    verdict: Literal["real", "test", "noise"]
+    rationale: str
+
+
+class SecretTriageOut(BaseModel):
+    verdicts: list[SecretVerdict]
+
+
+def _secret_user(secrets: list[dict]) -> str:
+    return "\n".join(f"[{i}] {json.dumps(s)}" for i, s in enumerate(secrets))
+
+
+def ai_secret_triage(activity: Activity, app_id: str) -> None:
+    """PHASE 4 (net=False) — classify the secret-scanner leads (real/test/noise). Reads secrets.jsonl
+    (guaranteed present by the phase-4 barrier), writes the SIDECAR findings/secrets_triage.jsonl
+    (never mutates secrets.jsonl → write-once). Best-effort no-op when AI is off or there are no
+    secrets."""
+    client = make_client()
+    if client is None:
+        return
+    ws = activity.app(app_id)
+    secrets = tools.read_jsonl(ws.canonical("secrets.jsonl"))[:_SECRETS_MAX]
+    if not secrets:
+        return
+    out = client.complete_json(SECRET_SYSTEM, _secret_user(secrets), SecretTriageOut)
+    if out is None:
+        return
+    verdicts = [{"index": v.index, "verdict": v.verdict, "rationale": v.rationale,
+                 "secret": secrets[v.index]}
+                for v in out.verdicts if 0 <= v.index < len(secrets)]
+    n = tools.write_jsonl(ws.findings / "secrets_triage.jsonl", verdicts)
+    real = sum(1 for v in verdicts if v["verdict"] == "real")
+    log.info("  → ai_secret_triage (%s) — %d verdict(s) (%d real) → secrets_triage.jsonl",
+             app_id, n, real)

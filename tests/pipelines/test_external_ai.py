@@ -87,3 +87,43 @@ def test_build_content_wordlist_folds_ai_seed(tmp_path):
     combined = tasks.build_content_wordlist(act, ws, [])
     assert "coupon" in combined
     assert "login" in combined
+
+
+def test_ai_secret_triage_writes_verdicts(tmp_path, monkeypatch):
+    act = Activity.named("s", root=tmp_path).ensure()
+    ws = act.app("a").ensure()
+    tools.write_jsonl(ws.canonical("secrets.jsonl"),
+                      [{"kind": "aws", "value": "AKIA..."}, {"kind": "test", "value": "test123"}])
+    out = ai.SecretTriageOut(verdicts=[
+        ai.SecretVerdict(index=0, verdict="real", rationale="live AWS key shape"),
+        ai.SecretVerdict(index=1, verdict="test", rationale="obvious test value"),
+    ])
+    monkeypatch.setattr(ai, "make_client", lambda: _FakeClient(json_out=out))
+    ai.ai_secret_triage(act, "a")
+    recs = tools.read_jsonl(ws.findings / "secrets_triage.jsonl")
+    assert len(recs) == 2
+    assert recs[0]["verdict"] == "real"
+    assert recs[0]["secret"]["kind"] == "aws"        # original payload preserved
+    assert recs[1]["verdict"] == "test"
+
+
+def test_ai_secret_triage_noop_when_no_secrets(tmp_path, monkeypatch):
+    act = Activity.named("s2", root=tmp_path).ensure()
+    ws = act.app("a").ensure()
+    monkeypatch.setattr(ai, "make_client", lambda: _FakeClient(json_out=None))
+    ai.ai_secret_triage(act, "a")
+    assert not (ws.findings / "secrets_triage.jsonl").exists()
+
+
+def test_consolidate_lifts_secrets_triage(tmp_path):
+    from ptflow.pipelines.external import tasks
+
+    act = Activity.named("c", root=tmp_path).ensure()
+    ws = act.app("a").ensure()
+    tools.write_jsonl(ws.findings / "secrets_triage.jsonl",
+                      [{"index": 0, "verdict": "real", "rationale": "x", "secret": {"kind": "aws"}}])
+    tasks.consolidate(act)
+    lifted = tools.read_jsonl(act.findings / "secrets_triage.jsonl")
+    assert len(lifted) == 1
+    assert lifted[0]["app_id"] == "a"
+    assert lifted[0]["verdict"] == "real"

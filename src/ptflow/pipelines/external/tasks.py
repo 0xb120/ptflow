@@ -4753,6 +4753,7 @@ _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "cloud_assets.jsonl": ("findings/cloud_assets.jsonl",),
     "sourcemap.jsonl": ("findings/sourcemap.jsonl",),
     "secrets.jsonl": ("secrets.jsonl",),
+    "secrets_triage.jsonl": ("findings/secrets_triage.jsonl",),
     "default_creds.jsonl": ("default_creds.jsonl",),
 }
 
