@@ -1,3 +1,4 @@
+import importlib
 import json
 
 from ptflow.core import tools
@@ -127,3 +128,36 @@ def test_consolidate_lifts_secrets_triage(tmp_path):
     assert len(lifted) == 1
     assert lifted[0]["app_id"] == "a"
     assert lifted[0]["verdict"] == "real"
+
+
+def _reload_pipeline():
+    import ptflow.pipelines.external.pipeline as p
+    return importlib.reload(p)
+
+
+def test_ai_stages_absent_when_off(monkeypatch):
+    monkeypatch.delenv("PTFLOW_AI", raising=False)
+    p = _reload_pipeline()
+    names = {s.name for s in p.PIPELINE.stages}
+    assert "ai_wordlist" not in names
+    assert "ai_secret_triage" not in names
+
+
+def test_ai_stages_present_when_on(monkeypatch):
+    monkeypatch.setenv("PTFLOW_AI", "on")
+    p = _reload_pipeline()
+    names = {s.name for s in p.PIPELINE.stages}
+    assert "ai_wordlist" in names
+    assert "ai_secret_triage" in names
+    by_name = {s.name: s for s in p.PIPELINE.stages}
+    assert by_name["ai_wordlist"].phase == 2
+    assert by_name["ai_wordlist"].net is False
+    assert by_name["ai_secret_triage"].phase == 4
+    monkeypatch.delenv("PTFLOW_AI", raising=False)
+    _reload_pipeline()  # restore module state for later tests
+
+
+def test_provider_is_stub_without_ai(monkeypatch):
+    monkeypatch.delenv("PTFLOW_AI", raising=False)
+    p = _reload_pipeline()
+    assert p.PIPELINE.provider().name == "stub"

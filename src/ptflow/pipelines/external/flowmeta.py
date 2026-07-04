@@ -466,6 +466,20 @@ FLOWMETA: dict[str, StepMeta] = {
                "cap wall-clock per-host (WPPROBE_TIMEOUT) · auth passthrough (PTFLOW_HTTP_HEADER)",
                "per-app findings → consolidate (fan-in terminale)"),
     ),
+    "ai_wordlist": StepMeta(
+        summary="[--ai] FASE 2, offline — genera candidati wordlist CONTESTUALI dal corpus fase-1 "
+                "(endpoint + tech) via LLM → wl_custom/ai_seed.txt, foldato da build_content_wordlist.",
+        commands=("# core/ai — LLMClient.complete_json (Anthropic Messages API)",),
+        outputs=("wl_custom/ai_seed.txt",),
+        notes=("opt-in (PTFLOW_AI) · net=False · best-effort (skip se AI off/assente)",),
+    ),
+    "ai_secret_triage": StepMeta(
+        summary="[--ai] FASE 4, offline — classifica i lead secret (real/test/noise) via LLM → "
+                "findings/secrets_triage.jsonl (sidecar; NON muta secrets.jsonl). consolidate lo solleva.",
+        commands=("# core/ai — LLMClient.complete_json (Anthropic Messages API)",),
+        outputs=("findings/secrets_triage.jsonl",),
+        notes=("opt-in (PTFLOW_AI) · net=False · best-effort",),
+    ),
 }
 
 _PIVOT = StepMeta(
