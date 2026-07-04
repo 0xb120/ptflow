@@ -83,3 +83,16 @@ def test_snapshot_redacts_secrets_and_is_refeedable(tmp_path):
 
 def test_snapshot_none_when_empty(tmp_path):
     assert runconfig.snapshot(tmp_path, []) is None
+
+
+def test_ai_flag_resolves_to_env():
+    resolved = runconfig.resolve({}, {}, ["ai=on", "ai.model=claude-opus-4-8"])
+    envs = {r.env: r.value for r in resolved}
+    assert envs["PTFLOW_AI"] == "on"
+    assert envs["PTFLOW_AI_MODEL"] == "claude-opus-4-8"
+
+
+def test_ai_provider_enum_rejects_unknown():
+    import pytest
+    with pytest.raises(runconfig.ConfigError):
+        runconfig.resolve({}, {}, ["ai.provider=openai"])

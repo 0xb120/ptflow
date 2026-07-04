@@ -61,6 +61,11 @@ def main(argv: list[str] | None = None) -> int:
         "--set", action="append", default=None, metavar="KEY=VALUE", dest="overrides",
         help="override one config knob, repeatable (e.g. --set oast=on --set profile=home)",
     )
+    run.add_argument(
+        "--ai", action="store_true",
+        help="enable the optional AI layer (triage/report/secret-triage/wordlist); requires the "
+             "'ai' extra + ANTHROPIC_API_KEY. Equivalent to --set ai=on.",
+    )
 
     sub.add_parser("serve", help="start the Prefect server + UI for observability (foreground)")
 
@@ -110,7 +115,10 @@ def _run(args: argparse.Namespace) -> int:
     # Resolve operator config (--set > env > file) and write it into os.environ BEFORE importing the
     # pipeline — its module-level constants read PTFLOW_* at import time.
     try:
-        resolved = runconfig.resolve(runconfig.load_config(args.config), os.environ, args.overrides)
+        overrides = list(args.overrides or [])
+        if args.ai:
+            overrides.append("ai=on")
+        resolved = runconfig.resolve(runconfig.load_config(args.config), os.environ, overrides)
     except runconfig.ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)  # noqa: T201
         return 2
