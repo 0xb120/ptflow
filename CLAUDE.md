@@ -15,13 +15,14 @@ pipeline runs an asset-discovery (breadth) phase over the whole scope, clusters 
 results into "application groups", then runs one or more per-app **loops** (depth)
 that fan out under Prefect.
 
-> **Terminal step = deterministic `consolidate` (done); agent seam dormant.** The real terminal
-> fan-in is now `consolidate` (`pipelines/external/tasks.consolidate`, an optional `Pipeline` hook the
-> orchestrator calls like `preflight`): it lifts every app group's per-app findings into the
+> **Terminal step = deterministic `consolidate` (done); agent seam dormant by default.** The real
+> terminal fan-in is now `consolidate` (`pipelines/external/tasks.consolidate`, an optional `Pipeline`
+> hook the orchestrator calls like `preflight`): it lifts every app group's per-app findings into the
 > activity-level `<activity>/findings/<type>.jsonl`, one file per finding TYPE (`cve`/`dast` fold
 > their surface+deep passes). The old agent stage (`core/agent.py`, `HypothesisProvider`) still runs
-> as a **dormant** `StubProvider` fan-in beside it — its real (Claude-backed) implementation is
-> parked; don't build toward it, and leave the seam in place.
+> as a **dormant** `StubProvider` fan-in beside it by default — its real (Claude-backed) implementation
+> was parked; the opt-in `--ai` layer now provides it (`ai_triage`), so don't treat the seam as
+> permanently inert, and leave the seam in place.
 
 ## Commands
 
@@ -132,7 +133,8 @@ uv run ptflow run external <activity> <scope.txt> --observe # stream THIS run to
 2. **`pipeline.cluster(activity)`** is the fan-out pivot — it groups discovery output into
    `scans/<app_id>/` dirs and returns the list of `app_id`s;
 3. **per-app loops** run in order (see below);
-4. the **agent** stage runs once as a fan-in (currently the dormant stub).
+4. the **agent** stage runs once as a fan-in (the dormant `StubProvider` by default; the real
+   Claude-backed provider, `ai_triage`, when `--ai`).
 
 **Spanning stages** (`spanning=True`, activity-scope) don't block the breadth→cluster barrier:
 they're launched once their breadth `needs` are done and awaited only at the fan-in, so they run
@@ -809,9 +811,9 @@ idempotent (overwrites each run / `--resume`). Sources (`_CONSOLIDATE_SOURCES` +
 - `findings/takeover.jsonl` ← per-app `takeover.txt` lines → `{app_id, type, evidence, source}` records
 
 An empty TYPE writes no file (no clutter). The whole-scope `findings/nuclei_scope.jsonl` is already an
-activity-level finding and is left untouched. The dormant agent seam (`findings/hypotheses.jsonl`)
-runs separately and is kept in place. A `consolidate` failure is isolated (logged + counted), never
-aborting the run.
+activity-level finding and is left untouched. The agent seam (`findings/hypotheses.jsonl`) runs
+separately and is kept in place — dormant (`StubProvider`) by default, Claude-backed (`ai_triage`)
+under `--ai`. A `consolidate` failure is isolated (logged + counted), never aborting the run.
 
 ## Adding a pipeline (checklist)
 

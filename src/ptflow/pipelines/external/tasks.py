@@ -4764,9 +4764,9 @@ def consolidate(activity: Activity) -> dict[str, int]:
     app_id for traceability. A scanner's surface+deep passes fold into one file (cve, dast); the
     subjack takeover lines become records too. Reads only on-disk artifacts; tolerant of a malformed
     line (read_jsonl skips it). Whole-scope nuclei_scope.jsonl is already an activity finding and is
-    left untouched; the dormant agent seam (hypotheses.jsonl) runs separately. Returns {type: count}
-    for the NON-EMPTY categories (empty types write no file — no clutter). Idempotent: overwrites on
-    every run / --resume."""
+    left untouched; the agent seam (hypotheses.jsonl) runs separately — dormant by default, Claude-backed
+    under --ai. Returns {type: count} for the NON-EMPTY categories (empty types write no file — no
+    clutter). Idempotent: overwrites on every run / --resume."""
     apps = activity.list_apps()
     counts: dict[str, int] = {}
     for out_name, sources in _CONSOLIDATE_SOURCES.items():
