@@ -54,7 +54,8 @@ uv run pytest tests/core/test_scope.py::test_classify  # one test
 ### Run config (operator knobs)
 
 The **operator-facing** knobs (the ~14 `PTFLOW_*` env vars: `profile`, `oast`, `net_limit`, `http_header`,
-`recrawl`, `deep_dive`, tool paths, wordlist dir/roles, interactsh server/token) can be set in an
+`recrawl`, `deep_dive`, tool paths, wordlist dir/roles, interactsh server/token, `ai`/`ai.model`/
+`ai.base_url`/`ai.provider`) can be set in an
 optional TOML file (`--config ptflow.toml`; see `ptflow.toml.example` for the annotated template) instead of
 scattered env vars. Resolution is `core/runconfig.py` (pure `resolve()` + thin `apply()`/`snapshot()`),
 loaded by the CLI's `_run`. **Precedence: `--set KEY=VALUE` (CLI, repeatable) > `PTFLOW_*` env var >
@@ -216,8 +217,10 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       findings/tilde_enum.jsonl  findings/dast.jsonl  findings/dast_full.jsonl  findings/wpprobe.jsonl  #   per-app findings (shortscan; DAST surface/deep; wpprobe WP CVEs); consolidate lifts up
       findings/xss.jsonl  findings/xss_full.jsonl  findings/sqli.jsonl  findings/sqli_full.jsonl   #   dedicated scanners (dalfox XSS / sqlmap SQLi), surface+deep; consolidate folds by type
       findings/cve.jsonl  findings/cve_full.jsonl    #   cve_lookup (PHASE 2) / cve_lookup_full (PHASE 4): known CVEs on enumerated software
+      findings/secrets_triage.jsonl      #   ai_secret_triage (--ai, PHASE 4): LLM real/FP verdicts on secrets.jsonl leads, SIDECAR (never mutates secrets.jsonl)
       raw/cve/seen.txt                   #   cve_lookup: (product,version) covered in PHASE 2 → PHASE 4 reports only the delta
       wl_custom/seed.txt  wl_custom/round*.txt   #   per-app GENERATED wordlists (seed offline; round N = fuzzed delta)
+      wl_custom/ai_seed.txt              #   ai_wordlist (--ai, PHASE 2): LLM-suggested candidate tokens, folded into content_discovery's wordlist
       responses/  responses/headless/  responses/discovered/round*/   # downloaded corpus (katana/httpx -srd) — mined offline
       raw/<tool>/  # provenance + tool scratch: raw/extracted/ (mined bodies),
                    #   raw/httpx/{screenshot,osint,discovered}, raw/katana/{crawl,headless},
@@ -226,7 +229,9 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
   findings/cve.jsonl  findings/dast.jsonl  findings/xss.jsonl  findings/sqli.jsonl  findings/tilde_enum.jsonl  findings/wpprobe.jsonl  findings/secrets.jsonl  findings/takeover.jsonl  findings/default_creds.jsonl
                                          #   CONSOLIDATE output — per-app findings lifted up by TYPE (each record stamped app_id;
                                          #   cve/dast fold surface+deep). nuclei_scope.jsonl is the whole-scope nuclei finding.
-  findings/hypotheses.jsonl              # dormant agent fan-in output (StubProvider seam, kept in place)
+  findings/secrets_triage.jsonl          # CONSOLIDATE output — ai_secret_triage verdicts lifted by app_id (--ai; empty/absent when AI is off)
+  findings/hypotheses.jsonl              # agent fan-in output (StubProvider by default; --ai revives it as ai_triage, correlating consolidated findings)
+  report.md                              # --ai terminal narrative report (ai_report hook): consolidated findings + hypotheses → prose (absent when AI is off)
   screenshots/screenshot/screenshot.html # UNIFIED gallery — one batched httpx run, 1 host/group (+ eyewitness/report.html)
   poc/  tmp/  logs/
   wl_global/                             # shared/global INPUT wordlists (SecLists & co.)
@@ -903,6 +908,17 @@ flow changed:
   (50 vs 150) and feroxbuster `-t`/`-L`, for a domestic line. Aggregate load ≈ concurrency × rate,
   so the per-tool rate is the real lever (a `net` concurrency cap alone won't tame the single
   full-port/nuclei stages). The active profile is logged at run start (preflight).
+- **AI layer (opt-in, `--ai` / `PTFLOW_AI=on`)** — adds four best-effort LLM stages via the
+  `core/ai/` seam (`LLMClient` + `AnthropicClient`, Anthropic Messages API, `claude-opus-4-8` default;
+  `anthropic` is the OPTIONAL `ai` extra, imported lazily). Key via the standard `ANTHROPIC_API_KEY` /
+  `ant` profile — NOT a ptflow knob. Stages: `ai_wordlist` (phase 2 → `wl_custom/ai_seed.txt`, folded
+  by `build_content_wordlist`), `ai_secret_triage` (phase 4 → sidecar `findings/secrets_triage.jsonl`),
+  `ai_triage` (revives the agent seam → `findings/hypotheses.jsonl`, correlating consolidated findings),
+  `ai_report` (terminal `report()` hook → `report.md`). All `net=False`, additive, failure-isolated;
+  with AI off, `ExternalPipeline.stages` is byte-identical to the deterministic default. Knobs:
+  `PTFLOW_AI_MODEL` / `PTFLOW_AI_BASE_URL` (Anthropic-compatible gateways/Bedrock/Vertex) /
+  `PTFLOW_AI_PROVIDER` (v1: `anthropic`). Roadmap: `ai_mine_bodies`, `ai_cve_rank`, `ai_param_values`,
+  native non-Anthropic provider (see `docs/superpowers/specs/2026-07-04-ai-layer-design.md`).
 - **Authorized test scope only:** `https://ginandjuice.shop/` (PortSwigger demo), `scanme.nmap.org`
   (Nmap-sanctioned).
 
