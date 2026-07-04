@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from ptflow.core.agent import HypothesisProvider, StubProvider
 from ptflow.core.stage import Stage
-from ptflow.pipelines.external import tasks
+from ptflow.pipelines.external import ai, tasks
 
 if TYPE_CHECKING:
     from ptflow.core.flowmap import MapSpec
     from ptflow.core.paths import Activity
     from ptflow.core.requirements import Requirement
+
+
+_AI = os.getenv("PTFLOW_AI", "").strip().lower() in {"1", "on", "true", "yes"}
+_AI_STAGES: tuple[Stage, ...] = (
+    # PHASE 2 (net=False) — contextual content-discovery seed, folded by build_content_wordlist.
+    Stage("ai_wordlist", ai.ai_wordlist, per_app=True, phase=2, net=False),
+    # PHASE 4 (net=False) — classify secret-scanner leads → findings/secrets_triage.jsonl.
+    Stage("ai_secret_triage", ai.ai_secret_triage, per_app=True, phase=4, net=False),
+)
 
 
 class ExternalPipeline:
@@ -95,6 +105,7 @@ class ExternalPipeline:
         # finding-only per-stack vuln scanners (gated on detected tech) — runs ∥ the rest of loop 4.
         # Today: wpprobe (WordPress plugin/theme → known-CVE) on WordPress groups → findings/wpprobe.jsonl.
         Stage("tech_vulnscan", tasks.tech_vulnscan, per_app=True, phase=4),
+        *(_AI_STAGES if _AI else ()),
     )
 
     def cluster(self, activity: Activity) -> list[str]:
@@ -107,7 +118,15 @@ class ExternalPipeline:
         return tasks.consolidate(activity)
 
     def provider(self) -> HypothesisProvider:
-        return StubProvider()
+        from ptflow.core.ai.client import make_client  # noqa: PLC0415
+
+        client = make_client()
+        return ai.ClaudeHypothesisProvider(client) if client is not None else StubProvider()
+
+    def report(self, activity: Activity) -> None:
+        """Optional AI report hook (duck-typed, called by the orchestrator terminal fan-in). No-op
+        when AI is off/unavailable."""
+        ai.report(activity)
 
     def preflight(self) -> None:
         """Log present/missing external tools at run start (best-effort, never aborts)."""

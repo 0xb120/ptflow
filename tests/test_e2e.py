@@ -1,4 +1,6 @@
-from ptflow.cli import main
+import os
+
+from ptflow.cli import _apply_ai_flag, main
 from ptflow.core import tools
 from ptflow.core.orchestrator import orchestrate
 from ptflow.pipelines import load_pipeline
@@ -101,6 +103,30 @@ def test_cli_interrupted_returns_130(tmp_path, monkeypatch):
     monkeypatch.setattr("ptflow.core.orchestrator.orchestrate", lambda *_a, **_k: (tmp_path, -1))
     scope_file = _scope(tmp_path)
     assert main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path)]) == 130
+
+
+def test_apply_ai_flag_does_not_override_explicit_set():
+    # --set ai=off must win over the --ai convenience flag (an explicit override outranks sugar for it)
+    assert _apply_ai_flag(["ai=off"], ai=True) == ["ai=off"]
+
+
+def test_apply_ai_flag_appends_when_absent():
+    assert _apply_ai_flag([], ai=True) == ["ai=on"]
+    assert _apply_ai_flag(["profile=home"], ai=False) == ["profile=home"]
+
+
+def test_cli_run_set_ai_off_beats_ai_flag(tmp_path, monkeypatch):
+    # End-to-end: `--set ai=off --ai` must resolve to PTFLOW_AI=off, not be silently clobbered by --ai.
+    monkeypatch.setenv("PTFLOW_AI", "off")
+    monkeypatch.setattr("ptflow.core.orchestrator.orchestrate", lambda *_a, **_k: (tmp_path, 0))
+    monkeypatch.delenv("PTFLOW_AI", raising=False)
+    scope_file = _scope(tmp_path)
+    rc = main([
+        "run", "example", "acme", str(scope_file), "--root", str(tmp_path),
+        "--set", "ai=off", "--ai",
+    ])
+    assert rc == 0
+    assert os.environ["PTFLOW_AI"] == "off"
 
 
 def test_cli_serve_starts_prefect_server(monkeypatch):

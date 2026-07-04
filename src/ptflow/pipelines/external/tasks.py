@@ -3308,6 +3308,7 @@ def build_content_wordlist(activity: Activity, ws: AppWorkspace, tech: list[str]
     app_id = ws.root.name
     # stage 0 custom (app-derived, high signal) — always full, first
     custom = [*tools.read_lines(ws.wl_custom / "seed.txt"),                 # build_wordlist app tokens
+              *tools.read_lines(ws.wl_custom / "ai_seed.txt"),              # ai_wordlist contextual tokens (--ai)
               *tools.read_lines(ws.wl_custom / "shortnames.txt"),           # tech_enum surface (8.3 names)
               *tokenize_urls(tools.read_lines(ws.canonical("endpoints_js.txt")))]  # mine_responses
 
@@ -4752,6 +4753,7 @@ _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "cloud_assets.jsonl": ("findings/cloud_assets.jsonl",),
     "sourcemap.jsonl": ("findings/sourcemap.jsonl",),
     "secrets.jsonl": ("secrets.jsonl",),
+    "secrets_triage.jsonl": ("findings/secrets_triage.jsonl",),
     "default_creds.jsonl": ("default_creds.jsonl",),
 }
 
@@ -4762,9 +4764,9 @@ def consolidate(activity: Activity) -> dict[str, int]:
     app_id for traceability. A scanner's surface+deep passes fold into one file (cve, dast); the
     subjack takeover lines become records too. Reads only on-disk artifacts; tolerant of a malformed
     line (read_jsonl skips it). Whole-scope nuclei_scope.jsonl is already an activity finding and is
-    left untouched; the dormant agent seam (hypotheses.jsonl) runs separately. Returns {type: count}
-    for the NON-EMPTY categories (empty types write no file — no clutter). Idempotent: overwrites on
-    every run / --resume."""
+    left untouched; the agent seam (hypotheses.jsonl) runs separately — dormant by default, Claude-backed
+    under --ai. Returns {type: count} for the NON-EMPTY categories (empty types write no file — no
+    clutter). Idempotent: overwrites on every run / --resume."""
     apps = activity.list_apps()
     counts: dict[str, int] = {}
     for out_name, sources in _CONSOLIDATE_SOURCES.items():

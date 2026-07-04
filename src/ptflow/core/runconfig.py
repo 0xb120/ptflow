@@ -24,7 +24,11 @@ log = get_logger()
 
 _HTTP_HEADER_SEP = ";;"          # PTFLOW_HTTP_HEADER multi-value separator (env reader also accepts \n)
 _TRUE = {"1", "on", "true", "yes"}
-_ENUMS = {"PTFLOW_PROFILE": ("wide", "home"), "PTFLOW_RECRAWL": ("off", "preview", "on")}
+_ENUMS = {
+    "PTFLOW_PROFILE": ("wide", "home"),
+    "PTFLOW_RECRAWL": ("off", "preview", "on"),
+    "PTFLOW_AI_PROVIDER": ("anthropic",),
+}
 _ROLES_PREFIX = "wordlists.roles."   # dynamic: wordlists.roles.<role> → PTFLOW_WL_<ROLE>
 
 
@@ -47,6 +51,10 @@ _KNOBS: tuple[Knob, ...] = (
     Knob("oast", "PTFLOW_OAST", "bool"),
     Knob("recrawl", "PTFLOW_RECRAWL", "str"),
     Knob("deep_dive", "PTFLOW_DEEP_DIVE", "bool"),
+    Knob("ai", "PTFLOW_AI", "bool"),
+    Knob("ai.model", "PTFLOW_AI_MODEL", "str"),
+    Knob("ai.base_url", "PTFLOW_AI_BASE_URL", "str"),
+    Knob("ai.provider", "PTFLOW_AI_PROVIDER", "str"),
     Knob("tools.sqlmap", "PTFLOW_SQLMAP", "path"),
     Knob("tools.search_vulns", "PTFLOW_SEARCH_VULNS", "path"),
     Knob("tools.nuclei_dast_templates", "PTFLOW_NUCLEI_DAST_TEMPLATES", "path"),

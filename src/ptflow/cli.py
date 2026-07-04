@@ -61,6 +61,11 @@ def main(argv: list[str] | None = None) -> int:
         "--set", action="append", default=None, metavar="KEY=VALUE", dest="overrides",
         help="override one config knob, repeatable (e.g. --set oast=on --set profile=home)",
     )
+    run.add_argument(
+        "--ai", action="store_true",
+        help="enable the optional AI layer (triage/report/secret-triage/wordlist); requires the "
+             "'ai' extra + ANTHROPIC_API_KEY. Equivalent to --set ai=on.",
+    )
 
     sub.add_parser("serve", help="start the Prefect server + UI for observability (foreground)")
 
@@ -105,12 +110,22 @@ def _doctor(pipeline_name: str) -> int:
     return report.exit_code
 
 
+def _apply_ai_flag(overrides: list[str], *, ai: bool) -> list[str]:
+    """Append ``ai=on`` for the ``--ai`` convenience flag — but only when the user did not already
+    pass an explicit ``ai=`` via ``--set``. ``--set`` must win over the flag (documented precedence:
+    ``--set`` > env > config; ``--ai`` is sugar for ``--set ai=on``, not a higher-precedence override)."""
+    if ai and not any(o.split("=", 1)[0].strip() == "ai" for o in overrides):
+        return [*overrides, "ai=on"]
+    return overrides
+
+
 def _run(args: argparse.Namespace) -> int:
     setup_logging(verbose=args.verbose)
     # Resolve operator config (--set > env > file) and write it into os.environ BEFORE importing the
     # pipeline — its module-level constants read PTFLOW_* at import time.
     try:
-        resolved = runconfig.resolve(runconfig.load_config(args.config), os.environ, args.overrides)
+        overrides = _apply_ai_flag(list(args.overrides or []), ai=args.ai)
+        resolved = runconfig.resolve(runconfig.load_config(args.config), os.environ, overrides)
     except runconfig.ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)  # noqa: T201
         return 2

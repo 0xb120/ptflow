@@ -15,13 +15,14 @@ pipeline runs an asset-discovery (breadth) phase over the whole scope, clusters 
 results into "application groups", then runs one or more per-app **loops** (depth)
 that fan out under Prefect.
 
-> **Terminal step = deterministic `consolidate` (done); agent seam dormant.** The real terminal
-> fan-in is now `consolidate` (`pipelines/external/tasks.consolidate`, an optional `Pipeline` hook the
-> orchestrator calls like `preflight`): it lifts every app group's per-app findings into the
+> **Terminal step = deterministic `consolidate` (done); agent seam dormant by default.** The real
+> terminal fan-in is now `consolidate` (`pipelines/external/tasks.consolidate`, an optional `Pipeline`
+> hook the orchestrator calls like `preflight`): it lifts every app group's per-app findings into the
 > activity-level `<activity>/findings/<type>.jsonl`, one file per finding TYPE (`cve`/`dast` fold
 > their surface+deep passes). The old agent stage (`core/agent.py`, `HypothesisProvider`) still runs
-> as a **dormant** `StubProvider` fan-in beside it — its real (Claude-backed) implementation is
-> parked; don't build toward it, and leave the seam in place.
+> as a **dormant** `StubProvider` fan-in beside it by default — its real (Claude-backed) implementation
+> was parked; the opt-in `--ai` layer now provides it (`ai_triage`), so don't treat the seam as
+> permanently inert, and leave the seam in place.
 
 ## Commands
 
@@ -54,7 +55,8 @@ uv run pytest tests/core/test_scope.py::test_classify  # one test
 ### Run config (operator knobs)
 
 The **operator-facing** knobs (the ~14 `PTFLOW_*` env vars: `profile`, `oast`, `net_limit`, `http_header`,
-`recrawl`, `deep_dive`, tool paths, wordlist dir/roles, interactsh server/token) can be set in an
+`recrawl`, `deep_dive`, tool paths, wordlist dir/roles, interactsh server/token, `ai`/`ai.model`/
+`ai.base_url`/`ai.provider`) can be set in an
 optional TOML file (`--config ptflow.toml`; see `ptflow.toml.example` for the annotated template) instead of
 scattered env vars. Resolution is `core/runconfig.py` (pure `resolve()` + thin `apply()`/`snapshot()`),
 loaded by the CLI's `_run`. **Precedence: `--set KEY=VALUE` (CLI, repeatable) > `PTFLOW_*` env var >
@@ -131,7 +133,8 @@ uv run ptflow run external <activity> <scope.txt> --observe # stream THIS run to
 2. **`pipeline.cluster(activity)`** is the fan-out pivot — it groups discovery output into
    `scans/<app_id>/` dirs and returns the list of `app_id`s;
 3. **per-app loops** run in order (see below);
-4. the **agent** stage runs once as a fan-in (currently the dormant stub).
+4. the **agent** stage runs once as a fan-in (the dormant `StubProvider` by default; the real
+   Claude-backed provider, `ai_triage`, when `--ai`).
 
 **Spanning stages** (`spanning=True`, activity-scope) don't block the breadth→cluster barrier:
 they're launched once their breadth `needs` are done and awaited only at the fan-in, so they run
@@ -216,8 +219,10 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       findings/tilde_enum.jsonl  findings/dast.jsonl  findings/dast_full.jsonl  findings/wpprobe.jsonl  #   per-app findings (shortscan; DAST surface/deep; wpprobe WP CVEs); consolidate lifts up
       findings/xss.jsonl  findings/xss_full.jsonl  findings/sqli.jsonl  findings/sqli_full.jsonl   #   dedicated scanners (dalfox XSS / sqlmap SQLi), surface+deep; consolidate folds by type
       findings/cve.jsonl  findings/cve_full.jsonl    #   cve_lookup (PHASE 2) / cve_lookup_full (PHASE 4): known CVEs on enumerated software
+      findings/secrets_triage.jsonl      #   ai_secret_triage (--ai, PHASE 4): LLM real/FP verdicts on secrets.jsonl leads, SIDECAR (never mutates secrets.jsonl)
       raw/cve/seen.txt                   #   cve_lookup: (product,version) covered in PHASE 2 → PHASE 4 reports only the delta
       wl_custom/seed.txt  wl_custom/round*.txt   #   per-app GENERATED wordlists (seed offline; round N = fuzzed delta)
+      wl_custom/ai_seed.txt              #   ai_wordlist (--ai, PHASE 2): LLM-suggested candidate tokens, folded into content_discovery's wordlist
       responses/  responses/headless/  responses/discovered/round*/   # downloaded corpus (katana/httpx -srd) — mined offline
       raw/<tool>/  # provenance + tool scratch: raw/extracted/ (mined bodies),
                    #   raw/httpx/{screenshot,osint,discovered}, raw/katana/{crawl,headless},
@@ -226,7 +231,9 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
   findings/cve.jsonl  findings/dast.jsonl  findings/xss.jsonl  findings/sqli.jsonl  findings/tilde_enum.jsonl  findings/wpprobe.jsonl  findings/secrets.jsonl  findings/takeover.jsonl  findings/default_creds.jsonl
                                          #   CONSOLIDATE output — per-app findings lifted up by TYPE (each record stamped app_id;
                                          #   cve/dast fold surface+deep). nuclei_scope.jsonl is the whole-scope nuclei finding.
-  findings/hypotheses.jsonl              # dormant agent fan-in output (StubProvider seam, kept in place)
+  findings/secrets_triage.jsonl          # CONSOLIDATE output — ai_secret_triage verdicts lifted by app_id (--ai; empty/absent when AI is off)
+  findings/hypotheses.jsonl              # agent fan-in output (StubProvider by default; --ai revives it as ai_triage, correlating consolidated findings)
+  report.md                              # --ai terminal narrative report (ai_report hook): consolidated findings + hypotheses → prose (absent when AI is off)
   screenshots/screenshot/screenshot.html # UNIFIED gallery — one batched httpx run, 1 host/group (+ eyewitness/report.html)
   poc/  tmp/  logs/
   wl_global/                             # shared/global INPUT wordlists (SecLists & co.)
@@ -804,9 +811,9 @@ idempotent (overwrites each run / `--resume`). Sources (`_CONSOLIDATE_SOURCES` +
 - `findings/takeover.jsonl` ← per-app `takeover.txt` lines → `{app_id, type, evidence, source}` records
 
 An empty TYPE writes no file (no clutter). The whole-scope `findings/nuclei_scope.jsonl` is already an
-activity-level finding and is left untouched. The dormant agent seam (`findings/hypotheses.jsonl`)
-runs separately and is kept in place. A `consolidate` failure is isolated (logged + counted), never
-aborting the run.
+activity-level finding and is left untouched. The agent seam (`findings/hypotheses.jsonl`) runs
+separately and is kept in place — dormant (`StubProvider`) by default, Claude-backed (`ai_triage`)
+under `--ai`. A `consolidate` failure is isolated (logged + counted), never aborting the run.
 
 ## Adding a pipeline (checklist)
 
@@ -903,6 +910,17 @@ flow changed:
   (50 vs 150) and feroxbuster `-t`/`-L`, for a domestic line. Aggregate load ≈ concurrency × rate,
   so the per-tool rate is the real lever (a `net` concurrency cap alone won't tame the single
   full-port/nuclei stages). The active profile is logged at run start (preflight).
+- **AI layer (opt-in, `--ai` / `PTFLOW_AI=on`)** — adds four best-effort LLM stages via the
+  `core/ai/` seam (`LLMClient` + `AnthropicClient`, Anthropic Messages API, `claude-opus-4-8` default;
+  `anthropic` is the OPTIONAL `ai` extra, imported lazily). Key via the standard `ANTHROPIC_API_KEY` /
+  `ant` profile — NOT a ptflow knob. Stages: `ai_wordlist` (phase 2 → `wl_custom/ai_seed.txt`, folded
+  by `build_content_wordlist`), `ai_secret_triage` (phase 4 → sidecar `findings/secrets_triage.jsonl`),
+  `ai_triage` (revives the agent seam → `findings/hypotheses.jsonl`, correlating consolidated findings),
+  `ai_report` (terminal `report()` hook → `report.md`). All `net=False`, additive, failure-isolated;
+  with AI off, `ExternalPipeline.stages` is byte-identical to the deterministic default. Knobs:
+  `PTFLOW_AI_MODEL` / `PTFLOW_AI_BASE_URL` (Anthropic-compatible gateways/Bedrock/Vertex) /
+  `PTFLOW_AI_PROVIDER` (v1: `anthropic`). Roadmap: `ai_mine_bodies`, `ai_cve_rank`, `ai_param_values`,
+  native non-Anthropic provider (see `docs/superpowers/specs/2026-07-04-ai-layer-design.md`).
 - **Authorized test scope only:** `https://ginandjuice.shop/` (PortSwigger demo), `scanme.nmap.org`
   (Nmap-sanctioned).
 
