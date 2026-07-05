@@ -3763,6 +3763,22 @@ def _cross_group_surface(activity: Activity, ws: AppWorkspace) -> list[dict]:
     return out
 
 
+def _finalize_catalog(ws: AppWorkspace, request_recs: list[dict], get_urls: list[str]) -> tuple[list[dict], int]:
+    """Turn assembled request records + URL-only GETs into the final per-app catalog: scheme-normalize
+    to the empirically-reachable scheme (_working_schemes), in-scope-filter to ws.hosts, dedup by shape
+    (catalog_records), then DROP GET shapes whose path the corpus only ever saw as 404/410 (dead_url_keys
+    — a discovered POST/form/XHR/JSON shape, status never recorded, is always kept). Returns (kept catalog,
+    count dropped as dead). Pure-ish (reads disk only)."""
+    in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
+    schemes = _working_schemes(ws)
+    catalog = catalog_records(request_recs, get_urls, in_scope, schemes)
+    dead = dead_url_keys(ln for idx in _all_store_indices(ws) for ln in tools.read_lines(idx))
+    kept = [r for r in catalog
+            if not (r.get("method", "GET").upper() == "GET" and not r.get("body")
+                    and _url_pathkey(r.get("url") or "") in dead)]
+    return kept, len(catalog) - len(kept)
+
+
 def _assemble_catalog(activity: Activity, ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[dict], int, int]:
     """Assemble a per-app request catalog → (catalog records, count mined from corpus, count dropped as
     dead/404). Pure-ish (reads disk only). Three contributions, all deduped by request shape
@@ -3785,8 +3801,6 @@ def _assemble_catalog(activity: Activity, ws: AppWorkspace, *, include_guessed: 
     Finally, GET shapes whose endpoint the corpus only ever saw as 404/410 are dropped (`dead_url_keys`)
     — malformed passive/archive URLs and phantom JS routes that would just burn DAST/param-fuzz payloads.
     GET-only + body-less: a discovered POST/form/XHR/JSON shape (status never recorded) is always kept."""
-    in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
-    schemes = _working_schemes(ws)
     # mine request SHAPES from the already-downloaded corpus (idempotent extract → ensure it's present)
     bodies, _ = _extract_bodies(ws)
     source_urls = {Path(s).stem: u for idx in _all_store_indices(ws) for s, u in _store_index(idx)}
@@ -3805,12 +3819,8 @@ def _assemble_catalog(activity: Activity, ws: AppWorkspace, *, include_guessed: 
         request_recs += _cross_group_surface(activity, ws)  # endpoints discovered in OTHER in-scope groups
         get_urls += [r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
                      if r.get("url") and 200 <= (r.get("status") or 0) < 300]  # noqa: PLR2004
-    catalog = catalog_records(request_recs, get_urls, in_scope, schemes)
-    dead = dead_url_keys(ln for idx in _all_store_indices(ws) for ln in tools.read_lines(idx))
-    kept = [r for r in catalog
-            if not (r.get("method", "GET").upper() == "GET" and not r.get("body")
-                    and _url_pathkey(r.get("url") or "") in dead)]
-    return kept, len(mined), len(catalog) - len(kept)
+    kept, n_dead = _finalize_catalog(ws, request_recs, get_urls)
+    return kept, len(mined), n_dead
 
 
 def request_catalog(activity: Activity, app_id: str) -> None:

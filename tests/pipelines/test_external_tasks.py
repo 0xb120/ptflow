@@ -1269,6 +1269,29 @@ def test_assemble_catalog_drops_dead_get_keeps_post(tmp_path):
     assert n_dead == 1
 
 
+def test_finalize_catalog_reschemes_filters_scope_and_drops_dead(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("finalize", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
+    ws.responses.mkdir(parents=True, exist_ok=True)
+    tools.write_lines(ws.hosts, ["https://a.com"])
+    (ws.responses / "index.txt").write_text("/s/1 https://a.com/dead (404 Not Found)\n")
+    recs = [
+        {"method": "GET", "url": "https://a.com/dead",
+         "raw": "GET /dead HTTP/1.1\r\nHost: a.com\r\n\r\n", "sources": ["katana"]},
+        {"method": "GET", "url": "https://a.com/live",
+         "raw": "GET /live HTTP/1.1\r\nHost: a.com\r\n\r\n", "sources": ["katana"]},
+    ]
+    kept, n_dead = tasks._finalize_catalog(ws, recs, ["https://out-of-scope.example/x"])
+    shapes = {(r["method"], tasks._url_pathkey(r["url"])) for r in kept}
+    assert ("GET", "a.com/dead") not in shapes          # dead GET dropped
+    assert ("GET", "a.com/live") in shapes              # alive GET kept
+    assert not any("out-of-scope.example" in r["url"] for r in kept)  # in-scope filter
+    assert n_dead == 1
+
+
 def test_select_body_targets_splits_json_and_urlencoded_and_dedups():
     catalog = [
         {"method": "POST", "url": "https://a/login",
