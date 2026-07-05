@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# post-merge — after a merge, sync documentation (delegates to doc-sync.sh).
+# $1 = 1 when the merge was a squash. A post-merge hook cannot fail the merge; we also
+# swallow any error so nothing noisy escapes.
+"$(dirname "$0")/doc-sync.sh" "$@" || true
