@@ -1757,7 +1757,7 @@ def test_app_service_banners_attributes_ip_only_record(tmp_path):
     tools.write_jsonl(canon("nerva_full_metadata.jsonl"),
                       [{"host": "", "ip": "45.33.32.156", "port": 22,
                         "metadata": {"banner": "SSH-2.0-OpenSSH_6.6.1p1"}}])
-    canon("domain_ip_map.txt").write_text("scanme.test [A] [45.33.32.156]\n", encoding="utf-8")
+    canon("inscope_domain_ip_map.txt").write_text("scanme.test [A] [45.33.32.156]\n", encoding="utf-8")
     meta = {"hosts": ["http://scanme.test"]}
     assert tasks._app_service_banners(act, meta) == [("45.33.32.156:22", "SSH-2.0-OpenSSH_6.6.1p1")]
 

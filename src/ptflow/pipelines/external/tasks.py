@@ -1847,7 +1847,7 @@ def portscan(activity: Activity) -> None:
     non-web ports are picked up there ∥ in the background (→ nerva). The naabu stdout is provenance
     (raw/naabu/), consumed in memory by honeypot_split/select_web_ports."""
     canon = activity.asset_discovery_canonical
-    unique_ips = tools.read_lines(canon("unique_ips.txt"))
+    unique_ips = tools.read_lines(canon("inscope_ips.txt"))
     scanned = _lines(
         _run("naabu", ["naabu", "-silent", "-p", WEB_PORTS, "-exclude-cdn",
                        "-c", NAABU_CONC, "-rate", NAABU_RATE],
@@ -1866,7 +1866,7 @@ def portscan_full(activity: Activity) -> None:
     honeypots) — only strings cross the stage boundary."""
     canon = activity.asset_discovery_canonical
     honeypots = set(tools.read_lines(canon("honeypots.txt")))
-    valid = [ip for ip in tools.read_lines(canon("unique_ips.txt")) if ip not in honeypots]
+    valid = [ip for ip in tools.read_lines(canon("inscope_ips.txt")) if ip not in honeypots]
     _run("naabu", ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn",
                    "-c", NAABU_CONC, "-rate", NAABU_RATE],
          stdin="\n".join(valid), dest=canon("naabu_full.txt"), label="full")
@@ -1885,8 +1885,8 @@ def httpx_fingerprint(activity: Activity) -> None:
     """
     canon = activity.asset_discovery_canonical
     httpx_input = "\n".join(tools.dedupe([
-        *tools.read_lines(canon("tls_names.txt")),
-        *tools.read_lines(canon("subdomains.txt")),
+        *tools.read_lines(canon("inscope_tls_names.txt")),
+        *tools.read_lines(canon("inscope_subdomains.txt")),
         *tools.read_lines(canon("naabu_web.txt")),  # fast top-1k web set (full scan is now spanning)
         *tools.read_lines(canon("honeypots.txt")),
     ]))
@@ -1951,7 +1951,7 @@ def nuclei_scope(activity: Activity) -> None:
     nuclei-templates first (`-ut`), then scans with -duc (no redundant check mid-run).
     """
     canon = activity.asset_discovery_canonical
-    targets = tools.dedupe([*tools.read_lines(canon("subdomains.txt")),
+    targets = tools.dedupe([*tools.read_lines(canon("inscope_subdomains.txt")),
                             *tools.read_lines(canon("unique_webapps.txt"))])
     if not targets:
         log.debug("  · skip nuclei_scope (no targets)")
@@ -4669,7 +4669,7 @@ def _app_service_banners(activity: Activity, meta: dict) -> list[tuple[str, str]
     if not recs:
         return []
     app_hosts = {url_host(h) for h in (meta.get("hosts") or [])}
-    dim = canon("domain_ip_map.txt")
+    dim = canon("inscope_domain_ip_map.txt")
     app_ips = map_hosts_to_ips(tools.read_lines(dim), app_hosts) if dim.exists() else set()
     out: list[tuple[str, str]] = []
     for r in recs:
