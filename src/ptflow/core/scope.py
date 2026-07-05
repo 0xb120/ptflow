@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-import re
+import ipaddress
 from dataclasses import dataclass
-
-_IP = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
-_CIDR = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
 
 
 @dataclass(frozen=True)
@@ -24,15 +21,13 @@ def classify(token: str) -> str:
         return "url"
     if t.startswith("*."):
         return "wildcard"
-    if _CIDR.match(t):
-        return "cidr"
-    if _IP.match(t):
-        return "ip"
-    return "domain"
+    try:
+        ipaddress.ip_network(t, strict=False)
+    except ValueError:
+        return "domain"
+    return "cidr" if "/" in t else "ip"
 
 
-# TODO(domain): _IP/_CIDR don't validate octet ranges. Acceptable for the stub  # noqa: TD003,FIX002
-# scaffolding; tighten when wiring a real toolset.
 def normalize(token: str, kind: str) -> str:
     t = token.strip().lower()
     if kind == "url":
@@ -70,3 +65,55 @@ def target_from_meta(meta: dict) -> Target:
         normalized=meta["normalized"],
         tid=meta["tid"],
     )
+
+
+@dataclass(frozen=True)
+class Allowlist:
+    exact_hosts: frozenset[str]
+    wildcard_apexes: frozenset[str]
+    nets: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
+
+
+def norm_host(host: str) -> str:
+    """Canonical host for scope comparison: lower-case, no trailing dot, IDN→punycode."""
+    h = host.strip().lower().rstrip(".")
+    try:
+        return h.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        return h
+
+
+def build_allowlist(targets: list[Target]) -> Allowlist:
+    """Bucket classified scope targets into the authorization allowlist. domain/url → exact host;
+    *.x → wildcard apex; ip/cidr → an ipaddress network (bad entries skipped)."""
+    exact: set[str] = set()
+    wild: set[str] = set()
+    nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for t in targets:
+        if t.kind in ("domain", "url"):
+            exact.add(norm_host(t.normalized))
+        elif t.kind == "wildcard":
+            wild.add(norm_host(t.normalized))
+        elif t.kind in ("ip", "cidr"):
+            try:
+                nets.append(ipaddress.ip_network(t.raw, strict=False))
+            except ValueError:
+                continue
+    return Allowlist(frozenset(exact), frozenset(wild), tuple(nets))
+
+
+def host_in_scope(host: str, allow: Allowlist) -> bool:
+    """Rules 1+2: exact-host match, or a suffix match under a *.apex (apex included)."""
+    h = norm_host(host)
+    if h in allow.exact_hosts:
+        return True
+    return any(h == w or h.endswith("." + w) for w in allow.wildcard_apexes)
+
+
+def ip_in_scope(ip: str, allow: Allowlist) -> bool:
+    """Rule 3: the IP is inside an explicitly-listed scope network (v4 or v6)."""
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return False
+    return any(addr in net for net in allow.nets)
