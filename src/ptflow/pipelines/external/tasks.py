@@ -4044,11 +4044,13 @@ def _surface_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
 
 
 def _delta_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
-    """The GUESSED-surface DELTA request set (phase 4): full-catalog shapes NOT already in the surface
-    catalog (by request_key) + the synthesized requests for the discovered hidden params (params.jsonl),
-    deduped and capped. Shared by `dast_full` and the deep vuln scanners (xss_full/sqli_full) so the
-    "delta, not the whole catalog" rule lives in ONE place."""
+    """The GUESSED-surface DELTA request set (phase 4): full-catalog shapes NOT already covered by the
+    phase-2 surface — the surface catalog (requests.jsonl) OR the cross-group sidecar (requests_xref.jsonl,
+    which phase-2 dast/xss/sqli already tested) — keyed by request_key, PLUS the synthesized requests for
+    the discovered hidden params (params.jsonl), deduped and capped. Shared by `dast_full` and the deep
+    vuln scanners (xss_full/sqli_full) so the "delta, not the whole catalog" rule lives in ONE place."""
     surface_keys = {request_key(r) for r in tools.read_jsonl(ws.canonical("requests.jsonl"))}
+    surface_keys |= {request_key(r) for r in tools.read_jsonl(ws.canonical("requests_xref.jsonl"))}
     delta = [r for r in tools.read_jsonl(ws.canonical("requests_full.jsonl"))
              if request_key(r) not in surface_keys]
     return dast_requests(delta, tools.read_jsonl(ws.canonical("params.jsonl")), cap=cap)

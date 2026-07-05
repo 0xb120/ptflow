@@ -2058,3 +2058,27 @@ def test_surface_request_set_collapses_shared_shape(tmp_path):
     sources = shared_recs[0]["sources"]
     assert "katana" in sources                                 # own-surface provenance kept
     assert any(s.startswith("xref:") for s in sources)         # cross-group provenance unioned in
+
+
+def test_delta_request_set_excludes_xref_covered_shapes(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("delta-xref", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
+    tools.write_lines(ws.hosts, ["https://a.com"])
+    tools.write_jsonl(ws.canonical("requests.jsonl"), [])
+    tools.write_jsonl(ws.canonical("params.jsonl"), [])
+    # a cross-group shape phase 2 already covered, plus a genuinely new full-catalog shape
+    tools.write_jsonl(ws.canonical("requests_xref.jsonl"),
+                      [{"method": "GET", "url": "https://a.com/routed",
+                        "raw": "GET /routed HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": [], "sources": ["xref:o"]}])
+    tools.write_jsonl(ws.canonical("requests_full.jsonl"), [
+        {"method": "GET", "url": "https://a.com/routed",
+         "raw": "GET /routed HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": [], "sources": ["xref:o"]},
+        {"method": "GET", "url": "https://a.com/guessed",
+         "raw": "GET /guessed HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": [], "sources": ["feroxbuster"]},
+    ])
+    got = {tasks._url_pathkey(r["url"]) for r in tasks._delta_request_set(ws, cap=100)}
+    assert "a.com/routed" not in got      # already covered in phase 2 via the sidecar → not re-tested
+    assert "a.com/guessed" in got         # genuinely new guessed surface → in the delta
