@@ -91,3 +91,48 @@ def test_ip_in_scope_v4_and_v6():
     assert scope.ip_in_scope("192.0.3.5", allow) is False
     assert scope.ip_in_scope("2001:db8::dead", allow) is True
     assert scope.ip_in_scope("not-an-ip", allow) is False
+
+
+def test_filter_assets_domain_scope_drops_thirdparty_name_and_ip():
+    from ptflow.core import scope
+    allow = scope.build_allowlist(scope.parse_scope("acme.com\n"))
+    name_ips = {"acme.com": ["192.0.2.9"], "cdn.other.test": ["203.0.113.5"]}
+    v = scope.filter_assets(["acme.com", "cdn.other.test"], name_ips,
+                            ["192.0.2.9", "203.0.113.5"], allow)
+    assert "acme.com" in v.kept_names
+    assert "cdn.other.test" not in v.kept_names        # third-party apex dropped
+    assert "192.0.2.9" in v.kept_ips                    # domain→IP kept
+    assert "203.0.113.5" not in v.kept_ips              # third-party IP dropped
+
+
+def test_filter_assets_ip_only_scope_recovers_vhost_by_rule4():
+    from ptflow.core import scope
+    allow = scope.build_allowlist(scope.parse_scope("192.0.2.0/24\n"))   # IP-only scope
+    name_ips = {"mail.acme.com": ["192.0.2.5"],      # SAN on an in-scope IP
+                "www.acme.com": ["203.0.113.7"]}     # public DNS points off-scope
+    v = scope.filter_assets(["mail.acme.com", "www.acme.com"], name_ips,
+                            ["192.0.2.5", "203.0.113.7"], allow)
+    assert "mail.acme.com" in v.kept_names            # rule 4: resolves to an in-scope IP
+    assert "www.acme.com" not in v.kept_names          # decision (a): resolves off-scope → dropped
+    assert "192.0.2.5" in v.kept_ips
+    assert "203.0.113.7" not in v.kept_ips
+
+
+def test_filter_assets_anti_transitivity():
+    from ptflow.core import scope
+    allow = scope.build_allowlist(scope.parse_scope("acme.com\n"))  # a DOMAIN, no IP net
+    # acme.com → 192.0.2.9 (domain-derived, scanned) — but that IP must NOT authorize other names
+    name_ips = {"acme.com": ["192.0.2.9"], "hitchhiker.other.test": ["192.0.2.9"]}
+    v = scope.filter_assets(["acme.com", "hitchhiker.other.test"], name_ips,
+                            ["192.0.2.9"], allow)
+    assert "acme.com" in v.kept_names
+    assert "hitchhiker.other.test" not in v.kept_names   # rule 4 uses EXPLICIT nets only
+
+
+def test_filter_assets_empty_allowlist_drops_all():
+    from ptflow.core import scope
+    allow = scope.build_allowlist([])
+    v = scope.filter_assets(["a.test"], {"a.test": ["192.0.2.1"]}, ["192.0.2.1"], allow)
+    assert not v.kept_names
+    assert not v.kept_ips
+    assert len(v.dropped) == 2

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 
@@ -117,3 +118,37 @@ def ip_in_scope(ip: str, allow: Allowlist) -> bool:
     except ValueError:
         return False
     return any(addr in net for net in allow.nets)
+
+
+@dataclass(frozen=True)
+class ScopeVerdict:
+    kept_names: frozenset[str]
+    kept_ips: frozenset[str]
+    dropped: tuple[dict, ...]
+
+
+def filter_assets(names: Iterable[str], name_ips: dict[str, list[str]],
+                  ips: Iterable[str], allow: Allowlist) -> ScopeVerdict:
+    """Partition discovered assets into (kept, dropped) by the four membership rules. A NAME is kept if
+    host_in_scope (rules 1+2) or any of its resolved IPs is in an explicit scope net (rule 4 — uses
+    EXPLICIT nets only, so domain-derived IPs never authorize further names). An IP is kept if it is in
+    an explicit scope net (rule 3) or is a resolved IP of a kept name (domain→IP; CDN exclusion is left
+    to naabu -exclude-cdn / split_cdn_ip_records downstream). Pure."""
+    kept_names: set[str] = set()
+    dropped: list[dict] = []
+    for raw in names:
+        n = norm_host(raw)
+        resolved = name_ips.get(n, [])
+        if host_in_scope(n, allow) or any(ip_in_scope(ip, allow) for ip in resolved):
+            kept_names.add(n)
+        else:
+            dropped.append({"asset": raw, "kind": "name", "reason": "out-of-scope",
+                            "resolved_ips": resolved})
+    kept_name_ips = {ip for n in kept_names for ip in name_ips.get(n, [])}
+    kept_ips: set[str] = set()
+    for ip in ips:
+        if ip_in_scope(ip, allow) or ip in kept_name_ips:
+            kept_ips.add(ip)
+        else:
+            dropped.append({"asset": ip, "kind": "ip", "reason": "out-of-scope"})
+    return ScopeVerdict(frozenset(kept_names), frozenset(kept_ips), tuple(dropped))
