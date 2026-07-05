@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -30,6 +30,7 @@ _ENUMS = {
     "PTFLOW_AI_PROVIDER": ("anthropic",),
 }
 _ROLES_PREFIX = "wordlists.roles."   # dynamic: wordlists.roles.<role> → PTFLOW_WL_<ROLE>
+_STEPS_PREFIX = "steps."   # dynamic: steps.<pipeline>.<step> → per-step on/off (filters pipeline.stages)
 
 
 class Knob(NamedTuple):
@@ -162,7 +163,7 @@ def resolve(config: Mapping[str, Any], env: Mapping[str, str],
     flat = _flatten(config)
     for source, keys in (("config", flat), ("--set", overrides)):
         for key in keys:
-            if key not in _BY_PATH and not key.startswith(_ROLES_PREFIX):
+            if key not in _BY_PATH and not key.startswith((_ROLES_PREFIX, _STEPS_PREFIX)):
                 log.warning("⚠ unknown %s key '%s' — ignored (typo?)", source, key)
 
     out: list[Resolved] = []
@@ -179,6 +180,29 @@ def resolve(config: Mapping[str, Any], env: Mapping[str, str],
         if value is not None:
             out.append(Resolved(rk.env, rk.path, value, secret=False))
     return out
+
+
+def resolve_disabled_steps(config: Mapping[str, Any], sets: Iterable[str] | None,
+                           pipeline: str, stage_names: Collection[str]) -> frozenset[str]:
+    """The steps to DISABLE for `pipeline`, from the `[steps.<pipeline>]` config table + `--set
+    steps.<pipeline>.<step>=off` (precedence --set > config), validated against the pipeline's LIVE
+    stage names. Sparse: only a step set to a falsey value is disabled; an unlisted step stays on.
+    Pure. Raises ConfigError on an unknown step name (so a stale/renamed step can't be referenced)."""
+    flat = _flatten(config)
+    overrides = _parse_overrides(sets)
+    prefix = f"{_STEPS_PREFIX}{pipeline}."
+    names = {k[len(prefix):] for src in (flat, overrides) for k in src if k.startswith(prefix)}
+    disabled: set[str] = set()
+    for name in names:
+        if name not in stage_names:
+            valid = ", ".join(sorted(stage_names))
+            msg = f"unknown step '{name}' for pipeline '{pipeline}' — valid: {valid}"
+            raise ConfigError(msg)
+        key = f"{prefix}{name}"
+        raw = overrides[key] if key in overrides else flat[key]  # --set wins over config
+        if _coerce("bool", raw) == "off":
+            disabled.add(name)
+    return frozenset(disabled)
 
 
 def apply(resolved: Iterable[Resolved]) -> None:
