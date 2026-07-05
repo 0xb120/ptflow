@@ -60,8 +60,11 @@ fi
 
 orig=$(git rev-parse --short ORIG_HEAD)
 head=$(git rev-parse --short HEAD)
-git commit -q -m "docs: auto-sync after merge ${orig}..${head}" -m "Automated by the post-merge doc-sync hook.
+if git commit -q -m "docs: auto-sync after merge ${orig}..${head}" -m "Automated by the post-merge doc-sync hook.
 
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>" || log "commit failed"
-log "committed documentation auto-sync"
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"; then
+  log "committed documentation auto-sync"
+else
+  log "commit failed"
+fi
 exit 0
