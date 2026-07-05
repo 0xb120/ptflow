@@ -155,8 +155,10 @@ Two mechanisms keep docs current; both are best-effort and never block work:
   runs after a merge that lands on `main`. It regenerates the flow-map docs (`ptflow.core.flowdocs`) and runs a
   **headless Claude agent** (`claude -p`, tools limited to Read/Edit/Grep/Glob, no Bash, under a timeout) to update
   the PROSE docs (`CLAUDE.md`, `README.md`, `ptflow.toml.example`) to reflect the merged change — committing
-  everything as one isolated `docs: auto-sync after merge …` follow-up you should review. It edits nothing else
-  (never code/tests or `docs/superpowers/**`). **One-time activation:** `git config core.hooksPath .githooks`.
+  everything as one isolated `docs: auto-sync after merge …` follow-up you should review. The agent is
+  *instructed* to edit only those prose files; the hook itself **stages and commits only** documentation
+  paths (the generated maps + those three files), so code, tests, and `docs/superpowers/**` are never
+  committed by it. **One-time activation:** `git config core.hooksPath .githooks`.
   Knobs: `PTFLOW_NO_DOC_SYNC=1` (skip a merge), `PTFLOW_DOC_SYNC_TIMEOUT` (agent seconds, default 300),
   `CLAUDE_BIN` (override the binary). It skips gracefully when `claude` is unavailable (the deterministic
   regeneration is still committed) and when the merge touched no `src/`.
