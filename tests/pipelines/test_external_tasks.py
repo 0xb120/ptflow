@@ -214,7 +214,7 @@ def test_pipeline_object_shape():
     assert app == [
         "passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
         "fetch_delta", "api_spec", "mine_responses", "request_catalog",
-        "dast", "xss", "sqli", "cve_lookup",
+        "xref_catalog", "dast", "xss", "sqli", "cve_lookup",
         "wordlist", "tech_enum", "content_discovery", "recrawl", "cloud_assets",
         "request_catalog_full", "param_fuzz", "dast_full", "xss_full", "sqli_full",
         "cve_lookup_full", "tech_vulnscan",
@@ -257,10 +257,17 @@ def test_pipeline_phase_wiring():
     assert by_name["request_catalog"].net is False    # offline merge → requests.jsonl (surface only)
     assert set(by_name["request_catalog"].needs) == {"crawl_headless", "mine_responses", "api_spec"}
     # PHASE 2 = DAST the explorable surface (low-hanging fruit): reads requests.jsonl across the barrier.
-    # cve_lookup runs ∥ dast (same phase, no needs) — OFFLINE CVE correlation (net=False).
+    # xref_catalog runs first (cross-group surface sidecar); dast/xss/sqli need it. cve_lookup runs ∥
+    # dast (same phase, no needs) — OFFLINE CVE correlation (net=False).
+    assert by_name["xref_catalog"].phase == 2
+    assert by_name["xref_catalog"].per_app is True
+    assert by_name["xref_catalog"].net is False
+    assert by_name["xref_catalog"].needs == ()
     assert by_name["dast"].phase == 2
     assert by_name["dast"].per_app is True
-    assert by_name["dast"].needs == ()
+    assert by_name["dast"].needs == ("xref_catalog",)
+    assert by_name["xss"].needs == ("xref_catalog",)
+    assert by_name["sqli"].needs == ("xref_catalog",)
     assert by_name["cve_lookup"].phase == 2
     assert by_name["cve_lookup"].per_app is True
     assert by_name["cve_lookup"].net is False
@@ -2082,3 +2089,15 @@ def test_delta_request_set_excludes_xref_covered_shapes(tmp_path):
     got = {tasks._url_pathkey(r["url"]) for r in tasks._delta_request_set(ws, cap=100)}
     assert "a.com/routed" not in got      # already covered in phase 2 via the sidecar → not re-tested
     assert "a.com/guessed" in got         # genuinely new guessed surface → in the delta
+
+
+def test_external_phase2_wires_xref_catalog():
+    from ptflow.pipelines.external.pipeline import PIPELINE
+
+    stages = {s.name: s for s in PIPELINE.stages}
+    assert "xref_catalog" in stages
+    assert stages["xref_catalog"].phase == 2
+    assert stages["xref_catalog"].per_app
+    assert not stages["xref_catalog"].net
+    for name in ("dast", "xss", "sqli"):
+        assert "xref_catalog" in stages[name].needs, f"{name} must depend on xref_catalog"

@@ -63,14 +63,19 @@ class ExternalPipeline:
         Stage("request_catalog", tasks.request_catalog,
               needs=("crawl_headless", "mine_responses", "api_spec"), per_app=True, phase=1, net=False),
         # ── per-app PHASE 2 — DAST the explorable surface (low-hanging fruit) ────────────────────────
+        # cross-group catalog first: pulls in peer groups' explorable-surface requests whose host
+        # belongs to THIS group (requests_xref.jsonl), so dast/xss/sqli also cover cross-group surface
+        # on the fast pass, not only in phase 4. Safe: the 1→2 barrier means every group finished
+        # phase 1 already (race-free read).
+        Stage("xref_catalog", tasks.xref_catalog, per_app=True, phase=2, net=False),
         # nuclei -dast over the surface catalog (observed params) — fast, high-signal findings on the
         # real attack surface BEFORE sinking hours into fuzzing. Reads requests.jsonl across the barrier.
-        Stage("dast", tasks.dast, per_app=True, phase=2),
+        Stage("dast", tasks.dast, needs=("xref_catalog",), per_app=True, phase=2),
         # dedicated vuln scanners over the explorable surface (full requests, every param location) —
         # dalfox (XSS) ∥ sqlmap (SQLi), each tool's own engine decides (no gf-style name routing). The
         # high-signal complement to nuclei -dast's generic templates. Best-effort; run ∥ dast/cve_lookup.
-        Stage("xss", tasks.xss, per_app=True, phase=2),
-        Stage("sqli", tasks.sqli, per_app=True, phase=2),
+        Stage("xss", tasks.xss, needs=("xref_catalog",), per_app=True, phase=2),
+        Stage("sqli", tasks.sqli, needs=("xref_catalog",), per_app=True, phase=2),
         # CVE lookup over the explorable-surface enumerated software (web server + tech + service banners
         # + corpus libs) — OFFLINE correlation (net=False, no target traffic), runs ∥ dast (same phase,
         # no needs). Records the covered (product,version) set so the phase-4 pass reports only the delta.

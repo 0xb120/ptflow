@@ -193,6 +193,18 @@ FLOWMETA: dict[str, StepMeta] = {
                "input full-request del DAST di FASE 2 (frutti bassi) — sblocca POST/JSON/body"),
     ),
     # --- PHASE 2: DAST the explorable surface (low-hanging fruit) ---
+    "xref_catalog": StepMeta(
+        summary="FASE 2 (testa) — assembla il CATALOGO CROSS-GRUPPO (requests_xref.jsonl): richieste/"
+                "endpoint scoperti in ALTRI gruppi in-scope il cui host appartiene a QUESTO gruppo, così "
+                "dast/xss/sqli testano la superficie cross-gruppo sul passaggio VELOCE, non solo in FASE 4. "
+                "Sicuro grazie alla barriera 1→2 (tutti i gruppi hanno finito la FASE 1 → lettura race-free).",
+        commands=(
+            "# _cross_group_surface(activity, ws): dagli ALTRI gruppi le richieste/endpoint con host ∈ ws.hosts",
+            "#   (taggate xref:<origine>) → _finalize_catalog (scheme raggiungibile · in-scope · dead-drop 404)",
+        ),
+        outputs=("requests_xref.jsonl",),
+        notes=("offline (net=False) · RoE-safe (solo host di gruppi in-scope) · gruppo solo ⇒ sidecar vuoto",),
+    ),
     "dast": StepMeta(
         summary="FASE 2 — DAST della SUPERFICIE ESPLORABILE (frutti bassi): nuclei -dast sul catalogo "
                 "superficie (requests.jsonl), fuzzando i parametri OSSERVATI (query/body/form/xhr che il "
