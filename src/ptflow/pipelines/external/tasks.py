@@ -563,6 +563,18 @@ def map_hosts_to_ips(lines: Iterable[str], hosts: set[str]) -> set[str]:
     return out
 
 
+def parse_domain_ip_map(lines: Iterable[str]) -> dict[str, list[str]]:
+    """Parse a dnsx `-a -resp` map (domain_ip_map.txt: ``<host> [A] [<ip>] …``) into {host: [ipv4, …]},
+    host normalized via scope.norm_host (matches filter_assets's name_ips lookup key). Reuses _IPV4_RE
+    over the rest of each line (bracket-agnostic). Pure."""
+    out: dict[str, list[str]] = {}
+    for line in lines:
+        head, _, rest = line.strip().partition(" ")
+        if head:
+            out.setdefault(scope.norm_host(head), []).extend(_IPV4_RE.findall(rest))
+    return out
+
+
 def split_cdn_ip_records(records: list[dict], scope_ips: set[str]) -> tuple[list[dict], list[dict]]:
     """Partition httpx records into (kept, dropped) for SCOPE HYGIENE (pure).
 
@@ -1788,6 +1800,40 @@ def resolve(activity: Activity) -> None:
     tools.write_lines(canon("unique_ips.txt"), [*resolved_ips, *tools.read_lines(activity.scope_ip)])
     _run("dnsx", ["dnsx", "-a", "-resp", "-nc", "-silent"],
          stdin=a_input, dest=canon("domain_ip_map.txt"), label="a_resp")
+
+
+def scope_gate(activity: Activity) -> None:
+    """Breadth — enforce the RoE authorization boundary between discovery and active scanning. Build the
+    scope allowlist (exact host / *.apex suffix / IP-CIDR) from scope_init, then keep only authorized
+    names+IPs from resolve's discovery output: a name survives if it matches a domain/wildcard entry OR
+    resolves to an in-scope IP (rule 4 — recovers vhosts on IP-only scopes); an IP survives if it is an
+    explicit scope IP or a resolved IP of a kept name. Third-party pull-in (SAN/PTR of an unlisted apex,
+    cloud IPs) is dropped to excluded_out_of_scope.jsonl (RoE audit). Offline (net=False); complements the
+    CDN filters (naabu -exclude-cdn / split_cdn_ip_records)."""
+    canon = activity.asset_discovery_canonical
+    targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8", errors="replace"))
+    allow = scope.build_allowlist(targets)
+    subdomains = tools.read_lines(canon("subdomains.txt"))
+    tls_names = tools.read_lines(canon("tls_names.txt"))
+    ips = tools.read_lines(canon("unique_ips.txt"))
+    dim_lines = tools.read_lines(canon("domain_ip_map.txt"))
+    name_ips = parse_domain_ip_map(dim_lines)
+    verdict = scope.filter_assets([*subdomains, *tls_names], name_ips, ips, allow)
+
+    tools.write_lines(canon("inscope_subdomains.txt"),
+                      [s for s in subdomains if scope.norm_host(s) in verdict.kept_names])
+    tools.write_lines(canon("inscope_tls_names.txt"),
+                      [t for t in tls_names if scope.norm_host(t) in verdict.kept_names])
+    tools.write_lines(canon("inscope_ips.txt"), [ip for ip in ips if ip in verdict.kept_ips])
+    tools.write_lines(canon("inscope_domain_ip_map.txt"),
+                      [ln for ln in dim_lines
+                       if scope.norm_host(ln.strip().partition(" ")[0]) in verdict.kept_names])
+    tools.write_jsonl(canon("excluded_out_of_scope.jsonl"), list(verdict.dropped))
+
+    if not (allow.exact_hosts or allow.wildcard_apexes or allow.nets):
+        log.warning("⚠ scope_gate: EMPTY allowlist (malformed/empty scope?) — all discovered assets dropped")
+    log.info("  → scope_gate: kept %d name(s) + %d ip(s), dropped %d → excluded_out_of_scope.jsonl",
+             len(verdict.kept_names), len(verdict.kept_ips), len(verdict.dropped))
 
 
 def portscan(activity: Activity) -> None:
