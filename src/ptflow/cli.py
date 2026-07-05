@@ -125,7 +125,8 @@ def _run(args: argparse.Namespace) -> int:
     # pipeline — its module-level constants read PTFLOW_* at import time.
     try:
         overrides = _apply_ai_flag(list(args.overrides or []), ai=args.ai)
-        resolved = runconfig.resolve(runconfig.load_config(args.config), os.environ, overrides)
+        config = runconfig.load_config(args.config)
+        resolved = runconfig.resolve(config, os.environ, overrides)
     except runconfig.ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)  # noqa: T201
         return 2
@@ -136,11 +137,18 @@ def _run(args: argparse.Namespace) -> int:
     from ptflow.pipelines import load_pipeline  # noqa: PLC0415 (constants read PTFLOW_* at import)
 
     pipeline = load_pipeline(args.pipeline)
+    try:
+        disabled = runconfig.resolve_disabled_steps(
+            config, overrides, pipeline.name, {s.name for s in pipeline.stages})
+    except runconfig.ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)  # noqa: T201
+        return 2
     base, failures = orchestrate(
         pipeline, args.activity, args.scope, root=args.root,
-        resume=args.resume, observe=args.observe,
+        resume=args.resume, observe=args.observe, disabled_steps=disabled,
     )
-    runconfig.snapshot(Path(base), resolved)  # reproducibility: effective knobs next to the run
+    runconfig.snapshot(Path(base), resolved,
+                       disabled_keys=[f"steps.{pipeline.name}.{n}" for n in sorted(disabled)])
     print(base)  # noqa: T201
     if failures < 0:
         return 130  # interrupted (SIGINT) — partial results saved; resume with --resume
@@ -152,11 +160,19 @@ def _run(args: argparse.Namespace) -> int:
     get_followups = getattr(pipeline, "followups", None)
     if callable(get_followups):
         for fu in get_followups(Activity(Path(base))):
+            fu_pipeline = load_pipeline(fu.pipeline)
+            try:
+                fu_disabled = runconfig.resolve_disabled_steps(
+                    config, overrides, fu_pipeline.name, {s.name for s in fu_pipeline.stages})
+            except runconfig.ConfigError as e:
+                print(f"config error: {e}", file=sys.stderr)  # noqa: T201
+                return 2
             fu_base, fu_failures = orchestrate(
-                load_pipeline(fu.pipeline), fu.activity, fu.scope, root=str(base),
-                resume=args.resume, observe=args.observe,
+                fu_pipeline, fu.activity, fu.scope, root=str(base),
+                resume=args.resume, observe=args.observe, disabled_steps=fu_disabled,
             )
-            runconfig.snapshot(Path(fu_base), resolved)
+            runconfig.snapshot(Path(fu_base), resolved,
+                               disabled_keys=[f"steps.{fu_pipeline.name}.{n}" for n in sorted(fu_disabled)])
             print(fu_base)  # noqa: T201
             if fu_failures < 0:
                 return 130
