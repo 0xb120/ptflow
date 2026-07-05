@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -30,6 +30,8 @@ _ENUMS = {
     "PTFLOW_AI_PROVIDER": ("anthropic",),
 }
 _ROLES_PREFIX = "wordlists.roles."   # dynamic: wordlists.roles.<role> → PTFLOW_WL_<ROLE>
+_STEPS_PREFIX = "steps."   # dynamic: steps.<pipeline>.<step> → per-step on/off (filters pipeline.stages)
+_STEPS_KEY_SEGMENTS = 3   # steps.<pipeline>.<step> — fewer segments is a malformed (unrecognized) key
 
 
 class Knob(NamedTuple):
@@ -154,6 +156,17 @@ def _pick(knob: Knob, overrides: dict[str, str], env: Mapping[str, str],
     return None
 
 
+def _is_recognized_key(key: str) -> bool:
+    """A config/override key the resolver knows about — a declared knob, a wordlist-role pin, or a
+    FULLY-FORMED per-step toggle (`steps.<pipeline>.<step>`). A malformed `steps.` key (missing the
+    pipeline or step segment) is deliberately NOT recognized, so resolve() warns it as a likely typo."""
+    if key in _BY_PATH or key.startswith(_ROLES_PREFIX):
+        return True
+    if key.startswith(_STEPS_PREFIX):
+        return len(key.split(".")) >= _STEPS_KEY_SEGMENTS
+    return False
+
+
 def resolve(config: Mapping[str, Any], env: Mapping[str, str],
             sets: Iterable[str] | None = None) -> list[Resolved]:
     """Effective knob values (precedence --set > env > config), coerced to the env string form and
@@ -162,7 +175,7 @@ def resolve(config: Mapping[str, Any], env: Mapping[str, str],
     flat = _flatten(config)
     for source, keys in (("config", flat), ("--set", overrides)):
         for key in keys:
-            if key not in _BY_PATH and not key.startswith(_ROLES_PREFIX):
+            if not _is_recognized_key(key):
                 log.warning("⚠ unknown %s key '%s' — ignored (typo?)", source, key)
 
     out: list[Resolved] = []
@@ -181,6 +194,29 @@ def resolve(config: Mapping[str, Any], env: Mapping[str, str],
     return out
 
 
+def resolve_disabled_steps(config: Mapping[str, Any], sets: Iterable[str] | None,
+                           pipeline: str, stage_names: Collection[str]) -> frozenset[str]:
+    """The steps to DISABLE for `pipeline`, from the `[steps.<pipeline>]` config table + `--set
+    steps.<pipeline>.<step>=off` (precedence --set > config), validated against the pipeline's LIVE
+    stage names. Sparse: only a step set to a falsey value is disabled; an unlisted step stays on.
+    Pure. Raises ConfigError on an unknown step name (so a stale/renamed step can't be referenced)."""
+    flat = _flatten(config)
+    overrides = _parse_overrides(sets)
+    prefix = f"{_STEPS_PREFIX}{pipeline}."
+    names = {k[len(prefix):] for src in (flat, overrides) for k in src if k.startswith(prefix)}
+    disabled: set[str] = set()
+    for name in names:
+        if name not in stage_names:
+            valid = ", ".join(sorted(stage_names))
+            msg = f"unknown step '{name}' for pipeline '{pipeline}' — valid: {valid}"
+            raise ConfigError(msg)
+        key = f"{prefix}{name}"
+        raw = overrides[key] if key in overrides else flat[key]  # --set wins over config
+        if _coerce("bool", raw) == "off":
+            disabled.add(name)
+    return frozenset(disabled)
+
+
 def apply(resolved: Iterable[Resolved]) -> None:
     """Write the resolved knobs into os.environ — MUST run before importing the pipeline (its constants
     read PTFLOW_* at import). An env var already set to its own value is a harmless no-op."""
@@ -192,15 +228,19 @@ def _toml_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def snapshot(activity_dir: Path, resolved: Iterable[Resolved]) -> Path | None:
+def snapshot(activity_dir: Path, resolved: Iterable[Resolved], *,
+             disabled_keys: Iterable[str] = ()) -> Path | None:
     """Write the effective run config to ``<activity>/config.toml`` (secrets redacted) for
-    reproducibility — re-feedable with ``--config``. Returns the path, or None if nothing was set."""
+    reproducibility — re-feedable with ``--config``. Includes disabled steps as ``steps.<pipeline>.<step>
+    = "off"`` lines. Returns the path, or None if nothing was set."""
     rows = sorted(resolved, key=lambda r: r.path)
-    if not rows:
+    steps = sorted(disabled_keys)
+    if not rows and not steps:
         return None
     lines = ["# ptflow — effective run config (auto-generated; secrets redacted).",
              "# Re-feed with:  ptflow run <pipeline> <activity> <scope> --config config.toml", ""]
     lines += [f"{r.path} = {_toml_quote('<redacted>' if r.secret else r.value)}" for r in rows]
+    lines += [f"{k} = {_toml_quote('off')}" for k in steps]
     out = activity_dir / "config.toml"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
@@ -57,6 +57,48 @@ class Stage:
     global network-concurrency cap (``_NET_SLOTS``); set ``net=False`` for purely offline stages
     (wordlist tokenisation, response-store mining, wordlist provisioning) so they neither claim a
     network slot nor get the ``net`` tag."""
+
+
+def stage_band(stage: Stage) -> str:
+    """The stage's execution band (pure) — the SINGLE source for both the Prefect UI tags and the
+    `ptflow steps` view, so the two can't diverge. breadth | spanning | post-cluster | loop:<phase>."""
+    if stage.spanning:
+        return "spanning"
+    if stage.cluster_scope:
+        return "post-cluster"
+    if stage.per_app:
+        return f"loop:{stage.phase}"
+    return "breadth"
+
+
+def enabled_stages(stages: Sequence[Stage], disabled: Collection[str]) -> list[Stage]:
+    """The stages left after removing the disabled ones (pure). Safe WITHOUT rewiring `needs`:
+    topo_order/_submit_dag ignore a missing dependency name, and stages read on-disk inputs
+    tolerantly — a surviving consumer of a removed stage just finds empty/absent inputs."""
+    return [s for s in stages if s.name not in disabled]
+
+
+def impacted_dependents(stages: Sequence[Stage], disabled: Collection[str]) -> list[str]:
+    """Surviving stages that transitively depend (via `needs`) on a disabled stage — the ones that
+    will run with empty/absent inputs (pure, sorted). Only `needs`-declared, same-scope edges are
+    modeled; cross-loop consumers that read another loop's artifacts across the barrier are NOT
+    declared in Stage metadata, so they aren't captured here."""
+    by_name = {s.name: s for s in stages}
+    disabled_set = set(disabled)
+    memo: dict[str, bool] = {}
+
+    def needs_disabled(name: str) -> bool:
+        if name in memo:
+            return memo[name]
+        memo[name] = False  # cycle guard (the DAG shouldn't have any) — overwritten below
+        stage = by_name.get(name)
+        result = stage is not None and any(
+            dep in disabled_set or needs_disabled(dep) for dep in stage.needs
+        )
+        memo[name] = result
+        return result
+
+    return sorted(s.name for s in stages if s.name not in disabled_set and needs_disabled(s.name))
 
 
 class Followup(NamedTuple):

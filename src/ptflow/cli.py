@@ -8,9 +8,15 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ptflow.core import runconfig
 from ptflow.core.log import setup_logging
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
+
+    from ptflow.core.stage import Pipeline
 
 # NB: orchestrator/pipelines are imported INSIDE main() — their constants read PTFLOW_* at import, so the
 # run config must populate os.environ first (see _run).
@@ -30,6 +36,52 @@ def _serve() -> int:
     ]
     print(f"Prefect UI → {_UI_URL}   ·   then in another terminal: ptflow run … --observe")  # noqa: T201
     return subprocess.run(cmd, check=False).returncode
+
+
+_BAND_ORDER = ("breadth", "spanning", "post-cluster")
+
+
+def _band_sort_key(band: str) -> tuple[int, int]:
+    """Order bands breadth → spanning → post-cluster → loop:1 → loop:2 … (pure)."""
+    if band in _BAND_ORDER:
+        return (_BAND_ORDER.index(band), 0)
+    phase = int(band.split(":", 1)[1]) if band.startswith("loop:") else 0
+    return (len(_BAND_ORDER), phase)
+
+
+def render_steps(pipeline: Pipeline, disabled: Collection[str], *, verbose: bool = False) -> str:
+    """Render every step of `pipeline` grouped by band, with ● (active) / ○ (disabled) — the live,
+    always-current step view. Pure: takes the resolved `disabled` set so it matches a run exactly.
+    `verbose` adds each step's phase / scope / net / needs on its own line."""
+    from ptflow.core.stage import impacted_dependents, stage_band  # noqa: PLC0415
+
+    stages = list(pipeline.stages)
+    disabled_set = set(disabled)
+    groups: dict[str, list] = {}
+    for s in stages:  # preserve declared order within each band
+        groups.setdefault(stage_band(s), []).append(s)
+
+    n_off = sum(1 for s in stages if s.name in disabled_set)
+    header = f"{pipeline.name} — {len(stages)} step" + (f" ({n_off} disabilitati)" if n_off else "")
+    lines = [header, ""]
+    for band in sorted(groups, key=_band_sort_key):
+        members = groups[band]
+        if verbose:
+            for s in members:
+                mark = "○" if s.name in disabled_set else "●"
+                bits = [f"phase={s.phase}", "per_app" if s.per_app else "activity",
+                        "net" if s.net else "offline"]
+                if s.needs:
+                    bits.append("needs=" + ",".join(s.needs))
+                lines.append(f"  {band:<13} {mark} {s.name:<22} [{' · '.join(bits)}]")
+        else:
+            cells = "   ".join(("○" if s.name in disabled_set else "●") + " " + s.name for s in members)
+            lines.append(f"  {band:<13} {cells}")
+    lines += ["", "○ = disabilitato   ● = attivo"]
+    impacted = impacted_dependents(stages, disabled_set)
+    if impacted:
+        lines.append("⚠ dipendenti che gireranno con input assenti: " + ", ".join(impacted))
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -77,6 +129,23 @@ def main(argv: list[str] | None = None) -> int:
         help="which pipeline's requirements to check (default: external)",
     )
 
+    steps = sub.add_parser(
+        "steps", help="list a pipeline's steps and their effective on/off state",
+    )
+    steps.add_argument("pipeline")
+    steps.add_argument(
+        "--config", default=None, metavar="PATH",
+        help="TOML file of operator knobs — reads its [steps.<pipeline>] table",
+    )
+    steps.add_argument(
+        "--set", action="append", default=None, metavar="KEY=VALUE", dest="overrides",
+        help="override a toggle, repeatable (e.g. --set steps.external.dast=off)",
+    )
+    steps.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="also show each step's phase / scope / net / needs",
+    )
+
     args = parser.parse_args(argv)
 
     if args.cmd == "serve":
@@ -87,6 +156,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "doctor":
         return _doctor(args.pipeline)
+
+    if args.cmd == "steps":
+        return _steps(args)
 
     return 1
 
@@ -110,6 +182,27 @@ def _doctor(pipeline_name: str) -> int:
     return report.exit_code
 
 
+def _steps(args: argparse.Namespace) -> int:
+    """List a pipeline's steps grouped by band, with the effective on/off state given --config/--set.
+    Reads the pipeline's live `stages`, so the view is always current (nothing generated to drift)."""
+    from ptflow.pipelines import load_pipeline  # noqa: PLC0415
+
+    try:
+        config = runconfig.load_config(args.config)
+    except runconfig.ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)  # noqa: T201
+        return 2
+    pipeline = load_pipeline(args.pipeline)
+    try:
+        disabled = runconfig.resolve_disabled_steps(
+            config, args.overrides, pipeline.name, {s.name for s in pipeline.stages})
+    except runconfig.ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)  # noqa: T201
+        return 2
+    print(render_steps(pipeline, disabled, verbose=args.verbose))  # noqa: T201
+    return 0
+
+
 def _apply_ai_flag(overrides: list[str], *, ai: bool) -> list[str]:
     """Append ``ai=on`` for the ``--ai`` convenience flag — but only when the user did not already
     pass an explicit ``ai=`` via ``--set``. ``--set`` must win over the flag (documented precedence:
@@ -125,7 +218,8 @@ def _run(args: argparse.Namespace) -> int:
     # pipeline — its module-level constants read PTFLOW_* at import time.
     try:
         overrides = _apply_ai_flag(list(args.overrides or []), ai=args.ai)
-        resolved = runconfig.resolve(runconfig.load_config(args.config), os.environ, overrides)
+        config = runconfig.load_config(args.config)
+        resolved = runconfig.resolve(config, os.environ, overrides)
     except runconfig.ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)  # noqa: T201
         return 2
@@ -136,11 +230,18 @@ def _run(args: argparse.Namespace) -> int:
     from ptflow.pipelines import load_pipeline  # noqa: PLC0415 (constants read PTFLOW_* at import)
 
     pipeline = load_pipeline(args.pipeline)
+    try:
+        disabled = runconfig.resolve_disabled_steps(
+            config, overrides, pipeline.name, {s.name for s in pipeline.stages})
+    except runconfig.ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)  # noqa: T201
+        return 2
     base, failures = orchestrate(
         pipeline, args.activity, args.scope, root=args.root,
-        resume=args.resume, observe=args.observe,
+        resume=args.resume, observe=args.observe, disabled_steps=disabled,
     )
-    runconfig.snapshot(Path(base), resolved)  # reproducibility: effective knobs next to the run
+    runconfig.snapshot(Path(base), resolved,
+                       disabled_keys=[f"steps.{pipeline.name}.{n}" for n in sorted(disabled)])
     print(base)  # noqa: T201
     if failures < 0:
         return 130  # interrupted (SIGINT) — partial results saved; resume with --resume
@@ -152,11 +253,19 @@ def _run(args: argparse.Namespace) -> int:
     get_followups = getattr(pipeline, "followups", None)
     if callable(get_followups):
         for fu in get_followups(Activity(Path(base))):
+            fu_pipeline = load_pipeline(fu.pipeline)
+            try:
+                fu_disabled = runconfig.resolve_disabled_steps(
+                    config, overrides, fu_pipeline.name, {s.name for s in fu_pipeline.stages})
+            except runconfig.ConfigError as e:
+                print(f"config error: {e}", file=sys.stderr)  # noqa: T201
+                return 2
             fu_base, fu_failures = orchestrate(
-                load_pipeline(fu.pipeline), fu.activity, fu.scope, root=str(base),
-                resume=args.resume, observe=args.observe,
+                fu_pipeline, fu.activity, fu.scope, root=str(base),
+                resume=args.resume, observe=args.observe, disabled_steps=fu_disabled,
             )
-            runconfig.snapshot(Path(fu_base), resolved)
+            runconfig.snapshot(Path(fu_base), resolved,
+                               disabled_keys=[f"steps.{fu_pipeline.name}.{n}" for n in sorted(fu_disabled)])
             print(fu_base)  # noqa: T201
             if fu_failures < 0:
                 return 130

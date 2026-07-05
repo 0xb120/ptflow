@@ -62,3 +62,11 @@ dir = "/opt/wordlist"
 server = ""
 # Auth token for a protected/self-hosted interactsh server. SECRET → redacted in the snapshot.
 token = ""
+
+# ── Per-step on/off toggles (debug) ─────────────────────────────────────────
+# Disable named stages for a run. Sparse: only what you list changes; everything else stays ON.
+# Names are validated against the pipeline's live stages — see them with `ptflow steps <pipeline>`.
+# One-off equivalent:  --set steps.external.dast=off
+# [steps.external]
+# nuclei_scope = false      # skip the whole-scope nuclei spanning scan
+# dast = false              # skip the phase-2 DAST (its dependents still run, on absent inputs)

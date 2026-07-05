@@ -23,3 +23,31 @@ def test_load_pipeline_unknown_raises():
 
     with pytest.raises(ValueError, match="unknown pipeline"):
         load_pipeline("does-not-exist")
+
+
+def test_stage_band_classifies():
+    from ptflow.core.stage import Stage, stage_band
+    assert stage_band(Stage("a", lambda *_: None)) == "breadth"
+    assert stage_band(Stage("b", lambda *_: None, spanning=True)) == "spanning"
+    assert stage_band(Stage("c", lambda *_: None, cluster_scope=True)) == "post-cluster"
+    assert stage_band(Stage("d", lambda *_: None, per_app=True, phase=2)) == "loop:2"
+
+
+def test_enabled_stages_filters():
+    from ptflow.core.stage import Stage, enabled_stages
+    stages = [Stage("a", lambda *_: None), Stage("b", lambda *_: None)]
+    assert [s.name for s in enabled_stages(stages, {"a"})] == ["b"]
+
+
+def test_impacted_dependents_transitive():
+    from ptflow.core.stage import Stage, impacted_dependents
+    a = Stage("a", lambda *_: None)
+    b = Stage("b", lambda *_: None, needs=("a",))
+    c = Stage("c", lambda *_: None, needs=("b",))
+    d = Stage("d", lambda *_: None)  # independent
+    assert impacted_dependents([a, b, c, d], {"a"}) == ["b", "c"]
+
+
+def test_impacted_dependents_none_when_independent():
+    from ptflow.core.stage import Stage, impacted_dependents
+    assert impacted_dependents([Stage("a", lambda *_: None), Stage("b", lambda *_: None)], {"a"}) == []

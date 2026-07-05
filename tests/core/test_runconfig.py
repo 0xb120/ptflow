@@ -96,3 +96,66 @@ def test_ai_provider_enum_rejects_unknown():
     import pytest
     with pytest.raises(runconfig.ConfigError):
         runconfig.resolve({}, {}, ["ai.provider=openai"])
+
+
+def test_resolve_disabled_steps_sparse_and_precedence():
+    config = {"steps": {"external": {"dast": False, "cve_lookup": True}}}
+    names = {"dast", "cve_lookup", "httpx"}
+    # config: dast off, cve_lookup on; --set turns httpx off and flips cve_lookup off (--set wins)
+    out = runconfig.resolve_disabled_steps(
+        config, ["steps.external.httpx=off", "steps.external.cve_lookup=off"], "external", names)
+    assert out == frozenset({"dast", "httpx", "cve_lookup"})
+
+
+def test_resolve_disabled_steps_unlisted_stay_enabled():
+    assert runconfig.resolve_disabled_steps({}, None, "external", {"dast", "httpx"}) == frozenset()
+
+
+def test_resolve_disabled_steps_unknown_name_raises():
+    with pytest.raises(runconfig.ConfigError):
+        runconfig.resolve_disabled_steps(
+            {"steps": {"external": {"nope": False}}}, None, "external", {"dast"})
+
+
+def test_resolve_disabled_steps_scopes_to_pipeline():
+    config = {"steps": {"internal": {"smb_checks": False}}}  # a DIFFERENT pipeline's table
+    assert runconfig.resolve_disabled_steps(config, None, "external", {"dast"}) == frozenset()
+
+
+def test_resolve_does_not_warn_steps_prefix(caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger="ptflow")
+    runconfig.resolve({"steps": {"external": {"dast": False}}}, {}, None)
+    assert "steps.external.dast" not in caplog.text  # recognized prefix, not a "unknown key" typo warning
+
+
+def test_resolve_warns_malformed_steps_key_missing_pipeline(caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger="ptflow")
+    runconfig.resolve({}, {}, ["steps.dast=off"])   # missing pipeline segment
+    assert "steps.dast" in caplog.text               # warned as an unknown/typo key
+
+
+def test_resolve_does_not_warn_wellformed_steps_key(caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger="ptflow")
+    runconfig.resolve({"steps": {"external": {"dast": False}}}, {}, None)
+    assert "steps.external.dast" not in caplog.text   # steps.<pipeline>.<step> is recognized
+
+
+def test_snapshot_records_disabled_steps(tmp_path):
+    resolved = runconfig.resolve({"profile": "home"}, {}, None)
+    out = runconfig.snapshot(tmp_path, resolved, disabled_keys=["steps.external.dast"])
+    text = out.read_text()
+    assert 'profile = "home"' in text
+    assert 'steps.external.dast = "off"' in text
+
+
+def test_snapshot_disabled_only_still_writes(tmp_path):
+    out = runconfig.snapshot(tmp_path, [], disabled_keys=["steps.external.dast"])
+    assert out is not None
+    assert 'steps.external.dast = "off"' in out.read_text()
+
+
+def test_snapshot_nothing_set_returns_none(tmp_path):
+    assert runconfig.snapshot(tmp_path, [], disabled_keys=[]) is None

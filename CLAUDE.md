@@ -35,6 +35,10 @@ uv run ptflow run <pipeline> <activity> <scope.txt> [--root DIR] [-v] [--resume]
 uv run ptflow doctor [<pipeline>]                      # verify a pipeline's external tools + datasets
                                                        # are installed (default: external); exit 1 if a
                                                        # CORE tool is missing (CI/provisioning gate)
+uv run ptflow steps <pipeline> [--config ptflow.toml] [--set KEY=VALUE ...] [-v]
+                                                       # list every step grouped by band + its
+                                                       # effective on/off state (live view; -v adds
+                                                       # phase/scope/net/needs). Read-only, exit 0.
 uv run ruff check . && uv run ty check src/ && uv run pytest   # the full dev gate
 uv run pytest tests/core/test_orchestrator.py          # one file
 uv run pytest tests/core/test_scope.py::test_classify  # one test
@@ -70,6 +74,18 @@ in config:** the ~119 internal tuning constants (caps/rates/timeouts/thresholds)
 defaults in code, with `profile` (`wide`/`home`) the bundle for the rate-sensitive ones. Env vars keep
 working unchanged (config is additive/optional). `core/config.py` (the `Config`/`CONFIG` structural
 dataclass: `fanout`/`retries`) is a SEPARATE concern — don't conflate it with `runconfig`.
+
+**Per-step on/off toggles (debug).** A sparse `[steps.<pipeline>]` table disables named stages for a
+run — `dast = false` under `[steps.external]`, or the one-off `--set steps.external.dast=off` (precedence
+`--set` > config file; no env layer). Only listed steps change; everything else stays ON. Step names are
+validated against the pipeline's **live `stages`** (unknown name → config error, exit 2), so the config
+can't reference a deleted/renamed step — that, plus the live `ptflow steps <pipeline>` view, is how the
+feature stays in sync with the code (nothing generated to drift). Mechanically the resolved set FILTERS
+`pipeline.stages` before the DAG is built (`orchestrator._run_dag`); this needs no `needs` rewrite because
+`topo_order`/`_submit_dag` already ignore missing dependency names and stages read on-disk inputs
+tolerantly — a disabled step's dependents still run, degrading on absent inputs (a WARNING at run start
+lists them). Disabled steps are recorded in `<activity>/config.toml`. Non-`Stage` hooks (`cluster`,
+`consolidate`, `provider`, `report`, `followups`) are not toggleable.
 
 ### Checking dependencies (`ptflow doctor`)
 
