@@ -78,7 +78,9 @@ dataclass: `fanout`/`retries`) is a SEPARATE concern — don't conflate it with 
 **Per-step on/off toggles (debug).** A sparse `[steps.<pipeline>]` table disables named stages for a
 run — `dast = false` under `[steps.external]`, or the one-off `--set steps.external.dast=off` (precedence
 `--set` > config file; no env layer). Only listed steps change; everything else stays ON. Step names are
-validated against the pipeline's **live `stages`** (unknown name → config error, exit 2), so the config
+validated against the pipeline's **live `stages`** (unknown name → config error, exit 2; a
+malformed key missing the pipeline segment — `steps.dast` instead of `steps.external.dast` — is
+flagged as an unknown config key, not silently ignored), so the config
 can't reference a deleted/renamed step — that, plus the live `ptflow steps <pipeline>` view, is how the
 feature stays in sync with the code (nothing generated to drift). Mechanically the resolved set FILTERS
 `pipeline.stages` before the DAG is built (`orchestrator._run_dag`); this needs no `needs` rewrite because
