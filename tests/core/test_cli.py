@@ -5,8 +5,12 @@ from ptflow.pipelines import load_pipeline
 def test_render_steps_all_active():
     out = render_steps(load_pipeline("example"), frozenset())
     assert "example — 3 step" in out
-    assert "● discover" in out and "● scope_scan" in out and "● enum" in out  # noqa: PT018
-    assert "○ discover" not in out and "○ scope_scan" not in out and "○ enum" not in out  # noqa: PT018
+    assert "● discover" in out
+    assert "● scope_scan" in out
+    assert "● enum" in out
+    assert "○ discover" not in out
+    assert "○ scope_scan" not in out
+    assert "○ enum" not in out
 
 
 def test_render_steps_marks_disabled_and_impacted():
@@ -20,4 +24,5 @@ def test_render_steps_marks_disabled_and_impacted():
 def test_render_steps_verbose_shows_needs_and_scope():
     out = render_steps(load_pipeline("example"), frozenset(), verbose=True)
     assert "needs=discover" in out
-    assert "per_app" in out and "activity" in out  # noqa: PT018
+    assert "per_app" in out
+    assert "activity" in out
