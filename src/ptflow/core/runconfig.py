@@ -155,6 +155,17 @@ def _pick(knob: Knob, overrides: dict[str, str], env: Mapping[str, str],
     return None
 
 
+def _is_recognized_key(key: str) -> bool:
+    """A config/override key the resolver knows about — a declared knob, a wordlist-role pin, or a
+    FULLY-FORMED per-step toggle (`steps.<pipeline>.<step>`). A malformed `steps.` key (missing the
+    pipeline or step segment) is deliberately NOT recognized, so resolve() warns it as a likely typo."""
+    if key in _BY_PATH or key.startswith(_ROLES_PREFIX):
+        return True
+    if key.startswith(_STEPS_PREFIX):
+        return len(key.split(".")) >= 3  # steps.<pipeline>.<step>
+    return False
+
+
 def resolve(config: Mapping[str, Any], env: Mapping[str, str],
             sets: Iterable[str] | None = None) -> list[Resolved]:
     """Effective knob values (precedence --set > env > config), coerced to the env string form and
@@ -163,7 +174,7 @@ def resolve(config: Mapping[str, Any], env: Mapping[str, str],
     flat = _flatten(config)
     for source, keys in (("config", flat), ("--set", overrides)):
         for key in keys:
-            if key not in _BY_PATH and not key.startswith((_ROLES_PREFIX, _STEPS_PREFIX)):
+            if not _is_recognized_key(key):
                 log.warning("⚠ unknown %s key '%s' — ignored (typo?)", source, key)
 
     out: list[Resolved] = []

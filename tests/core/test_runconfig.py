@@ -129,6 +129,20 @@ def test_resolve_does_not_warn_steps_prefix(caplog):
     assert "steps.external.dast" not in caplog.text  # recognized prefix, not a "unknown key" typo warning
 
 
+def test_resolve_warns_malformed_steps_key_missing_pipeline(caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger="ptflow")
+    runconfig.resolve({}, {}, ["steps.dast=off"])   # missing pipeline segment
+    assert "steps.dast" in caplog.text               # warned as an unknown/typo key
+
+
+def test_resolve_does_not_warn_wellformed_steps_key(caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger="ptflow")
+    runconfig.resolve({"steps": {"external": {"dast": False}}}, {}, None)
+    assert "steps.external.dast" not in caplog.text   # steps.<pipeline>.<step> is recognized
+
+
 def test_snapshot_records_disabled_steps(tmp_path):
     resolved = runconfig.resolve({"profile": "home"}, {}, None)
     out = runconfig.snapshot(tmp_path, resolved, disabled_keys=["steps.external.dast"])
