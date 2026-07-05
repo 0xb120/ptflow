@@ -104,6 +104,18 @@ def _stage_tags(stage: Stage) -> list[str]:
     return ["net", band] if stage.net else [band]
 
 
+def _filter_disabled(pipeline: Pipeline, disabled: set[str]) -> list[Stage]:
+    """Drop the disabled stages from the pipeline (logging which, and WARNING which surviving stages
+    depend on a removed one and will run on absent inputs). Returns the enabled stage list."""
+    if disabled:
+        log.info("▶ steps disabled: %s", ", ".join(sorted(disabled)))
+        impacted = impacted_dependents(pipeline.stages, disabled)
+        if impacted:
+            log.warning("⚠ these steps depend on a disabled step and will run with absent inputs: %s",
+                        ", ".join(impacted))
+    return enabled_stages(pipeline.stages, disabled)
+
+
 def _submit_dag(  # noqa: PLR0913
     stages: list[Stage],
     pipeline_name: str,
@@ -238,7 +250,7 @@ def _terminal_fanin(pipeline: Pipeline, activity: Activity, failures: list[str])
 
 
 @flow(task_runner=ThreadPoolTaskRunner(max_workers=CONFIG.fanout.max_workers))  # ty: ignore[no-matching-overload]
-def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *,  # noqa: C901
+def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *,
              resume: bool, disabled: tuple[str, ...] = ()) -> int:
     """Drive the full DAG. Returns the number of stage failures (0 = clean).
 
@@ -251,14 +263,7 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *,  # noq
     tools.clear_abort()  # fresh run (a prior aborted run in this process must not poison this one)
     pipeline = load_pipeline(pipeline_name)
     activity = Activity.named(activity_name, Path(root) if root else None)
-    disabled_set = set(disabled)
-    if disabled_set:
-        log.info("▶ steps disabled: %s", ", ".join(sorted(disabled_set)))
-        impacted = impacted_dependents(pipeline.stages, disabled_set)
-        if impacted:
-            log.warning("⚠ these steps depend on a disabled step and will run with absent inputs: %s",
-                        ", ".join(impacted))
-    stages = enabled_stages(pipeline.stages, disabled_set)
+    stages = _filter_disabled(pipeline, set(disabled))
     activity_stages = [s for s in stages
                        if not s.per_app and not s.spanning and not s.cluster_scope]
     spanning_stages = [s for s in stages if s.spanning]
