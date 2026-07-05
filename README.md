@@ -175,6 +175,18 @@ The **internal** ([flow](docs/internal-pipeline-flow.html) · [map](docs/interna
 **webscan** ([flow](docs/webscan-pipeline-flow.html) · [map](docs/webscan-pipeline-map.md)) pipelines
 have the same three views under their own `docs/<name>-pipeline-*` names.
 
+## Doc-sync hook (optional)
+
+This repo ships a post-merge hook that auto-updates documentation after a merge to `main`
+(regenerates the flow maps + a headless Claude agent refreshes the prose docs, as one reviewable
+`docs: auto-sync` commit). Activate once with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Skip it for a given merge with `PTFLOW_NO_DOC_SYNC=1 git merge …`. See CLAUDE.md → "Documentation automation".
+
 ## Authorized test scope
 
 ```
