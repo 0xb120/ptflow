@@ -34,7 +34,7 @@ select = ["ALL"]
 ignore = ["D", "COM812", "ISC001", "S603", "S607", "TC001", "TC003", "ERA001", "ANN401", "E501"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "ANN", "INP001", "PLR2004", "PLC0415", "SLF001", "S603", "S607"]
+"tests/*" = ["S101", "ANN", "INP001", "PLR2004", "PLC0415", "SLF001"]
 
 [tool.ty.environment]
 python-version = "3.11"
