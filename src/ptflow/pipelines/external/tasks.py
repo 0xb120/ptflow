@@ -4035,9 +4035,12 @@ def _run_dast(ws: AppWorkspace, requests_: list[dict], *, input_name: str, out_n
 
 
 def _surface_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
-    """The EXPLORABLE-surface request set (phase 2): the surface catalog (requests.jsonl), deduped by
-    shape and capped. Shared by `dast` and the surface vuln scanners (xss/sqli)."""
-    return dast_requests(tools.read_jsonl(ws.canonical("requests.jsonl")), [], cap=cap)
+    """The EXPLORABLE-surface request set (phase 2): the surface catalog (requests.jsonl) UNIONED with the
+    cross-group sidecar (requests_xref.jsonl — peers' surface owned by this group, from xref_catalog),
+    deduped by shape and capped. Shared by `dast` and the surface vuln scanners (xss/sqli)."""
+    catalog = [*tools.read_jsonl(ws.canonical("requests.jsonl")),
+               *tools.read_jsonl(ws.canonical("requests_xref.jsonl"))]
+    return dast_requests(catalog, [], cap=cap)
 
 
 def _delta_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:

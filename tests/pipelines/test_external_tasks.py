@@ -2019,3 +2019,42 @@ def test_xref_catalog_single_group_is_empty(tmp_path):
     tools.write_lines(b.canonical("endpoints_js.txt"), ["https://api.company.com/own"])
     tasks.xref_catalog(act, "only")
     assert tools.read_jsonl(b.canonical("requests_xref.jsonl")) == []  # no other groups → empty
+
+
+def test_surface_request_set_merges_xref_sidecar(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("surface-xref", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
+    tools.write_lines(ws.hosts, ["https://a.com"])
+    tools.write_jsonl(ws.canonical("requests.jsonl"),
+                      [{"method": "GET", "url": "https://a.com/own",
+                        "raw": "GET /own HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": [], "sources": ["katana"]}])
+    tools.write_jsonl(ws.canonical("requests_xref.jsonl"),
+                      [{"method": "GET", "url": "https://a.com/routed",
+                        "raw": "GET /routed HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": [],
+                        "sources": ["xref:other"]}])
+    got = {tasks._url_pathkey(r["url"]) for r in tasks._surface_request_set(ws, cap=100)}
+    assert "a.com/own" in got       # own surface still present
+    assert "a.com/routed" in got    # cross-group surface folded in
+
+
+def test_surface_request_set_collapses_shared_shape(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("surface-xref-dedup", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
+    tools.write_lines(ws.hosts, ["https://a.com"])
+    shared = {"method": "GET", "url": "https://a.com/shared",
+              "raw": "GET /shared HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": []}
+    tools.write_jsonl(ws.canonical("requests.jsonl"), [{**shared, "sources": ["katana"]}])
+    tools.write_jsonl(ws.canonical("requests_xref.jsonl"), [{**shared, "sources": ["xref:other"]}])
+    result = tasks._surface_request_set(ws, cap=100)
+    shared_recs = [r for r in result if tasks._url_pathkey(r["url"]) == "a.com/shared"]
+    assert len(shared_recs) == 1                                # same (method, path) collapses to ONE
+    assert tasks.request_key(shared_recs[0]) == ("GET", tasks.path_template("https://a.com/shared"))
+    sources = shared_recs[0]["sources"]
+    assert "katana" in sources                                 # own-surface provenance kept
+    assert any(s.startswith("xref:") for s in sources)         # cross-group provenance unioned in
