@@ -31,6 +31,7 @@ _ENUMS = {
 }
 _ROLES_PREFIX = "wordlists.roles."   # dynamic: wordlists.roles.<role> → PTFLOW_WL_<ROLE>
 _STEPS_PREFIX = "steps."   # dynamic: steps.<pipeline>.<step> → per-step on/off (filters pipeline.stages)
+_STEPS_KEY_SEGMENTS = 3   # steps.<pipeline>.<step> — fewer segments is a malformed (unrecognized) key
 
 
 class Knob(NamedTuple):
@@ -162,7 +163,7 @@ def _is_recognized_key(key: str) -> bool:
     if key in _BY_PATH or key.startswith(_ROLES_PREFIX):
         return True
     if key.startswith(_STEPS_PREFIX):
-        return len(key.split(".")) >= 3  # steps.<pipeline>.<step>
+        return len(key.split(".")) >= _STEPS_KEY_SEGMENTS
     return False
 
 
