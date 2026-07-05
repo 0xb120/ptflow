@@ -250,6 +250,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
       secrets.jsonl                      #   secret fleet, run ONCE at content_discovery's tail (full corpus)
       requests_crawl.jsonl  requests_headless.jsonl  requests_api.jsonl  requests_recrawl.jsonl  #   FULL requests
       requests.jsonl                     #   request_catalog (PHASE 1): EXPLORABLE-surface catalog (phase-2 DAST input)
+      requests_xref.jsonl                #   xref_catalog (PHASE 2): cross-group surface sidecar — OTHER in-scope groups' requests whose host is THIS group's (dast/xss/sqli read requests.jsonl ∪ this)
       requests_full.jsonl                #   request_catalog_full (PHASE 4): + guessed surface (param_fuzz/dast_full input)
       raw/recrawl/seeds.txt              #   recrawl: new-territory seeds (PTFLOW_RECRAWL on=crawl [default] · preview=list only)
       params.jsonl                       #   param_fuzz: hidden params, ALL locations {url,param,loc:query|body|json|header}
@@ -385,15 +386,20 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     **EXPLORABLE-surface** request catalog `requests.jsonl` — crawl/headless **full requests**
     (`requests_crawl/headless.jsonl` — method/body/form/xhr, not bare URLs) + `requests_api.jsonl` +
     shapes mined from the **crawl** corpus + URL-only sources as GET. No guessed surface yet.
-  - **Loop 2 — DAST the explorable surface** (`phase=2`, low-hanging fruit): `dast` runs **nuclei
-    `-dast -im jsonl`** over `requests.jsonl`, fuzzing the **observed** params (query/path/header/
-    cookie/**body**) → `findings/dast.jsonl`. Fast, high-signal findings on the real attack surface
-    before any fuzzing; no hidden-param discovery (that's guessing → phase 4). `cve_lookup` runs **∥
-    `dast`** (same phase, offline `net=False`): known-CVE correlation of the enumerated software (web
-    server + tech + non-HTTP service banners + corpus libs) against `search_vulns`' local DB →
-    `findings/cve.jsonl`. See "CVE lookup" below. `xss` (dalfox) ∥ `sqli` (sqlmap) also run here —
-    **dedicated scanners** over the surface catalog's full requests → `findings/xss.jsonl` /
-    `findings/sqli.jsonl`. See "Dedicated vuln scanners" below.
+  - **Loop 2 — DAST the explorable surface** (`phase=2`, low-hanging fruit): the head `xref_catalog`
+    (offline `net=False`) assembles the **cross-group surface sidecar** `requests_xref.jsonl` — requests/
+    endpoints discovered while crawling OTHER in-scope groups whose host belongs to THIS group (via
+    `_cross_group_surface`), so the fast pass tests the cross-group surface too, not only phase 4 (the
+    1→2 barrier makes the peer read race-free). Then `dast` (← `xref_catalog`) runs **nuclei
+    `-dast -im jsonl`** over `requests.jsonl` ∪ `requests_xref.jsonl`, fuzzing the **observed** params
+    (query/path/header/cookie/**body**) → `findings/dast.jsonl`. Fast, high-signal findings on the real
+    attack surface before any fuzzing; no hidden-param discovery (that's guessing → phase 4). `cve_lookup`
+    runs **∥ `dast`** (same phase, offline `net=False`, no `xref_catalog` need — it reads enumerated
+    software, not the catalog): known-CVE correlation of the enumerated software (web server + tech +
+    non-HTTP service banners + corpus libs) against `search_vulns`' local DB → `findings/cve.jsonl`. See
+    "CVE lookup" below. `xss` (dalfox) ∥ `sqli` (sqlmap) also run here (← `xref_catalog`) — **dedicated
+    scanners** over the same surface set → `findings/xss.jsonl` / `findings/sqli.jsonl`. See "Dedicated
+    vuln scanners" below.
   - **Loop 3 — guessing / surface expansion** (`phase=3`): `wordlist` (offline seed from JS/body/seed)
     → `tech_enum` (surface-generating per-stack scanners) → `content_discovery` — feroxbuster forced
     browsing run as a bounded **fixpoint** (fuzz → download → mine → fuzz the new token delta), which
@@ -731,12 +737,14 @@ flagged `category` on all 50 query endpoints → now one record. Endpoint-specif
 query/path/header/cookie/**body** per template `part`, `-fa low` for live-infra politeness, best-effort
 (skip if nuclei or the dast templates dir — `PTFLOW_NUCLEI_DAST_TEMPLATES`, default `~/nuclei-templates/dast`
 — is absent), capped at `DAST_MAX_REQUESTS` (reconftw DEEP_LIMIT analog):
-- **`dast`** (phase 2) over the explorable-surface catalog `requests.jsonl` with its **observed** params
-  → `findings/dast.jsonl` (input `raw/dast/input.jsonl`). The fast low-hanging-fruit pass.
-- **`dast_full`** (phase 4) over the **delta** (`requests_full.jsonl` shapes NOT already in
-  `requests.jsonl`, keyed by `request_key`) + `build_fuzz_requests` (the discovered hidden params
-  injected into concrete requests per location) → `findings/dast_full.jsonl` (input
-  `raw/dast/input_full.jsonl`). It does NOT re-DAST the surface phase 2 already covered.
+- **`dast`** (phase 2) over the explorable-surface set (`_surface_request_set` = `requests.jsonl` **∪**
+  the cross-group sidecar `requests_xref.jsonl`) with its **observed** params → `findings/dast.jsonl`
+  (input `raw/dast/input.jsonl`). The fast low-hanging-fruit pass.
+- **`dast_full`** (phase 4) over the **delta** (`_delta_request_set` = `requests_full.jsonl` shapes NOT
+  already in `requests.jsonl` **nor** `requests_xref.jsonl`, keyed by `request_key`) + `build_fuzz_requests`
+  (the discovered hidden params injected into concrete requests per location) → `findings/dast_full.jsonl`
+  (input `raw/dast/input_full.jsonl`). It does NOT re-DAST the surface phase 2 already covered (including
+  the cross-group surface).
 
 Both passes **dedup their findings by INJECTION POINT** (`dedup_dast_findings`) before writing — one
 record per `(template-id, host, path, fuzzing_position, fuzzing_method)` (path WITHOUT the query, since
@@ -965,6 +973,35 @@ flow changed:
 
 The architecture sections above say *what* the external pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **Cross-group discovered surface reaches phase 2, not only phase 4 — via a per-app `xref_catalog`
+  stage, made race-free by the loop barrier.** The 2026-07-04 cross-group routing (`_cross_group_surface`)
+  folded endpoints discovered while crawling group A that belong to another in-scope group B into **B's
+  phase-4** full catalog (`requests_full.jsonl`), so only the heavy phase-4 pass tested them — a real,
+  immediately-DASTable cross-group endpoint got no fast, high-signal phase-2 finding. Fix: a new per-app
+  phase-2 stage `xref_catalog` (head of loop 2, `net=False`) writes a per-group **sidecar**
+  `requests_xref.jsonl` from `_cross_group_surface` (peers' phase-1 discovery whose host ∈ this group,
+  finalized by the extracted `_finalize_catalog` — scheme-normalize + in-scope + dead-drop). Phase-2
+  `dast`/`xss`/`sqli` (`needs=("xref_catalog",)`) read the surface set via `_surface_request_set`
+  (`requests.jsonl` ∪ `requests_xref.jsonl`); the phase-4 delta (`_delta_request_set`) subtracts BOTH
+  keysets so nothing is double-tested. *Why race-free:* the per-app loop barrier (`_run_loops` awaits every
+  phase-1 future across ALL groups before submitting any phase-2 stage) guarantees every group finished
+  phase 1 — the same guarantee `request_catalog_full` already relies on one barrier later, so a phase-2
+  stage can read any peer's phase-1 output safely. *Why a per-app `Stage`, not an activity-level pool at
+  the 1→2 barrier* (the prior spec's "Approach 3"): the barrier already settles all phase-1 output, so a
+  per-app stage symmetric to the phase-4 fold needs **zero `core/` change** — `--resume`, per-step toggles,
+  and the flow map come for free. *Why a sidecar file, not folded into `requests.jsonl`:* write-once (one
+  writer per artifact) — `request_catalog` owns `requests.jsonl`, `xref_catalog` owns `requests_xref.jsonl`.
+  *Why `request_catalog_full` still folds `_cross_group_surface`* (unchanged): `param_fuzz` reads
+  `requests_full.jsonl` directly (not the delta), so keeping the fold there lets it keep probing cross-group
+  endpoints for hidden params — a distinct analysis from DAST, no regression. *RoE-safe by construction:*
+  inherits `_cross_group_surface`'s `host ∈ ws.hosts` filter (an in-scope group's hosts only — no scope
+  expansion). *Applies to `webscan` too* (it reuses external's functions, inheriting the `StepMeta`).
+  *Rejected:* the activity-level discovered-surface pool (heavier than the barrier needs); re-DASTing the
+  cross-group surface in phase 4 as well (double-test — the delta subtraction is the cure). *Roadmap
+  (deferred):* re-crawling routed endpoints from the owning group, scope-expansion for an in-scope host that
+  never clustered, cross-run persistence. See
+  `docs/superpowers/specs/2026-07-05-phase2-cross-group-coverage-design.md`.
 
 - **The catalog REALIGNS `raw` to the unioned params after the merge (`normalize_request`), and seeds a
   non-blank value.** A run-analysis (`ptflow-recon-20260630`) found the phase-2 surface scanners testing
