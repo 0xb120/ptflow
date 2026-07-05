@@ -27,7 +27,7 @@ from ptflow.core.agent import propose_hypotheses
 from ptflow.core.config import CONFIG
 from ptflow.core.log import add_file_handler, get_logger
 from ptflow.core.paths import Activity
-from ptflow.core.stage import Pipeline, Stage, stage_band
+from ptflow.core.stage import Pipeline, Stage, enabled_stages, impacted_dependents, stage_band
 from ptflow.pipelines import load_pipeline
 
 if TYPE_CHECKING:
@@ -238,7 +238,8 @@ def _terminal_fanin(pipeline: Pipeline, activity: Activity, failures: list[str])
 
 
 @flow(task_runner=ThreadPoolTaskRunner(max_workers=CONFIG.fanout.max_workers))  # ty: ignore[no-matching-overload]
-def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *, resume: bool) -> int:
+def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *,  # noqa: C901
+             resume: bool, disabled: tuple[str, ...] = ()) -> int:
     """Drive the full DAG. Returns the number of stage failures (0 = clean).
 
     The whole body runs under a `finally` that calls tools.terminate_all(): on any abort
@@ -250,10 +251,18 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *, resume
     tools.clear_abort()  # fresh run (a prior aborted run in this process must not poison this one)
     pipeline = load_pipeline(pipeline_name)
     activity = Activity.named(activity_name, Path(root) if root else None)
-    activity_stages = [s for s in pipeline.stages
+    disabled_set = set(disabled)
+    if disabled_set:
+        log.info("▶ steps disabled: %s", ", ".join(sorted(disabled_set)))
+        impacted = impacted_dependents(pipeline.stages, disabled_set)
+        if impacted:
+            log.warning("⚠ these steps depend on a disabled step and will run with absent inputs: %s",
+                        ", ".join(impacted))
+    stages = enabled_stages(pipeline.stages, disabled_set)
+    activity_stages = [s for s in stages
                        if not s.per_app and not s.spanning and not s.cluster_scope]
-    spanning_stages = [s for s in pipeline.stages if s.spanning]
-    cluster_scope_stages = [s for s in pipeline.stages if s.cluster_scope]
+    spanning_stages = [s for s in stages if s.spanning]
+    cluster_scope_stages = [s for s in stages if s.cluster_scope]
     failures: list[str] = []
     try:
         # 1. activity-scope (breadth) DAG — barrier before cluster
@@ -283,7 +292,7 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *, resume
         # 3. per-app loops — each phase is a loop: fan-out across groups + intra-app
         #    parallelism (capped by max_workers), with a global barrier between loops.
         if app_ids:
-            _run_loops(list(pipeline.stages), app_ids,
+            _run_loops(stages, app_ids,
                        pipeline_name, activity_name, root, failures, resume=resume)
 
         # 4. join the spanning + post-cluster-spanning stages (ran ∥ everything above), then fan-in
@@ -340,6 +349,7 @@ def orchestrate(  # noqa: PLR0913
     root: str | None = None,
     resume: bool = False,
     observe: str | None = None,
+    disabled_steps: frozenset[str] = frozenset(),
 ) -> tuple[Path, int]:
     """Run the full pipeline for one activity. Returns (activity base dir, stage-failure count);
     the count is 0 on a clean run and >0 when one or more stages failed (the CLI maps it to its
@@ -347,7 +357,10 @@ def orchestrate(  # noqa: PLR0913
     skipped (only failed/incomplete ones rerun) — auto-invalidated if scope.txt changed. With
     `observe` (a Prefect API URL), the run streams to that server's UI (run graph, states, timings,
     logs) instead of spinning a throwaway ephemeral server — pure telemetry, the pipeline is
-    unchanged. temporary_settings applies the redirect at runtime (env set post-import is too late)."""
+    unchanged. temporary_settings applies the redirect at runtime (env set post-import is too late).
+    `disabled_steps` names stages to filter out of this run (a debug knob resolved from
+    `[steps.<pipeline>]` / `--set steps.<pipeline>.<step>=off`); its dependents still run (degrading on
+    absent inputs)."""
     activity = Activity.named(activity_name, Path(root) if root else None).ensure()
     add_file_handler(activity.logs / "run.log")  # persist the full run log (every command + output)
     scope_text = Path(scope_file).read_text(encoding="utf-8", errors="replace")
@@ -368,13 +381,14 @@ def orchestrate(  # noqa: PLR0913
     # the spanning stages run ∥ the loops instead of starving them (_FANOUT_SLOTS holds the fan-out cap)
     pool = ThreadPoolTaskRunner(max_workers=_pool_size(pipeline.stages, CONFIG.fanout.max_workers))
     run = _run_dag.with_options(flow_run_name=f"{pipeline.name}:{activity_name}", task_runner=pool)
+    disabled = tuple(sorted(disabled_steps))
     def _go() -> int:
         if observe:
             # redirect this run to the persistent server + let it capture the `ptflow` logger, scoped to
             # the run (no global profile/env mutation). temporary_settings overrides at runtime.
             with temporary_settings({PREFECT_API_URL: observe, PREFECT_LOGGING_EXTRA_LOGGERS: ["ptflow"]}):
-                return run(pipeline.name, activity_name, root, resume=resume)
-        return run(pipeline.name, activity_name, root, resume=resume)
+                return run(pipeline.name, activity_name, root, resume=resume, disabled=disabled)
+        return run(pipeline.name, activity_name, root, resume=resume, disabled=disabled)
 
     try:
         failures = _go()
