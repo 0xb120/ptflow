@@ -27,7 +27,7 @@ from ptflow.core.agent import propose_hypotheses
 from ptflow.core.config import CONFIG
 from ptflow.core.log import add_file_handler, get_logger
 from ptflow.core.paths import Activity
-from ptflow.core.stage import Pipeline, Stage
+from ptflow.core.stage import Pipeline, Stage, stage_band
 from ptflow.pipelines import load_pipeline
 
 if TYPE_CHECKING:
@@ -100,14 +100,7 @@ def _pool_size(stages: Sequence[Stage], fanout: int) -> int:
 def _stage_tags(stage: Stage) -> list[str]:
     """Band tag for the Prefect UI (so task runs group/filter by phase in the dashboard), plus the
     `net` tag for network stages (offline ones omit it). Pure — derived from the Stage's flags."""
-    if stage.spanning:
-        band = "spanning"
-    elif stage.cluster_scope:
-        band = "post-cluster"
-    elif stage.per_app:
-        band = f"loop:{stage.phase}"
-    else:
-        band = "breadth"
+    band = stage_band(stage)
     return ["net", band] if stage.net else [band]
 
 

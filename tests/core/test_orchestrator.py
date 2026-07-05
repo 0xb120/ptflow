@@ -142,3 +142,12 @@ def test_terminal_fanin_isolates_agent_and_calls_report(tmp_path):
     orchestrator._terminal_fanin(P(), act, failures)
     assert "agent" in failures          # agent failure isolated, not raised
     assert called["report"] is True     # report hook still ran
+
+
+def test_enabled_stages_topo_tolerates_removed_dep():
+    from ptflow.core.stage import Stage, enabled_stages
+    a = Stage("a", lambda *_: None)
+    b = Stage("b", lambda *_: None, needs=("a",))
+    kept = enabled_stages([a, b], {"a"})
+    order = [s.name for s in orchestrator.topo_order(kept)]
+    assert order == ["b"]  # 'b' survives; its now-missing dep 'a' is ignored, no KeyError
