@@ -57,9 +57,10 @@ class WebscanPipeline:
         Stage("request_catalog", external.request_catalog,
               needs=("crawl_headless", "mine_responses", "api_spec"), per_app=True, phase=1, net=False),
         # ── LOOP 2 — DAST the explorable surface ─────────────────────────────────────────────────────
-        Stage("dast", external.dast, per_app=True, phase=2),
-        Stage("xss", external.xss, per_app=True, phase=2),
-        Stage("sqli", external.sqli, per_app=True, phase=2),
+        Stage("xref_catalog", external.xref_catalog, per_app=True, phase=2, net=False),
+        Stage("dast", external.dast, needs=("xref_catalog",), per_app=True, phase=2),
+        Stage("xss", external.xss, needs=("xref_catalog",), per_app=True, phase=2),
+        Stage("sqli", external.sqli, needs=("xref_catalog",), per_app=True, phase=2),
         Stage("cve_lookup", external.cve_lookup, per_app=True, phase=2, net=False),
         # ── LOOP 3 — guessing / surface expansion ────────────────────────────────────────────────────
         Stage("wordlist", external.build_wordlist, per_app=True, phase=3, net=False),
