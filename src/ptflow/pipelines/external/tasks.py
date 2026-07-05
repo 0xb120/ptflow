@@ -4048,7 +4048,11 @@ def _delta_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
     phase-2 surface — the surface catalog (requests.jsonl) OR the cross-group sidecar (requests_xref.jsonl,
     which phase-2 dast/xss/sqli already tested) — keyed by request_key, PLUS the synthesized requests for
     the discovered hidden params (params.jsonl), deduped and capped. Shared by `dast_full` and the deep
-    vuln scanners (xss_full/sqli_full) so the "delta, not the whole catalog" rule lives in ONE place."""
+    vuln scanners (xss_full/sqli_full) so the "delta, not the whole catalog" rule lives in ONE place.
+    Excluding the sidecar keys is only as robust as the existing surface subtraction: the request_key
+    match relies on requests_xref.jsonl and requests_full.jsonl resolving the same scheme for a given
+    host, which holds because the xref sidecar uses the same phase-2 scheme resolution
+    (_working_schemes, hosts.txt fallback) that requests.jsonl does."""
     surface_keys = {request_key(r) for r in tools.read_jsonl(ws.canonical("requests.jsonl"))}
     surface_keys |= {request_key(r) for r in tools.read_jsonl(ws.canonical("requests_xref.jsonl"))}
     delta = [r for r in tools.read_jsonl(ws.canonical("requests_full.jsonl"))

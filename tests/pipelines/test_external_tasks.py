@@ -2110,5 +2110,6 @@ def test_webscan_phase2_wires_xref_catalog():
     assert "xref_catalog" in stages
     assert stages["xref_catalog"].phase == 2
     assert stages["xref_catalog"].per_app
+    assert not stages["xref_catalog"].net
     for name in ("dast", "xss", "sqli"):
         assert "xref_catalog" in stages[name].needs, f"webscan {name} must depend on xref_catalog"
