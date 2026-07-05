@@ -26,7 +26,28 @@ fi
 regen=${PTFLOW_DOC_SYNC_REGEN:-uv run python -m ptflow.core.flowdocs}
 sh -c "$regen" || log "regen failed (continuing)"
 
-# >>> AGENT_PHASE <<<
+# --- phase 3+4: agent prose update (best-effort) ----------------------------
+claude_bin=${CLAUDE_BIN:-claude}
+timeout_s=${PTFLOW_DOC_SYNC_TIMEOUT:-300}
+if command -v "$claude_bin" >/dev/null 2>&1 || [ -x "$claude_bin" ]; then
+  diffstat=$(git diff --stat ORIG_HEAD HEAD)
+  # cap the full diff so a huge merge can't blow up the prompt (~200 KB)
+  fulldiff=$(git diff ORIG_HEAD HEAD | head -c 200000)
+  prompt="You are updating this repository's PROSE documentation after a git merge landed on main.
+
+Update ONLY the prose that the merge below makes stale. You MAY edit these files: CLAUDE.md, README.md, ptflow.toml.example. Do NOT edit anything else — not code, not tests, and never anything under docs/superpowers/. Make surgical edits that preserve the existing structure, voice, and content; do not rewrite or delete sections wholesale. CLAUDE.md is the single source of truth — keep it coherent. If nothing is stale, make no changes.
+
+Merge diff stat:
+${diffstat}
+
+Merge diff (may be truncated):
+${fulldiff}"
+  printf '%s' "$prompt" | timeout "$timeout_s" "$claude_bin" -p \
+      --permission-mode acceptEdits --allowedTools "Read Edit Grep Glob" >/dev/null 2>&1 \
+      || log "agent prose update skipped/failed (keeping deterministic regen)"
+else
+  log "agent skipped (claude not available)"
+fi
 
 # --- phase 5: single scoped commit ------------------------------------------
 for p in CLAUDE.md README.md ptflow.toml.example docs/*-pipeline-*.html docs/*-pipeline-*.md; do

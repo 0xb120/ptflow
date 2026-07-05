@@ -98,3 +98,30 @@ def test_no_src_change_no_action(tmp_path):
     repo = _init_repo(tmp_path)
     _merge(repo, _env(repo), touch_src=False)
     assert not any(s.startswith("docs: auto-sync") for s in _subjects(repo))
+
+
+def test_agent_edits_are_committed(tmp_path):
+    repo = _init_repo(tmp_path)
+    # stub claude: append a marker to CLAUDE.md (proves the agent phase ran and its edits are picked up)
+    claude = repo / ".githooks" / "stub-claude-edit.sh"
+    _stub(claude, 'printf "\\nAGENT-MARKER\\n" >> CLAUDE.md\n')
+    _merge(repo, _env(repo, CLAUDE_BIN=str(claude)))
+    assert _subjects(repo)[0].startswith("docs: auto-sync after merge")
+    assert "AGENT-MARKER" in (repo / "CLAUDE.md").read_text()
+
+
+def test_claude_absent_still_commits_regen(tmp_path):
+    repo = _init_repo(tmp_path)
+    _merge(repo, _env(repo, CLAUDE_BIN="/nonexistent/claude"))
+    # agent skipped gracefully, but the deterministic regen is still committed
+    assert _subjects(repo)[0].startswith("docs: auto-sync after merge")
+    assert (repo / "docs" / "example-pipeline-map.md").read_text() == "map v1\n"
+
+
+def test_claude_timeout_still_commits_regen(tmp_path):
+    repo = _init_repo(tmp_path)
+    slow = repo / ".githooks" / "stub-claude-slow.sh"
+    _stub(slow, "sleep 5\n")  # exceeds the 1s timeout below
+    _merge(repo, _env(repo, CLAUDE_BIN=str(slow), PTFLOW_DOC_SYNC_TIMEOUT="1"))
+    assert _subjects(repo)[0].startswith("docs: auto-sync after merge")
+    assert (repo / "docs" / "example-pipeline-map.md").read_text() == "map v1\n"
