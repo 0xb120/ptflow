@@ -37,11 +37,15 @@ BAR2[["━━ BARRIERA: FASE 1 → FASE 2 ━━"]]
 P1 ==> BAR2
 subgraph P2["FASE 2 · DAST surface"]
 direction TB
+xref_catalog["xref_catalog  ·  net=False<br># _cross_group_surface(activity, ws): dagli ALTRI gruppi le richieste/endpoint con host ∈ ws.hosts<br>#   (taggate xref:&lt;origine&gt;) → _finalize_catalog (scheme raggiungibile · in-scope · dead-drop 404)"]
 dast["dast<br># input: requests.jsonl (parametri osservati), dedup per shape, cap DAST_MAX_REQUESTS=1500<br>#   → raw/dast/input.jsonl ({request:{endpoint,raw}})<br>nuclei -dast -im jsonl -l input.jsonl -t &lt;dast templates&gt; -fa low -rl &lt;profilo&gt; -c &lt;profilo&gt;<br>       -timeout 10 -retries 2 -j -silent -duc [-H auth]<br># dedup_dast_findings: 1 record per (template, host, path, fuzz position) — collassa i re-fire<br>#   dello stesso punto di iniezione (varianti sintetizzate, http+https) su UN solo finding"]
 xss["xss<br># candidati = request parametrizzati del catalogo superficie (cap VULN_MAX_REQUESTS=40)<br>dalfox file &lt;raw&gt; --rawdata --format jsonl --skip-bav -w 30 --timeout 10 [--http] [-H auth]<br># 1 processo per request (raw Burp/ZAP) → testa query/body/json/header, non solo GET<br># PTFLOW_OAST=on: interactsh-client per il pass + -b https://b&lt;i&gt;.&lt;domain&gt; (callback per-request)<br>#   → correlate_oast: full-id &lt;marker&gt;.&lt;uid&gt; → request → finding poc_kind:blind (solo sincroni)"]
 sqli["sqli<br># candidati = request parametrizzati del catalogo superficie (cap VULN_MAX_REQUESTS=40)<br>sqlmap -r &lt;raw&gt; --batch --smart --level 1 --risk 1 --threads 4 --disable-coloring [-H auth]<br># 1 processo per request · --smart = test pesanti solo su euristica positiva (politeness)"]
 cve_lookup["cve_lookup  ·  net=False<br># software = collect_software(tech, Server header, banner nerva, lib del corpus) — solo con versione<br>search_vulns -q '&lt;Prodotto Versione&gt;' -f json --ignore-general-product-vulns --use-created-product-ids<br># --use-created-product-ids: product ID alla versione ESATTA (no ladder) · cache memo process-wide · offline DB locale"]
 end
+xref_catalog --> dast
+xref_catalog --> xss
+xref_catalog --> sqli
 BAR2 ==> P2
 BAR3[["━━ BARRIERA: FASE 2 → FASE 3 ━━"]]
 P2 ==> BAR3
@@ -93,7 +97,7 @@ classDef phase4 fill:#3a1a08,stroke:#f08a4c,color:#fbe2d2;
 class provision_wl,ingest breadth
 class screenshot span
 class crawl,crawl_headless,api_spec,mine_responses,request_catalog phase1
-class dast,xss,sqli,cve_lookup phase2
+class xref_catalog,dast,xss,sqli,cve_lookup phase2
 class wordlist,tech_enum,content_discovery,recrawl,cloud_assets phase3
 class request_catalog_full,param_fuzz,dast_full,xss_full,sqli_full,cve_lookup_full,tech_vulnscan phase4
 class CLUSTER pivot

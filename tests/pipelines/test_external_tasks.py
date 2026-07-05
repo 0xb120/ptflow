@@ -214,7 +214,7 @@ def test_pipeline_object_shape():
     assert app == [
         "passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
         "fetch_delta", "api_spec", "mine_responses", "request_catalog",
-        "dast", "xss", "sqli", "cve_lookup",
+        "xref_catalog", "dast", "xss", "sqli", "cve_lookup",
         "wordlist", "tech_enum", "content_discovery", "recrawl", "cloud_assets",
         "request_catalog_full", "param_fuzz", "dast_full", "xss_full", "sqli_full",
         "cve_lookup_full", "tech_vulnscan",
@@ -257,10 +257,17 @@ def test_pipeline_phase_wiring():
     assert by_name["request_catalog"].net is False    # offline merge → requests.jsonl (surface only)
     assert set(by_name["request_catalog"].needs) == {"crawl_headless", "mine_responses", "api_spec"}
     # PHASE 2 = DAST the explorable surface (low-hanging fruit): reads requests.jsonl across the barrier.
-    # cve_lookup runs ∥ dast (same phase, no needs) — OFFLINE CVE correlation (net=False).
+    # xref_catalog runs first (cross-group surface sidecar); dast/xss/sqli need it. cve_lookup runs ∥
+    # dast (same phase, no needs) — OFFLINE CVE correlation (net=False).
+    assert by_name["xref_catalog"].phase == 2
+    assert by_name["xref_catalog"].per_app is True
+    assert by_name["xref_catalog"].net is False
+    assert by_name["xref_catalog"].needs == ()
     assert by_name["dast"].phase == 2
     assert by_name["dast"].per_app is True
-    assert by_name["dast"].needs == ()
+    assert by_name["dast"].needs == ("xref_catalog",)
+    assert by_name["xss"].needs == ("xref_catalog",)
+    assert by_name["sqli"].needs == ("xref_catalog",)
     assert by_name["cve_lookup"].phase == 2
     assert by_name["cve_lookup"].per_app is True
     assert by_name["cve_lookup"].net is False
@@ -1269,6 +1276,29 @@ def test_assemble_catalog_drops_dead_get_keeps_post(tmp_path):
     assert n_dead == 1
 
 
+def test_finalize_catalog_reschemes_filters_scope_and_drops_dead(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("finalize", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
+    ws.responses.mkdir(parents=True, exist_ok=True)
+    tools.write_lines(ws.hosts, ["https://a.com"])
+    (ws.responses / "index.txt").write_text("/s/1 https://a.com/dead (404 Not Found)\n")
+    recs = [
+        {"method": "GET", "url": "https://a.com/dead",
+         "raw": "GET /dead HTTP/1.1\r\nHost: a.com\r\n\r\n", "sources": ["katana"]},
+        {"method": "GET", "url": "https://a.com/live",
+         "raw": "GET /live HTTP/1.1\r\nHost: a.com\r\n\r\n", "sources": ["katana"]},
+    ]
+    kept, n_dead = tasks._finalize_catalog(ws, recs, ["https://out-of-scope.example/x"])
+    shapes = {(r["method"], tasks._url_pathkey(r["url"])) for r in kept}
+    assert ("GET", "a.com/dead") not in shapes          # dead GET dropped
+    assert ("GET", "a.com/live") in shapes              # alive GET kept
+    assert not any("out-of-scope.example" in r["url"] for r in kept)  # in-scope filter
+    assert n_dead == 1
+
+
 def test_select_body_targets_splits_json_and_urlencoded_and_dedups():
     catalog = [
         {"method": "POST", "url": "https://a/login",
@@ -1961,3 +1991,125 @@ def test_request_catalog_full_single_group_unchanged(tmp_path):
     tasks.request_catalog_full(act, "only")
     full = [r["url"] for r in tools.read_jsonl(b.canonical("requests_full.jsonl"))]
     assert any("api.company.com/own" in u for u in full)   # its own endpoint still present
+
+
+def test_xref_catalog_routes_other_groups_surface(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("xref-cat", root=tmp_path).ensure()
+    a = act.app("attack.com-aaaa").ensure()
+    b = act.app("api.company.com-bbbb").ensure()
+    tools.write_lines(a.hosts, ["https://attack.com"])
+    tools.write_lines(b.hosts, ["https://api.company.com"])
+    tools.write_lines(a.canonical("endpoints_js.txt"), ["https://api.company.com/v1/users"])
+    tools.write_jsonl(a.canonical("requests_crawl.jsonl"),
+                      [{"method": "POST", "url": "https://api.company.com/v1/login",
+                        "headers": {}, "body": "u=1", "params": [], "raw": "r", "sources": ["katana"]}])
+    tasks.xref_catalog(act, "api.company.com-bbbb")
+    routed = tools.read_jsonl(b.canonical("requests_xref.jsonl"))
+    urls = {r["url"] for r in routed}
+    assert any("api.company.com/v1/users" in u for u in urls)   # endpoint routed into B
+    assert any("api.company.com/v1/login" in u for u in urls)   # request routed into B
+    login = next(r for r in routed if r["url"].endswith("/login"))
+    assert login["method"] == "POST"                            # shape preserved
+    assert any(s.startswith("xref:attack.com") for s in login["sources"])  # provenance
+
+
+def test_xref_catalog_single_group_is_empty(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("xref-cat-solo", root=tmp_path).ensure()
+    b = act.app("only").ensure()
+    tools.write_lines(b.hosts, ["https://api.company.com"])
+    tools.write_lines(b.canonical("endpoints_js.txt"), ["https://api.company.com/own"])
+    tasks.xref_catalog(act, "only")
+    assert tools.read_jsonl(b.canonical("requests_xref.jsonl")) == []  # no other groups → empty
+
+
+def test_surface_request_set_merges_xref_sidecar(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("surface-xref", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
+    tools.write_lines(ws.hosts, ["https://a.com"])
+    tools.write_jsonl(ws.canonical("requests.jsonl"),
+                      [{"method": "GET", "url": "https://a.com/own",
+                        "raw": "GET /own HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": [], "sources": ["katana"]}])
+    tools.write_jsonl(ws.canonical("requests_xref.jsonl"),
+                      [{"method": "GET", "url": "https://a.com/routed",
+                        "raw": "GET /routed HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": [],
+                        "sources": ["xref:other"]}])
+    got = {tasks._url_pathkey(r["url"]) for r in tasks._surface_request_set(ws, cap=100)}
+    assert "a.com/own" in got       # own surface still present
+    assert "a.com/routed" in got    # cross-group surface folded in
+
+
+def test_surface_request_set_collapses_shared_shape(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("surface-xref-dedup", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
+    tools.write_lines(ws.hosts, ["https://a.com"])
+    shared = {"method": "GET", "url": "https://a.com/shared",
+              "raw": "GET /shared HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": []}
+    tools.write_jsonl(ws.canonical("requests.jsonl"), [{**shared, "sources": ["katana"]}])
+    tools.write_jsonl(ws.canonical("requests_xref.jsonl"), [{**shared, "sources": ["xref:other"]}])
+    result = tasks._surface_request_set(ws, cap=100)
+    shared_recs = [r for r in result if tasks._url_pathkey(r["url"]) == "a.com/shared"]
+    assert len(shared_recs) == 1                                # same (method, path) collapses to ONE
+    assert tasks.request_key(shared_recs[0]) == ("GET", tasks.path_template("https://a.com/shared"))
+    sources = shared_recs[0]["sources"]
+    assert "katana" in sources                                 # own-surface provenance kept
+    assert any(s.startswith("xref:") for s in sources)         # cross-group provenance unioned in
+
+
+def test_delta_request_set_excludes_xref_covered_shapes(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("delta-xref", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
+    tools.write_lines(ws.hosts, ["https://a.com"])
+    tools.write_jsonl(ws.canonical("requests.jsonl"), [])
+    tools.write_jsonl(ws.canonical("params.jsonl"), [])
+    # a cross-group shape phase 2 already covered, plus a genuinely new full-catalog shape
+    tools.write_jsonl(ws.canonical("requests_xref.jsonl"),
+                      [{"method": "GET", "url": "https://a.com/routed",
+                        "raw": "GET /routed HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": [], "sources": ["xref:o"]}])
+    tools.write_jsonl(ws.canonical("requests_full.jsonl"), [
+        {"method": "GET", "url": "https://a.com/routed",
+         "raw": "GET /routed HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": [], "sources": ["xref:o"]},
+        {"method": "GET", "url": "https://a.com/guessed",
+         "raw": "GET /guessed HTTP/1.1\r\nHost: a.com\r\n\r\n", "params": [], "sources": ["feroxbuster"]},
+    ])
+    got = {tasks._url_pathkey(r["url"]) for r in tasks._delta_request_set(ws, cap=100)}
+    assert "a.com/routed" not in got      # already covered in phase 2 via the sidecar → not re-tested
+    assert "a.com/guessed" in got         # genuinely new guessed surface → in the delta
+
+
+def test_external_phase2_wires_xref_catalog():
+    from ptflow.pipelines.external.pipeline import PIPELINE
+
+    stages = {s.name: s for s in PIPELINE.stages}
+    assert "xref_catalog" in stages
+    assert stages["xref_catalog"].phase == 2
+    assert stages["xref_catalog"].per_app
+    assert not stages["xref_catalog"].net
+    for name in ("dast", "xss", "sqli"):
+        assert "xref_catalog" in stages[name].needs, f"{name} must depend on xref_catalog"
+
+
+def test_webscan_phase2_wires_xref_catalog():
+    from ptflow.pipelines.webscan.pipeline import PIPELINE
+
+    stages = {s.name: s for s in PIPELINE.stages}
+    assert "xref_catalog" in stages
+    assert stages["xref_catalog"].phase == 2
+    assert stages["xref_catalog"].per_app
+    assert not stages["xref_catalog"].net
+    for name in ("dast", "xss", "sqli"):
+        assert "xref_catalog" in stages[name].needs, f"webscan {name} must depend on xref_catalog"

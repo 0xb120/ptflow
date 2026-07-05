@@ -3763,6 +3763,22 @@ def _cross_group_surface(activity: Activity, ws: AppWorkspace) -> list[dict]:
     return out
 
 
+def _finalize_catalog(ws: AppWorkspace, request_recs: list[dict], get_urls: list[str]) -> tuple[list[dict], int]:
+    """Turn assembled request records + URL-only GETs into the final per-app catalog: scheme-normalize
+    to the empirically-reachable scheme (_working_schemes), in-scope-filter to ws.hosts, dedup by shape
+    (catalog_records), then DROP GET shapes whose path the corpus only ever saw as 404/410 (dead_url_keys
+    — a discovered POST/form/XHR/JSON shape, status never recorded, is always kept). Returns (kept catalog,
+    count dropped as dead). Pure-ish (reads disk only)."""
+    in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
+    schemes = _working_schemes(ws)
+    catalog = catalog_records(request_recs, get_urls, in_scope, schemes)
+    dead = dead_url_keys(ln for idx in _all_store_indices(ws) for ln in tools.read_lines(idx))
+    kept = [r for r in catalog
+            if not (r.get("method", "GET").upper() == "GET" and not r.get("body")
+                    and _url_pathkey(r.get("url") or "") in dead)]
+    return kept, len(catalog) - len(kept)
+
+
 def _assemble_catalog(activity: Activity, ws: AppWorkspace, *, include_guessed: bool) -> tuple[list[dict], int, int]:
     """Assemble a per-app request catalog → (catalog records, count mined from corpus, count dropped as
     dead/404). Pure-ish (reads disk only). Three contributions, all deduped by request shape
@@ -3785,8 +3801,6 @@ def _assemble_catalog(activity: Activity, ws: AppWorkspace, *, include_guessed: 
     Finally, GET shapes whose endpoint the corpus only ever saw as 404/410 are dropped (`dead_url_keys`)
     — malformed passive/archive URLs and phantom JS routes that would just burn DAST/param-fuzz payloads.
     GET-only + body-less: a discovered POST/form/XHR/JSON shape (status never recorded) is always kept."""
-    in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
-    schemes = _working_schemes(ws)
     # mine request SHAPES from the already-downloaded corpus (idempotent extract → ensure it's present)
     bodies, _ = _extract_bodies(ws)
     source_urls = {Path(s).stem: u for idx in _all_store_indices(ws) for s, u in _store_index(idx)}
@@ -3805,12 +3819,8 @@ def _assemble_catalog(activity: Activity, ws: AppWorkspace, *, include_guessed: 
         request_recs += _cross_group_surface(activity, ws)  # endpoints discovered in OTHER in-scope groups
         get_urls += [r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
                      if r.get("url") and 200 <= (r.get("status") or 0) < 300]  # noqa: PLR2004
-    catalog = catalog_records(request_recs, get_urls, in_scope, schemes)
-    dead = dead_url_keys(ln for idx in _all_store_indices(ws) for ln in tools.read_lines(idx))
-    kept = [r for r in catalog
-            if not (r.get("method", "GET").upper() == "GET" and not r.get("body")
-                    and _url_pathkey(r.get("url") or "") in dead)]
-    return kept, len(mined), len(catalog) - len(kept)
+    kept, n_dead = _finalize_catalog(ws, request_recs, get_urls)
+    return kept, len(mined), n_dead
 
 
 def request_catalog(activity: Activity, app_id: str) -> None:
@@ -3842,6 +3852,21 @@ def request_catalog_full(activity: Activity, app_id: str) -> None:
     methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
     log.info("  → request_catalog_full (%s) — %d request shape(s) [%s] (mined %d from corpus,"
              " dropped %d dead/404) → requests_full.jsonl", app_id, n, methods, n_mined, n_dead)
+
+
+def xref_catalog(activity: Activity, app_id: str) -> None:
+    """PHASE 2 (head) — assemble the CROSS-GROUP surface catalog (requests_xref.jsonl): requests/endpoints
+    discovered in OTHER in-scope groups whose host belongs to THIS group, so the phase-2 dast/xss/sqli
+    pass tests the cross-group surface on the FAST pass, not only in phase 4 (request_catalog_full).
+
+    Safe by the loop barrier: the global 1→2 barrier guarantees every group finished phase 1, so reading
+    peers' discovery artifacts is race-free (same guarantee request_catalog_full relies on at phase 4).
+    Offline (net=False). A lone group has no peers → an empty sidecar (tolerant reads make it a no-op)."""
+    ws = activity.app(app_id)
+    catalog, n_dead = _finalize_catalog(ws, _cross_group_surface(activity, ws), [])
+    n = tools.write_jsonl(ws.canonical("requests_xref.jsonl"), catalog)
+    log.info("  → xref_catalog (%s) — %d cross-group request shape(s) (dropped %d dead/404)"
+             " → requests_xref.jsonl", app_id, n, n_dead)
 
 
 def param_fuzz(activity: Activity, app_id: str) -> None:
@@ -4010,17 +4035,26 @@ def _run_dast(ws: AppWorkspace, requests_: list[dict], *, input_name: str, out_n
 
 
 def _surface_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
-    """The EXPLORABLE-surface request set (phase 2): the surface catalog (requests.jsonl), deduped by
-    shape and capped. Shared by `dast` and the surface vuln scanners (xss/sqli)."""
-    return dast_requests(tools.read_jsonl(ws.canonical("requests.jsonl")), [], cap=cap)
+    """The EXPLORABLE-surface request set (phase 2): the surface catalog (requests.jsonl) UNIONED with the
+    cross-group sidecar (requests_xref.jsonl — peers' surface owned by this group, from xref_catalog),
+    deduped by shape and capped. Shared by `dast` and the surface vuln scanners (xss/sqli)."""
+    catalog = [*tools.read_jsonl(ws.canonical("requests.jsonl")),
+               *tools.read_jsonl(ws.canonical("requests_xref.jsonl"))]
+    return dast_requests(catalog, [], cap=cap)
 
 
 def _delta_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
-    """The GUESSED-surface DELTA request set (phase 4): full-catalog shapes NOT already in the surface
-    catalog (by request_key) + the synthesized requests for the discovered hidden params (params.jsonl),
-    deduped and capped. Shared by `dast_full` and the deep vuln scanners (xss_full/sqli_full) so the
-    "delta, not the whole catalog" rule lives in ONE place."""
+    """The GUESSED-surface DELTA request set (phase 4): full-catalog shapes NOT already covered by the
+    phase-2 surface — the surface catalog (requests.jsonl) OR the cross-group sidecar (requests_xref.jsonl,
+    which phase-2 dast/xss/sqli already tested) — keyed by request_key, PLUS the synthesized requests for
+    the discovered hidden params (params.jsonl), deduped and capped. Shared by `dast_full` and the deep
+    vuln scanners (xss_full/sqli_full) so the "delta, not the whole catalog" rule lives in ONE place.
+    Excluding the sidecar keys is only as robust as the existing surface subtraction: the request_key
+    match relies on requests_xref.jsonl and requests_full.jsonl resolving the same scheme for a given
+    host, which holds because the xref sidecar uses the same phase-2 scheme resolution
+    (_working_schemes, hosts.txt fallback) that requests.jsonl does."""
     surface_keys = {request_key(r) for r in tools.read_jsonl(ws.canonical("requests.jsonl"))}
+    surface_keys |= {request_key(r) for r in tools.read_jsonl(ws.canonical("requests_xref.jsonl"))}
     delta = [r for r in tools.read_jsonl(ws.canonical("requests_full.jsonl"))
              if request_key(r) not in surface_keys]
     return dast_requests(delta, tools.read_jsonl(ws.canonical("params.jsonl")), cap=cap)
