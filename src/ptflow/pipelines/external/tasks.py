@@ -1818,7 +1818,7 @@ def scope_gate(activity: Activity) -> None:
     ips = tools.read_lines(canon("unique_ips.txt"))
     dim_lines = tools.read_lines(canon("domain_ip_map.txt"))
     name_ips = parse_domain_ip_map(dim_lines)
-    verdict = scope.filter_assets([*subdomains, *tls_names], name_ips, ips, allow)
+    verdict = scope.filter_assets(tools.dedupe([*subdomains, *tls_names]), name_ips, ips, allow)
 
     tools.write_lines(canon("inscope_subdomains.txt"),
                       [s for s in subdomains if scope.norm_host(s) in verdict.kept_names])
@@ -1838,7 +1838,7 @@ def scope_gate(activity: Activity) -> None:
 
 def portscan(activity: Activity) -> None:
     """Phase 3 — FAST web-port scan: WEB_PORTS → honeypot filter → naabu_web.txt (the web target set
-    httpx probes). Reads unique_ips.txt; writes honeypots.txt + naabu_web.txt (canonical).
+    httpx probes). Reads inscope_ips.txt; writes honeypots.txt + naabu_web.txt (canonical).
 
     Scans the curated ~250 HTTP(S)-bearing ports (WEB_PORTS), NOT nmap's generic top-1k — so httpx
     sees web apps on uncommon ports (5601/8161/9200/7001/…) that top-1k would miss, while staying
@@ -1862,7 +1862,7 @@ def portscan_full(activity: Activity) -> None:
     """SPANNING — full 65535-port scan on the valid (non-honeypot) IPs → naabu_full.txt, which feeds
     nerva (non-HTTP service fingerprint). Launched after `portscan`, runs ∥ clustering + the per-app
     loops, joined at the fan-in — off the critical path, since breadth→cluster→loops only needs the
-    fast top-1k web set (naabu_web.txt). Recomputes the valid set from disk (unique_ips minus
+    fast top-1k web set (naabu_web.txt). Recomputes the valid set from disk (inscope_ips.txt minus
     honeypots) — only strings cross the stage boundary."""
     canon = activity.asset_discovery_canonical
     honeypots = set(tools.read_lines(canon("honeypots.txt")))
@@ -4662,7 +4662,7 @@ def _corpus_urls(ws: AppWorkspace) -> list[str]:
 
 def _app_service_banners(activity: Activity, meta: dict) -> list[tuple[str, str]]:
     """Non-HTTP service banners (nerva) on THIS app's hosts → [(host:port, banner)]. Maps a nerva record
-    to the app by hostname, or by IP via domain_ip_map.txt. Best-effort: [] if nerva output is absent."""
+    to the app by hostname, or by IP via inscope_domain_ip_map.txt. Best-effort: [] if nerva output is absent."""
     canon = activity.asset_discovery_canonical
     nerva = canon("nerva_full_metadata.jsonl")
     recs = tools.read_jsonl(nerva) if nerva.exists() else []

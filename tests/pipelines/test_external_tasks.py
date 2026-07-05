@@ -1747,8 +1747,8 @@ def test_scope_gate_keeps_inscope_drops_thirdparty(tmp_path):
 
 
 def test_app_service_banners_attributes_ip_only_record(tmp_path):
-    # regression: an IP-only nerva record must attach to the app via domain_ip_map.txt — the old
-    # parser took the '[A]' record-type column instead of the bracketed IP, so it never matched.
+    # regression: an IP-only nerva record must attach to the app via inscope_domain_ip_map.txt — the
+    # old parser took the '[A]' record-type column instead of the bracketed IP, so it never matched.
     from ptflow.core import tools
     from ptflow.core.paths import Activity
 
