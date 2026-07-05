@@ -208,7 +208,7 @@ def test_pipeline_object_shape():
     app = [s.name for s in PIPELINE.stages if s.per_app]
     # full-port scan + nerva are now SPANNING (off the breadth critical path); httpx needs only
     # the fast top-1k web set, so the breadth chain stops at httpx.
-    assert activity == ["provision_wl", "expand", "resolve", "portscan", "httpx"]
+    assert activity == ["provision_wl", "expand", "resolve", "scope_gate", "portscan", "httpx"]
     assert spanning == ["portscan_full", "nerva", "nuclei_scope"]
     assert cluster_scope == ["screenshot"]  # batched screenshot, post-cluster ∥ the loops
     assert app == [
@@ -2151,3 +2151,14 @@ def test_webscan_phase2_wires_xref_catalog():
     assert not stages["xref_catalog"].net
     for name in ("dast", "xss", "sqli"):
         assert "xref_catalog" in stages[name].needs, f"webscan {name} must depend on xref_catalog"
+
+
+def test_scope_gate_is_wired_between_resolve_and_portscan():
+    from ptflow.pipelines.external.pipeline import PIPELINE
+
+    stages = {s.name: s for s in PIPELINE.stages}
+    assert "scope_gate" in stages
+    assert stages["scope_gate"].needs == ("resolve",)
+    assert not stages["scope_gate"].net
+    assert not stages["scope_gate"].per_app
+    assert stages["portscan"].needs == ("scope_gate",)   # portscan now gated

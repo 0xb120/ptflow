@@ -47,6 +47,21 @@ FLOWMETA: dict[str, StepMeta] = {
         ),
         outputs=("subdomains.txt", "unique_ips.txt", "domain_ip_map.txt"),
     ),
+    "scope_gate": StepMeta(
+        summary="Gate di AUTORIZZAZIONE (RoE) tra discovery e scan attivo. Costruisce l'allowlist dallo "
+                "scope (host esatto / *.apex a suffisso / IP-CIDR) e tiene solo gli asset autorizzati: un "
+                "nome sopravvive se matcha un dominio/wildcard OPPURE risolve a un IP in-scope (regola 4 — "
+                "recupera i vhost negli scope solo-IP); un IP se è esplicito o risolto da un nome tenuto. "
+                "Il pull-in di terzi (SAN/PTR di apex non elencati, IP cloud) va in excluded_out_of_scope.jsonl.",
+        commands=(
+            "# build_allowlist(scope_init) + filter_assets(subdomains + tls_names, domain_ip_map, unique_ips)",
+            "# offline (net=False) · complementa naabu -exclude-cdn / split_cdn_ip_records (niente check CDN qui)",
+        ),
+        outputs=("inscope_subdomains.txt", "inscope_tls_names.txt", "inscope_ips.txt",
+                 "inscope_domain_ip_map.txt", "excluded_out_of_scope.jsonl"),
+        notes=("gli stage attivi (portscan/httpx/nuclei_scope/cve_lookup) leggono i file inscope_* · "
+               "allowlist vuota ⇒ scarta tutto + WARNING",),
+    ),
     "portscan": StepMeta(
         summary="Scan VELOCE su ~250 porte WEB curate (WEB_PORTS) → filtro honeypot → naabu_web.txt "
                 "(il set che legge httpx). Il full-port è spanning (portscan_full), fuori dal percorso critico.",

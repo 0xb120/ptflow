@@ -32,7 +32,8 @@ class ExternalPipeline:
         Stage("provision_wl", tasks.provision_wl, net=False),  # wordlist roles → wl_global/ (offline, ∥)
         Stage("expand", tasks.expand),
         Stage("resolve", tasks.resolve, needs=("expand",)),
-        Stage("portscan", tasks.portscan, needs=("resolve",)),
+        Stage("scope_gate", tasks.scope_gate, needs=("resolve",), net=False),  # RoE authorization gate
+        Stage("portscan", tasks.portscan, needs=("scope_gate",)),
         Stage("httpx", tasks.httpx_fingerprint, needs=("portscan",)),
         # full 65535-port scan + non-HTTP fingerprint — SPANNING: ∥ clustering + all per-app loops,
         # joined at the fan-in. httpx only needs the fast top-1k web set (naabu_web.txt), so the

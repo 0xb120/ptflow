@@ -13,13 +13,15 @@ direction TB
 provision_wl["provision_wl  ·  net=False<br># wordlists.provision() — un symlink wl_global/&lt;role&gt;.txt per ruolo risolto"]
 expand["expand<br>mapcidr -silent                                  # espande i CIDR<br>naabu -top-ports 1000 -exclude-cdn -c 50 -rate 1000   # porte per harvest TLS (rate=profilo)<br>tlsx -san -cn -resp-only  →  dnsx -silent        # nomi dai cert → risolti<br>dnsx -ptr -resp-only                             # PTR sugli IP<br>assetfinder -subs-only    subfinder -silent      # enum delle wildcard"]
 resolve["resolve<br>shuffledns -mode resolve -r resolvers-trusted    # fallback: dnsx -silent<br>dnsx -a -resp-only -silent                       # → unique_ips<br>dnsx -a -resp -nc -silent                        # → domain_ip_map"]
+scope_gate["scope_gate  ·  net=False<br># build_allowlist(scope_init) + filter_assets(subdomains + tls_names, domain_ip_map, unique_ips)<br># offline (net=False) · complementa naabu -exclude-cdn / split_cdn_ip_records (niente check CDN qui)"]
 portscan["portscan<br>naabu -p &lt;~250 WEB_PORTS&gt; -exclude-cdn -c 50 -rate 1000   # rate=profilo<br># → honeypot_split (≥15 porte aperte = honeypot) + select_web_ports"]
 httpx["httpx<br>httpx -sc -cl -td -title -ip -hash sha256<br>      -favicon -location -fr -irh -j<br>split_cdn_ip_records → drop bare-IP CDN/cloud/WAF (→ excluded_cdn.jsonl)"]
 end
 scope -.->|∥ offline| provision_wl
 scope --> expand
 expand --> resolve
-resolve --> portscan
+resolve --> scope_gate
+scope_gate --> portscan
 portscan --> httpx
 CLUSTER{{"② CLUSTER · pivot fan-out<br>→ scans/&lt;app_id&gt;/"}}
 BREADTH ==> CLUSTER
@@ -119,7 +121,7 @@ classDef phase1 fill:#10331c,stroke:#4cc46b,color:#dcf6e3;
 classDef phase2 fill:#3a2f06,stroke:#e6c247,color:#f8edc2;
 classDef phase3 fill:#3a0f23,stroke:#ef6a9b,color:#fbd9e6;
 classDef phase4 fill:#3a1a08,stroke:#f08a4c,color:#fbe2d2;
-class provision_wl,expand,resolve,portscan,httpx breadth
+class provision_wl,expand,resolve,scope_gate,portscan,httpx breadth
 class portscan_full,nerva,nuclei_scope,screenshot span
 class passive_probe,crawl,crawl_headless,subenum,takeover,fetch_delta,api_spec,mine_responses,request_catalog phase1
 class xref_catalog,dast,xss,sqli,cve_lookup phase2
