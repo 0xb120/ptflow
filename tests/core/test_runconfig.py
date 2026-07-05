@@ -127,3 +127,21 @@ def test_resolve_does_not_warn_steps_prefix(caplog):
     caplog.set_level(logging.WARNING, logger="ptflow")
     runconfig.resolve({"steps": {"external": {"dast": False}}}, {}, None)
     assert "steps.external.dast" not in caplog.text  # recognized prefix, not a "unknown key" typo warning
+
+
+def test_snapshot_records_disabled_steps(tmp_path):
+    resolved = runconfig.resolve({"profile": "home"}, {}, None)
+    out = runconfig.snapshot(tmp_path, resolved, disabled_keys=["steps.external.dast"])
+    text = out.read_text()
+    assert 'profile = "home"' in text
+    assert 'steps.external.dast = "off"' in text
+
+
+def test_snapshot_disabled_only_still_writes(tmp_path):
+    out = runconfig.snapshot(tmp_path, [], disabled_keys=["steps.external.dast"])
+    assert out is not None
+    assert 'steps.external.dast = "off"' in out.read_text()
+
+
+def test_snapshot_nothing_set_returns_none(tmp_path):
+    assert runconfig.snapshot(tmp_path, [], disabled_keys=[]) is None

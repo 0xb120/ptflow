@@ -216,15 +216,19 @@ def _toml_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def snapshot(activity_dir: Path, resolved: Iterable[Resolved]) -> Path | None:
+def snapshot(activity_dir: Path, resolved: Iterable[Resolved], *,
+             disabled_keys: Iterable[str] = ()) -> Path | None:
     """Write the effective run config to ``<activity>/config.toml`` (secrets redacted) for
-    reproducibility — re-feedable with ``--config``. Returns the path, or None if nothing was set."""
+    reproducibility — re-feedable with ``--config``. Includes disabled steps as ``steps.<pipeline>.<step>
+    = "off"`` lines. Returns the path, or None if nothing was set."""
     rows = sorted(resolved, key=lambda r: r.path)
-    if not rows:
+    steps = sorted(disabled_keys)
+    if not rows and not steps:
         return None
     lines = ["# ptflow — effective run config (auto-generated; secrets redacted).",
              "# Re-feed with:  ptflow run <pipeline> <activity> <scope> --config config.toml", ""]
     lines += [f"{r.path} = {_toml_quote('<redacted>' if r.secret else r.value)}" for r in rows]
+    lines += [f"{k} = {_toml_quote('off')}" for k in steps]
     out = activity_dir / "config.toml"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
