@@ -1984,3 +1984,38 @@ def test_request_catalog_full_single_group_unchanged(tmp_path):
     tasks.request_catalog_full(act, "only")
     full = [r["url"] for r in tools.read_jsonl(b.canonical("requests_full.jsonl"))]
     assert any("api.company.com/own" in u for u in full)   # its own endpoint still present
+
+
+def test_xref_catalog_routes_other_groups_surface(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("xref-cat", root=tmp_path).ensure()
+    a = act.app("attack.com-aaaa").ensure()
+    b = act.app("api.company.com-bbbb").ensure()
+    tools.write_lines(a.hosts, ["https://attack.com"])
+    tools.write_lines(b.hosts, ["https://api.company.com"])
+    tools.write_lines(a.canonical("endpoints_js.txt"), ["https://api.company.com/v1/users"])
+    tools.write_jsonl(a.canonical("requests_crawl.jsonl"),
+                      [{"method": "POST", "url": "https://api.company.com/v1/login",
+                        "headers": {}, "body": "u=1", "params": [], "raw": "r", "sources": ["katana"]}])
+    tasks.xref_catalog(act, "api.company.com-bbbb")
+    routed = tools.read_jsonl(b.canonical("requests_xref.jsonl"))
+    urls = {r["url"] for r in routed}
+    assert any("api.company.com/v1/users" in u for u in urls)   # endpoint routed into B
+    assert any("api.company.com/v1/login" in u for u in urls)   # request routed into B
+    login = next(r for r in routed if r["url"].endswith("/login"))
+    assert login["method"] == "POST"                            # shape preserved
+    assert any(s.startswith("xref:attack.com") for s in login["sources"])  # provenance
+
+
+def test_xref_catalog_single_group_is_empty(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("xref-cat-solo", root=tmp_path).ensure()
+    b = act.app("only").ensure()
+    tools.write_lines(b.hosts, ["https://api.company.com"])
+    tools.write_lines(b.canonical("endpoints_js.txt"), ["https://api.company.com/own"])
+    tasks.xref_catalog(act, "only")
+    assert tools.read_jsonl(b.canonical("requests_xref.jsonl")) == []  # no other groups → empty

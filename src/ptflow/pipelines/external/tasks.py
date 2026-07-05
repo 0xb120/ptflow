@@ -3854,6 +3854,21 @@ def request_catalog_full(activity: Activity, app_id: str) -> None:
              " dropped %d dead/404) → requests_full.jsonl", app_id, n, methods, n_mined, n_dead)
 
 
+def xref_catalog(activity: Activity, app_id: str) -> None:
+    """PHASE 2 (head) — assemble the CROSS-GROUP surface catalog (requests_xref.jsonl): requests/endpoints
+    discovered in OTHER in-scope groups whose host belongs to THIS group, so the phase-2 dast/xss/sqli
+    pass tests the cross-group surface on the FAST pass, not only in phase 4 (request_catalog_full).
+
+    Safe by the loop barrier: the global 1→2 barrier guarantees every group finished phase 1, so reading
+    peers' discovery artifacts is race-free (same guarantee request_catalog_full relies on at phase 4).
+    Offline (net=False). A lone group has no peers → an empty sidecar (tolerant reads make it a no-op)."""
+    ws = activity.app(app_id)
+    catalog, n_dead = _finalize_catalog(ws, _cross_group_surface(activity, ws), [])
+    n = tools.write_jsonl(ws.canonical("requests_xref.jsonl"), catalog)
+    log.info("  → xref_catalog (%s) — %d cross-group request shape(s) (dropped %d dead/404)"
+             " → requests_xref.jsonl", app_id, n, n_dead)
+
+
 def param_fuzz(activity: Activity, app_id: str) -> None:
     """PHASE 4 — hidden-parameter discovery across ALL locations (query · body · json · header), not
     just GET, over the FULL request catalog (requests_full.jsonl) — so it probes the fuzzing-discovered
