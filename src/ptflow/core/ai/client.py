@@ -15,6 +15,8 @@ import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
+import anyio
+
 from ptflow.core.log import get_logger
 
 if TYPE_CHECKING:
@@ -174,6 +176,74 @@ class OpenAICompatibleClient:
                 return schema.model_validate_json(content)
         except Exception:  # noqa: BLE001  (model may not support response_format → fall back)
             log.debug("native response_format unavailable; using prompt fallback")
+        return _json_via_prompt(self.complete_text, system, user, schema)
+
+
+def _cc_text(messages: list) -> str:
+    parts = []
+    for m in messages:
+        for b in getattr(m, "content", None) or []:
+            t = getattr(b, "text", None)
+            if t:
+                parts.append(t)
+    return "".join(parts)
+
+
+def _cc_structured(messages: list) -> object | None:
+    for m in messages:
+        so = getattr(m, "structured_output", None)
+        if so is not None:
+            return so
+    return None
+
+
+class ClaudeCodeClient:
+    """Claude Code Agent SDK client — runs the agent as a pure text generator (tools=[]) on the
+    operator's subscription (CLAUDE_CODE_OAUTH_TOKEN) or ANTHROPIC_API_KEY. The SDK is async; the seam
+    is sync, so each call bridges with anyio.run. `query`/`options_cls` are injected in tests; in
+    production they're imported lazily so this module never requires the optional extra."""
+
+    name = "claude-code"
+
+    def __init__(self, model: str | None = None, *, query: object | None = None,
+                 options_cls: object | None = None) -> None:
+        self.model = model
+        self._query = query
+        self._options_cls = options_cls
+
+    def _sdk(self) -> tuple:
+        if self._query is None or self._options_cls is None:
+            from claude_agent_sdk import ClaudeAgentOptions, query  # noqa: PLC0415  (lazy — extra)
+
+            self._query = self._query or query
+            self._options_cls = self._options_cls or ClaudeAgentOptions
+        return self._query, self._options_cls
+
+    async def _arun(self, system: str, user: str, output_format: object | None = None) -> list:
+        query, options_cls = self._sdk()
+        kw: dict = {"system_prompt": system, "tools": []}
+        if self.model:
+            kw["model"] = self.model
+        qkw: dict = {"prompt": user, "options": options_cls(**kw)}
+        if output_format is not None:
+            qkw["output_format"] = output_format
+        return [m async for m in query(**qkw)]
+
+    def complete_text(self, system: str, user: str, *, max_tokens: int = 64000) -> str | None:  # noqa: ARG002
+        try:
+            return _cc_text(anyio.run(self._arun, system, user)) or None
+        except Exception:  # best-effort
+            log.exception("AI complete_text failed")
+            return None
+
+    def complete_json(self, system: str, user: str, schema: type[T]) -> T | None:
+        try:
+            of = {"type": "json_schema", "schema": schema.model_json_schema()}
+            so = _cc_structured(anyio.run(self._arun, system, user, of))
+            if so is not None:
+                return schema.model_validate(so)
+        except Exception:  # noqa: BLE001  (native output_format unsupported → fall back)
+            log.debug("native structured output unavailable; using prompt fallback")
         return _json_via_prompt(self.complete_text, system, user, schema)
 
 

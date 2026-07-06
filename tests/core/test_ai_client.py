@@ -204,3 +204,64 @@ def test_openai_complete_text():
 def test_openai_complete_json_none_when_all_fail():
     c = aic.OpenAICompatibleClient(model="m", client=_openai_fake(native_raises=True, text="garbage"))
     assert c.complete_json("sys", "usr", _Out) is None
+
+
+class _CCBlock:
+    def __init__(self, text):
+        self.type = "text"
+        self.text = text
+
+
+class _CCMsg:
+    def __init__(self, blocks=None, structured_output=None):
+        self.content = blocks or []
+        if structured_output is not None:
+            self.structured_output = structured_output
+
+
+def _cc_query(messages):
+    async def _q(**_kwargs):
+        for m in messages:
+            yield m
+    return _q
+
+
+class _CCOptions:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def test_claude_code_complete_text():
+    q = _cc_query([_CCMsg([_CCBlock("hello "), _CCBlock("world")])])
+    c = aic.ClaudeCodeClient(query=q, options_cls=_CCOptions)
+    assert c.complete_text("sys", "usr") == "hello world"
+
+
+def test_claude_code_complete_json_native():
+    q = _cc_query([_CCMsg(structured_output={"value": "hi"})])
+    c = aic.ClaudeCodeClient(query=q, options_cls=_CCOptions)
+    out = c.complete_json("sys", "usr", _Out)
+    assert out is not None
+    assert out.value == "hi"
+
+
+def test_claude_code_complete_json_falls_back_to_prompt():
+    # no structured_output on the message → complete_json re-runs via complete_text (prompt fallback)
+    q = _cc_query([_CCMsg([_CCBlock('{"value": "fb"}')])])
+    c = aic.ClaudeCodeClient(query=q, options_cls=_CCOptions)
+    out = c.complete_json("sys", "usr", _Out)
+    assert out is not None
+    assert out.value == "fb"
+
+
+def test_claude_code_options_disable_tools():
+    captured = {}
+
+    class _Opts:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    q = _cc_query([_CCMsg([_CCBlock("x")])])
+    aic.ClaudeCodeClient(query=q, options_cls=_Opts).complete_text("sys", "usr")
+    assert captured.get("tools") == []
+    assert captured.get("system_prompt") == "sys"
