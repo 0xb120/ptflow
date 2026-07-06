@@ -129,3 +129,20 @@ def test_json_via_prompt_retries_then_succeeds():
 def test_json_via_prompt_none_when_never_valid():
     assert aic._json_via_prompt(lambda _s, _u: "nope", "sys", "usr", _Out, retries=1) is None
     assert aic._json_via_prompt(lambda _s, _u: None, "sys", "usr", _Out) is None
+
+
+def test_extract_json_fence_only_no_prose():
+    # input that STARTS with the fence — exercises the fence-stripping branch, not the bracket fallback
+    assert aic._extract_json('```json\n{"value": "hi"}\n```') == '{"value": "hi"}'
+
+
+def test_json_via_prompt_retries_on_schema_invalid():
+    # first reply is syntactically valid JSON but fails schema validation → validate-retry path
+    seq = iter(['{"wrong": "x"}', '{"value": "ok"}'])
+
+    def fake_text(_system, _user):
+        return next(seq)
+
+    out = aic._json_via_prompt(fake_text, "sys", "usr", _Out, retries=1)
+    assert out is not None
+    assert out.value == "ok"
