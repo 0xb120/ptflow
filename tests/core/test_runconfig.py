@@ -92,12 +92,6 @@ def test_ai_flag_resolves_to_env():
     assert envs["PTFLOW_AI_MODEL"] == "claude-opus-4-8"
 
 
-def test_ai_provider_enum_rejects_unknown():
-    import pytest
-    with pytest.raises(runconfig.ConfigError):
-        runconfig.resolve({}, {}, ["ai.provider=openai"])
-
-
 def test_resolve_disabled_steps_sparse_and_precedence():
     config = {"steps": {"external": {"dast": False, "cve_lookup": True}}}
     names = {"dast", "cve_lookup", "httpx"}
@@ -159,3 +153,18 @@ def test_snapshot_disabled_only_still_writes(tmp_path):
 
 def test_snapshot_nothing_set_returns_none(tmp_path):
     assert runconfig.snapshot(tmp_path, [], disabled_keys=[]) is None
+
+
+def test_ai_provider_enum_accepts_new_values():
+    from ptflow.core import runconfig
+    for prov in ("claude-code", "openai"):
+        resolved = runconfig.resolve({"ai": {"provider": prov}}, {})
+        assert any(r.env == "PTFLOW_AI_PROVIDER" and r.value == prov for r in resolved)
+
+
+def test_ai_provider_enum_rejects_unknown():
+    import pytest
+
+    from ptflow.core import runconfig
+    with pytest.raises(runconfig.ConfigError):
+        runconfig.resolve({"ai": {"provider": "anthropic"}}, {})
