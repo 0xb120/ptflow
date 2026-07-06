@@ -212,6 +212,40 @@ def test_claude_code_complete_json_falls_back_to_prompt():
     assert out.value == "fb"
 
 
+def test_openai_does_not_forward_max_tokens():
+    # OpenAI-compatible cloud endpoints (OpenRouter, OpenAI) 400 on a max_tokens above the model's
+    # output cap; forwarding our best-effort default (64000 / 16000) would silently degrade to None.
+    captured = []
+
+    class _Msg:
+        content = '{"value": "x"}'
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        def __init__(self):
+            self.choices = [_Choice()]
+
+    class _Completions:
+        @staticmethod
+        def create(**kwargs):
+            captured.append(kwargs)
+            return _Resp()
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    c = aic.OpenAICompatibleClient(model="m", client=_Client())
+    c.complete_text("s", "u")
+    c.complete_json("s", "u", _Out)  # exercises the native path
+    assert captured, "create was never called"
+    assert all("max_tokens" not in kw for kw in captured), captured
+
+
 def test_claude_code_options_disable_tools():
     captured = {}
 

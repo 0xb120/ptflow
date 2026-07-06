@@ -99,10 +99,12 @@ class OpenAICompatibleClient:
     def _messages(self, system: str, user: str) -> list[dict]:
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
-    def complete_text(self, system: str, user: str, *, max_tokens: int = 64000) -> str | None:
+    def complete_text(self, system: str, user: str, *, max_tokens: int = 64000) -> str | None:  # noqa: ARG002
+        # OpenAI-compatible servers 400 on max_tokens above the model's output cap; let the server
+        # use the model default.
         try:
             resp = self._sdk().chat.completions.create(  # ty: ignore[unresolved-attribute]
-                model=self.model, max_tokens=max_tokens, messages=self._messages(system, user))
+                model=self.model, messages=self._messages(system, user))
             return resp.choices[0].message.content or None
         except Exception:  # best-effort: any failure degrades to None
             log.exception("AI complete_text failed")
@@ -110,8 +112,10 @@ class OpenAICompatibleClient:
 
     def complete_json(self, system: str, user: str, schema: type[T]) -> T | None:
         try:
+            # OpenAI-compatible servers 400 on max_tokens above the model's output cap; let the
+            # server use the model default.
             resp = self._sdk().chat.completions.create(  # ty: ignore[unresolved-attribute]
-                model=self.model, max_tokens=16000, messages=self._messages(system, user),
+                model=self.model, messages=self._messages(system, user),
                 response_format={"type": "json_schema", "json_schema": {
                     "name": "out", "schema": schema.model_json_schema(), "strict": True}})
             content = resp.choices[0].message.content
