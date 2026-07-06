@@ -1529,9 +1529,9 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-agent-sdk", marker = "extra == 'ai'" },
+    { name = "claude-agent-sdk", marker = "extra == 'ai'", specifier = ">=0.2.110" },
     { name = "fastapi", specifier = "<0.137" },
-    { name = "openai", marker = "extra == 'ai'" },
+    { name = "openai", marker = "extra == 'ai'", specifier = ">=2.44.0" },
     { name = "prefect", specifier = ">=3.0" },
 ]
 provides-extras = ["ai"]
