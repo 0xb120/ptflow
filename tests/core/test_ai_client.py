@@ -146,3 +146,61 @@ def test_json_via_prompt_retries_on_schema_invalid():
     out = aic._json_via_prompt(fake_text, "sys", "usr", _Out, retries=1)
     assert out is not None
     assert out.value == "ok"
+
+
+def _openai_fake(*, native_json=None, native_raises=False, text=None):
+    class _Msg:
+        def __init__(self, content):
+            self.content = content
+
+    class _Choice:
+        def __init__(self, content):
+            self.message = _Msg(content)
+
+    class _Resp:
+        def __init__(self, content):
+            self.choices = [_Choice(content)]
+
+    class _Completions:
+        @staticmethod
+        def create(**kwargs):
+            if "response_format" in kwargs:
+                if native_raises:
+                    msg = "no structured output"
+                    raise RuntimeError(msg)
+                return _Resp(native_json)
+            return _Resp(text)
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    return _Client()
+
+
+def test_openai_complete_json_native():
+    c = aic.OpenAICompatibleClient(model="m", client=_openai_fake(native_json='{"value": "hi"}'))
+    out = c.complete_json("sys", "usr", _Out)
+    assert out is not None
+    assert out.value == "hi"
+
+
+def test_openai_complete_json_falls_back_to_prompt():
+    # native path raises; plain create() (no response_format) returns the JSON for the fallback
+    c = aic.OpenAICompatibleClient(model="m", client=_openai_fake(native_raises=True,
+                                                                  text='{"value": "fb"}'))
+    out = c.complete_json("sys", "usr", _Out)
+    assert out is not None
+    assert out.value == "fb"
+
+
+def test_openai_complete_text():
+    c = aic.OpenAICompatibleClient(model="m", client=_openai_fake(text="hello world"))
+    assert c.complete_text("sys", "usr") == "hello world"
+
+
+def test_openai_complete_json_none_when_all_fail():
+    c = aic.OpenAICompatibleClient(model="m", client=_openai_fake(native_raises=True, text="garbage"))
+    assert c.complete_json("sys", "usr", _Out) is None

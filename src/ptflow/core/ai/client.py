@@ -129,6 +129,54 @@ class AnthropicClient:
             return text or None
 
 
+class OpenAICompatibleClient:
+    """OpenAI-compatible client (Ollama local/cloud, OpenRouter) driven by base_url. Hybrid
+    structured output: native response_format json_schema first, prompt-based fallback otherwise.
+    `client` is injected in tests; in production it's built lazily so importing this module never
+    requires the optional `openai` extra."""
+
+    name = "openai"
+
+    def __init__(self, model: str, base_url: str | None = None, api_key: str | None = None,
+                 client: object | None = None) -> None:
+        self.model = model
+        self._base_url = base_url
+        self._api_key = api_key or "ollama"   # Ollama needs no key; the SDK requires a non-empty str
+        self._client = client
+
+    def _sdk(self) -> object:
+        if self._client is None:
+            import openai  # noqa: PLC0415  (lazy — optional 'ai' extra)
+
+            self._client = openai.OpenAI(base_url=self._base_url, api_key=self._api_key)
+        return self._client
+
+    def _messages(self, system: str, user: str) -> list[dict]:
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    def complete_text(self, system: str, user: str, *, max_tokens: int = 64000) -> str | None:
+        try:
+            resp = self._sdk().chat.completions.create(  # ty: ignore[unresolved-attribute]
+                model=self.model, max_tokens=max_tokens, messages=self._messages(system, user))
+            return resp.choices[0].message.content or None
+        except Exception:  # best-effort: any failure degrades to None
+            log.exception("AI complete_text failed")
+            return None
+
+    def complete_json(self, system: str, user: str, schema: type[T]) -> T | None:
+        try:
+            resp = self._sdk().chat.completions.create(  # ty: ignore[unresolved-attribute]
+                model=self.model, max_tokens=16000, messages=self._messages(system, user),
+                response_format={"type": "json_schema", "json_schema": {
+                    "name": "out", "schema": schema.model_json_schema(), "strict": True}})
+            content = resp.choices[0].message.content
+            if content:
+                return schema.model_validate_json(content)
+        except Exception:  # noqa: BLE001  (model may not support response_format → fall back)
+            log.debug("native response_format unavailable; using prompt fallback")
+        return _json_via_prompt(self.complete_text, system, user, schema)
+
+
 def make_client() -> LLMClient | None:
     """The single entry point every AI stage uses. Returns None (⇒ the stage degrades to a no-op) when
     PTFLOW_AI is off, the provider is unsupported, or the `anthropic` extra is not installed."""
