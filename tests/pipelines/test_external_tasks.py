@@ -208,7 +208,7 @@ def test_pipeline_object_shape():
     app = [s.name for s in PIPELINE.stages if s.per_app]
     # full-port scan + nerva are now SPANNING (off the breadth critical path); httpx needs only
     # the fast top-1k web set, so the breadth chain stops at httpx.
-    assert activity == ["provision_wl", "expand", "resolve", "portscan", "httpx"]
+    assert activity == ["provision_wl", "expand", "resolve", "scope_gate", "portscan", "httpx"]
     assert spanning == ["portscan_full", "nerva", "nuclei_scope"]
     assert cluster_scope == ["screenshot"]  # batched screenshot, post-cluster ∥ the loops
     assert app == [
@@ -1708,9 +1708,47 @@ def test_map_hosts_to_ips_parses_dnsx_resp_format():
     assert tasks.map_hosts_to_ips(["app.test [A] [10.0.0.1]"], {"app.test"}) == {"10.0.0.1"}
 
 
+def test_parse_domain_ip_map_extracts_host_and_ips():
+    got = tasks.parse_domain_ip_map([
+        "acme.com [A] [192.0.2.9] [192.0.2.10]",
+        "mail.acme.com [A] [192.0.2.5]",
+        "",
+    ])
+    assert got == {"acme.com": ["192.0.2.9", "192.0.2.10"], "mail.acme.com": ["192.0.2.5"]}
+
+
+def test_scope_gate_keeps_inscope_drops_thirdparty(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("gate", root=tmp_path).ensure()
+    act.scope_init.parent.mkdir(parents=True, exist_ok=True)
+    act.scope_init.write_text("acme.com\n192.0.2.0/24\n")
+    canon = act.asset_discovery_canonical
+    tools.write_lines(canon("subdomains.txt"), ["acme.com", "evil.test"])          # evil = third-party
+    tools.write_lines(canon("tls_names.txt"), ["mail.acme.com", "cdn.other.test"]) # mail on scope IP (rule 4)
+    tools.write_lines(canon("unique_ips.txt"), ["192.0.2.9", "203.0.113.5"])
+    tools.write_lines(canon("domain_ip_map.txt"), [
+        "acme.com [A] [192.0.2.9]",
+        "mail.acme.com [A] [192.0.2.5]",       # 192.0.2.5 ∈ 192.0.2.0/24 → rule 4 keeps the name
+        "evil.test [A] [203.0.113.5]",
+        "cdn.other.test [A] [203.0.113.5]",
+    ])
+    tasks.scope_gate(act)
+    subs = tools.read_lines(canon("inscope_subdomains.txt"))
+    tls = tools.read_lines(canon("inscope_tls_names.txt"))
+    ips = tools.read_lines(canon("inscope_ips.txt"))
+    dropped = {d["asset"] for d in tools.read_jsonl(canon("excluded_out_of_scope.jsonl"))}
+    assert subs == ["acme.com"]                      # evil.test dropped
+    assert tls == ["mail.acme.com"]                  # rule 4 kept it; cdn.other.test dropped
+    assert "192.0.2.9" in ips
+    assert "203.0.113.5" not in ips
+    assert {"evil.test", "cdn.other.test", "203.0.113.5"} <= dropped
+
+
 def test_app_service_banners_attributes_ip_only_record(tmp_path):
-    # regression: an IP-only nerva record must attach to the app via domain_ip_map.txt — the old
-    # parser took the '[A]' record-type column instead of the bracketed IP, so it never matched.
+    # regression: an IP-only nerva record must attach to the app via inscope_domain_ip_map.txt — the
+    # old parser took the '[A]' record-type column instead of the bracketed IP, so it never matched.
     from ptflow.core import tools
     from ptflow.core.paths import Activity
 
@@ -1719,7 +1757,7 @@ def test_app_service_banners_attributes_ip_only_record(tmp_path):
     tools.write_jsonl(canon("nerva_full_metadata.jsonl"),
                       [{"host": "", "ip": "45.33.32.156", "port": 22,
                         "metadata": {"banner": "SSH-2.0-OpenSSH_6.6.1p1"}}])
-    canon("domain_ip_map.txt").write_text("scanme.test [A] [45.33.32.156]\n", encoding="utf-8")
+    canon("inscope_domain_ip_map.txt").write_text("scanme.test [A] [45.33.32.156]\n", encoding="utf-8")
     meta = {"hosts": ["http://scanme.test"]}
     assert tasks._app_service_banners(act, meta) == [("45.33.32.156:22", "SSH-2.0-OpenSSH_6.6.1p1")]
 
@@ -2113,3 +2151,14 @@ def test_webscan_phase2_wires_xref_catalog():
     assert not stages["xref_catalog"].net
     for name in ("dast", "xss", "sqli"):
         assert "xref_catalog" in stages[name].needs, f"webscan {name} must depend on xref_catalog"
+
+
+def test_scope_gate_is_wired_between_resolve_and_portscan():
+    from ptflow.pipelines.external.pipeline import PIPELINE
+
+    stages = {s.name: s for s in PIPELINE.stages}
+    assert "scope_gate" in stages
+    assert stages["scope_gate"].needs == ("resolve",)
+    assert not stages["scope_gate"].net
+    assert not stages["scope_gate"].per_app
+    assert stages["portscan"].needs == ("scope_gate",)   # portscan now gated

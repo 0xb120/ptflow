@@ -563,6 +563,18 @@ def map_hosts_to_ips(lines: Iterable[str], hosts: set[str]) -> set[str]:
     return out
 
 
+def parse_domain_ip_map(lines: Iterable[str]) -> dict[str, list[str]]:
+    """Parse a dnsx `-a -resp` map (domain_ip_map.txt: ``<host> [A] [<ip>] …``) into {host: [ipv4, …]},
+    host normalized via scope.norm_host (matches filter_assets's name_ips lookup key). Reuses _IPV4_RE
+    over the rest of each line (bracket-agnostic). Pure."""
+    out: dict[str, list[str]] = {}
+    for line in lines:
+        head, _, rest = line.strip().partition(" ")
+        if head:
+            out.setdefault(scope.norm_host(head), []).extend(_IPV4_RE.findall(rest))
+    return out
+
+
 def split_cdn_ip_records(records: list[dict], scope_ips: set[str]) -> tuple[list[dict], list[dict]]:
     """Partition httpx records into (kept, dropped) for SCOPE HYGIENE (pure).
 
@@ -1790,9 +1802,43 @@ def resolve(activity: Activity) -> None:
          stdin=a_input, dest=canon("domain_ip_map.txt"), label="a_resp")
 
 
+def scope_gate(activity: Activity) -> None:
+    """Breadth — enforce the RoE authorization boundary between discovery and active scanning. Build the
+    scope allowlist (exact host / *.apex suffix / IP-CIDR) from scope_init, then keep only authorized
+    names+IPs from resolve's discovery output: a name survives if it matches a domain/wildcard entry OR
+    resolves to an in-scope IP (rule 4 — recovers vhosts on IP-only scopes); an IP survives if it is an
+    explicit scope IP or a resolved IP of a kept name. Third-party pull-in (SAN/PTR of an unlisted apex,
+    cloud IPs) is dropped to excluded_out_of_scope.jsonl (RoE audit). Offline (net=False); complements the
+    CDN filters (naabu -exclude-cdn / split_cdn_ip_records)."""
+    canon = activity.asset_discovery_canonical
+    targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8", errors="replace"))
+    allow = scope.build_allowlist(targets)
+    subdomains = tools.read_lines(canon("subdomains.txt"))
+    tls_names = tools.read_lines(canon("tls_names.txt"))
+    ips = tools.read_lines(canon("unique_ips.txt"))
+    dim_lines = tools.read_lines(canon("domain_ip_map.txt"))
+    name_ips = parse_domain_ip_map(dim_lines)
+    verdict = scope.filter_assets(tools.dedupe([*subdomains, *tls_names]), name_ips, ips, allow)
+
+    tools.write_lines(canon("inscope_subdomains.txt"),
+                      [s for s in subdomains if scope.norm_host(s) in verdict.kept_names])
+    tools.write_lines(canon("inscope_tls_names.txt"),
+                      [t for t in tls_names if scope.norm_host(t) in verdict.kept_names])
+    tools.write_lines(canon("inscope_ips.txt"), [ip for ip in ips if ip in verdict.kept_ips])
+    tools.write_lines(canon("inscope_domain_ip_map.txt"),
+                      [ln for ln in dim_lines
+                       if scope.norm_host(ln.strip().partition(" ")[0]) in verdict.kept_names])
+    tools.write_jsonl(canon("excluded_out_of_scope.jsonl"), list(verdict.dropped))
+
+    if not (allow.exact_hosts or allow.wildcard_apexes or allow.nets):
+        log.warning("⚠ scope_gate: EMPTY allowlist (malformed/empty scope?) — all discovered assets dropped")
+    log.info("  → scope_gate: kept %d name(s) + %d ip(s), dropped %d → excluded_out_of_scope.jsonl",
+             len(verdict.kept_names), len(verdict.kept_ips), len(verdict.dropped))
+
+
 def portscan(activity: Activity) -> None:
     """Phase 3 — FAST web-port scan: WEB_PORTS → honeypot filter → naabu_web.txt (the web target set
-    httpx probes). Reads unique_ips.txt; writes honeypots.txt + naabu_web.txt (canonical).
+    httpx probes). Reads inscope_ips.txt; writes honeypots.txt + naabu_web.txt (canonical).
 
     Scans the curated ~250 HTTP(S)-bearing ports (WEB_PORTS), NOT nmap's generic top-1k — so httpx
     sees web apps on uncommon ports (5601/8161/9200/7001/…) that top-1k would miss, while staying
@@ -1801,7 +1847,7 @@ def portscan(activity: Activity) -> None:
     non-web ports are picked up there ∥ in the background (→ nerva). The naabu stdout is provenance
     (raw/naabu/), consumed in memory by honeypot_split/select_web_ports."""
     canon = activity.asset_discovery_canonical
-    unique_ips = tools.read_lines(canon("unique_ips.txt"))
+    unique_ips = tools.read_lines(canon("inscope_ips.txt"))
     scanned = _lines(
         _run("naabu", ["naabu", "-silent", "-p", WEB_PORTS, "-exclude-cdn",
                        "-c", NAABU_CONC, "-rate", NAABU_RATE],
@@ -1816,11 +1862,11 @@ def portscan_full(activity: Activity) -> None:
     """SPANNING — full 65535-port scan on the valid (non-honeypot) IPs → naabu_full.txt, which feeds
     nerva (non-HTTP service fingerprint). Launched after `portscan`, runs ∥ clustering + the per-app
     loops, joined at the fan-in — off the critical path, since breadth→cluster→loops only needs the
-    fast top-1k web set (naabu_web.txt). Recomputes the valid set from disk (unique_ips minus
+    fast top-1k web set (naabu_web.txt). Recomputes the valid set from disk (inscope_ips.txt minus
     honeypots) — only strings cross the stage boundary."""
     canon = activity.asset_discovery_canonical
     honeypots = set(tools.read_lines(canon("honeypots.txt")))
-    valid = [ip for ip in tools.read_lines(canon("unique_ips.txt")) if ip not in honeypots]
+    valid = [ip for ip in tools.read_lines(canon("inscope_ips.txt")) if ip not in honeypots]
     _run("naabu", ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn",
                    "-c", NAABU_CONC, "-rate", NAABU_RATE],
          stdin="\n".join(valid), dest=canon("naabu_full.txt"), label="full")
@@ -1839,8 +1885,8 @@ def httpx_fingerprint(activity: Activity) -> None:
     """
     canon = activity.asset_discovery_canonical
     httpx_input = "\n".join(tools.dedupe([
-        *tools.read_lines(canon("tls_names.txt")),
-        *tools.read_lines(canon("subdomains.txt")),
+        *tools.read_lines(canon("inscope_tls_names.txt")),
+        *tools.read_lines(canon("inscope_subdomains.txt")),
         *tools.read_lines(canon("naabu_web.txt")),  # fast top-1k web set (full scan is now spanning)
         *tools.read_lines(canon("honeypots.txt")),
     ]))
@@ -1905,7 +1951,7 @@ def nuclei_scope(activity: Activity) -> None:
     nuclei-templates first (`-ut`), then scans with -duc (no redundant check mid-run).
     """
     canon = activity.asset_discovery_canonical
-    targets = tools.dedupe([*tools.read_lines(canon("subdomains.txt")),
+    targets = tools.dedupe([*tools.read_lines(canon("inscope_subdomains.txt")),
                             *tools.read_lines(canon("unique_webapps.txt"))])
     if not targets:
         log.debug("  · skip nuclei_scope (no targets)")
@@ -4616,14 +4662,14 @@ def _corpus_urls(ws: AppWorkspace) -> list[str]:
 
 def _app_service_banners(activity: Activity, meta: dict) -> list[tuple[str, str]]:
     """Non-HTTP service banners (nerva) on THIS app's hosts → [(host:port, banner)]. Maps a nerva record
-    to the app by hostname, or by IP via domain_ip_map.txt. Best-effort: [] if nerva output is absent."""
+    to the app by hostname, or by IP via inscope_domain_ip_map.txt. Best-effort: [] if nerva output is absent."""
     canon = activity.asset_discovery_canonical
     nerva = canon("nerva_full_metadata.jsonl")
     recs = tools.read_jsonl(nerva) if nerva.exists() else []
     if not recs:
         return []
     app_hosts = {url_host(h) for h in (meta.get("hosts") or [])}
-    dim = canon("domain_ip_map.txt")
+    dim = canon("inscope_domain_ip_map.txt")
     app_ips = map_hosts_to_ips(tools.read_lines(dim), app_hosts) if dim.exists() else set()
     out: list[tuple[str, str]] = []
     for r in recs:
