@@ -86,3 +86,46 @@ def test_complete_text_concatenates_text_blocks():
 
     c = aic.AnthropicClient(client=_Fake())
     assert c.complete_text("sys", "usr") == "hello world"
+
+
+def test_extract_json_plain():
+    assert aic._extract_json('{"value": "hi"}') == '{"value": "hi"}'
+
+
+def test_extract_json_fenced_and_prose():
+    text = 'Sure!\n```json\n{"value": "hi"}\n```\nDone.'
+    assert aic._extract_json(text) == '{"value": "hi"}'
+
+
+def test_extract_json_none_when_absent():
+    assert aic._extract_json("no json here") is None
+    assert aic._extract_json("") is None
+
+
+def test_json_via_prompt_valid_first_try():
+    calls = []
+
+    def fake_text(system, user):
+        calls.append((system, user))
+        return '{"value": "ok"}'
+
+    out = aic._json_via_prompt(fake_text, "sys", "usr", _Out)
+    assert out is not None
+    assert out.value == "ok"
+    assert "JSON Schema" in calls[0][0]  # schema was appended to the system prompt
+
+
+def test_json_via_prompt_retries_then_succeeds():
+    seq = iter(["garbage", '{"value": "ok"}'])
+
+    def fake_text(_system, _user):
+        return next(seq)
+
+    out = aic._json_via_prompt(fake_text, "sys", "usr", _Out, retries=1)
+    assert out is not None
+    assert out.value == "ok"
+
+
+def test_json_via_prompt_none_when_never_valid():
+    assert aic._json_via_prompt(lambda _s, _u: "nope", "sys", "usr", _Out, retries=1) is None
+    assert aic._json_via_prompt(lambda _s, _u: None, "sys", "usr", _Out) is None

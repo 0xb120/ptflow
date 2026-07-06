@@ -10,7 +10,9 @@ off, or when the provider is unsupported.
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
 from ptflow.core.log import get_logger
@@ -32,6 +34,42 @@ class LLMClient(Protocol):
     def complete_json(self, system: str, user: str, schema: type[T]) -> T | None: ...
 
     def complete_text(self, system: str, user: str, *, max_tokens: int = 64000) -> str | None: ...
+
+
+def _extract_json(text: str) -> str | None:
+    """Pull the first JSON object/array out of a model's text reply — strips ``` fences and prose."""
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = t[3:]
+        if t[:4].lower() == "json":
+            t = t[4:]
+        t = t.rsplit("```", 1)[0].strip()
+    starts = [p for p in (t.find("{"), t.find("[")) if p != -1]
+    if not starts:
+        return None
+    start = min(starts)
+    end = max(t.rfind("}"), t.rfind("]"))
+    if end <= start:
+        return None
+    return t[start : end + 1]
+
+
+def _json_via_prompt(complete_text_fn: Callable[[str, str], str | None], system: str, user: str,
+                     schema: type[T], *, retries: int = 1) -> T | None:
+    """Provider-agnostic structured-output fallback: put the JSON Schema in the prompt, call the text
+    completion, extract + validate, retry on failure. Returns None if never valid."""
+    sys2 = (system + "\n\nRespond with ONLY a JSON value conforming to this JSON Schema — no prose, "
+            "no markdown fences:\n" + json.dumps(schema.model_json_schema()))
+    for _ in range(retries + 1):
+        raw = _extract_json(complete_text_fn(sys2, user) or "")
+        if raw:
+            try:
+                return schema.model_validate_json(raw)
+            except Exception:  # noqa: BLE001  (best-effort: bad JSON → retry/None)
+                log.debug("AI structured-output validation failed; retrying")
+    return None
 
 
 class AnthropicClient:
