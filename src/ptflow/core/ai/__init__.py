@@ -1,1 +1,1 @@
-"""Optional AI layer — provider seam (LLMClient) + Anthropic implementation. Opt-in via PTFLOW_AI."""
+"""Optional AI layer — provider-agnostic seam (LLMClient) with claude-code + openai backends. Opt-in via PTFLOW_AI."""

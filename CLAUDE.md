@@ -961,17 +961,22 @@ flow changed:
   (50 vs 150) and feroxbuster `-t`/`-L`, for a domestic line. Aggregate load ≈ concurrency × rate,
   so the per-tool rate is the real lever (a `net` concurrency cap alone won't tame the single
   full-port/nuclei stages). The active profile is logged at run start (preflight).
-- **AI layer (opt-in, `--ai` / `PTFLOW_AI=on`)** — adds four best-effort LLM stages via the
-  `core/ai/` seam (`LLMClient` + `AnthropicClient`, Anthropic Messages API, `claude-opus-4-8` default;
-  `anthropic` is the OPTIONAL `ai` extra, imported lazily). Key via the standard `ANTHROPIC_API_KEY` /
-  `ant` profile — NOT a ptflow knob. Stages: `ai_wordlist` (phase 2 → `wl_custom/ai_seed.txt`, folded
-  by `build_content_wordlist`), `ai_secret_triage` (phase 4 → sidecar `findings/secrets_triage.jsonl`),
+- **AI layer (opt-in, `--ai` / `PTFLOW_AI=on`)** — adds four best-effort LLM stages via a
+  **provider-agnostic** `core/ai/` seam (`LLMClient` Protocol + `make_client()`). Two backends,
+  selected by **`PTFLOW_AI_PROVIDER`**: **`claude-code`** (default) drives the Claude Code Agent
+  SDK on the operator's own subscription — auth via `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`)
+  or `ANTHROPIC_API_KEY` — and **requires the `claude` CLI on PATH**; **`openai`** talks to any
+  OpenAI-compatible endpoint (Ollama local/cloud, OpenRouter, …) via `PTFLOW_AI_BASE_URL` +
+  **`PTFLOW_AI_MODEL` (required for this provider)** + `OPENAI_API_KEY`. Structured output is
+  **hybrid**: native schema support first, falling back to prompt+validate+retry for models (e.g.
+  local Ollama) that don't support one. `claude-agent-sdk` + `openai` are the OPTIONAL `ai` extra,
+  imported lazily. Stages: `ai_wordlist` (phase 2 → `wl_custom/ai_seed.txt`, folded by
+  `build_content_wordlist`), `ai_secret_triage` (phase 4 → sidecar `findings/secrets_triage.jsonl`),
   `ai_triage` (revives the agent seam → `findings/hypotheses.jsonl`, correlating consolidated findings),
   `ai_report` (terminal `report()` hook → `report.md`). All `net=False`, additive, failure-isolated;
-  with AI off, `ExternalPipeline.stages` is byte-identical to the deterministic default. Knobs:
-  `PTFLOW_AI_MODEL` / `PTFLOW_AI_BASE_URL` (Anthropic-compatible gateways/Bedrock/Vertex) /
-  `PTFLOW_AI_PROVIDER` (v1: `anthropic`). Roadmap: `ai_mine_bodies`, `ai_cve_rank`, `ai_param_values`,
-  native non-Anthropic provider (see `docs/superpowers/specs/2026-07-04-ai-layer-design.md`).
+  with AI off, `ExternalPipeline.stages` is byte-identical to the deterministic default. Roadmap:
+  `ai_mine_bodies`, `ai_cve_rank`, `ai_param_values` (see
+  `docs/superpowers/specs/2026-07-04-ai-layer-design.md`).
 - **Authorized test scope only:** `https://ginandjuice.shop/` (PortSwigger demo), `scanme.nmap.org`
   (Nmap-sanctioned).
 
