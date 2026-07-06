@@ -235,6 +235,9 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                                                            #   httpx_full_metadata.jsonl, excluded_cdn.jsonl,
                                                            #   naabu_web.txt [fast/httpx], naabu_full.txt
                                                            #   [spanning], nerva_full_metadata.jsonl, …)
+                                                           #   scope_gate: inscope_{subdomains,tls_names,ips,
+                                                           #   domain_ip_map}.txt (RoE-authorized set the active
+                                                           #   stages read) + excluded_out_of_scope.jsonl (audit)
   .state/  <stage>.done  scope.sha        # --resume markers (skip completed stages; invalidated on scope change)
   scans/                                 # ONLY per-app group workspaces (no special-cased breadth dir)
     <app_id>/                            # one clustered app group (per-app loops)
@@ -361,7 +364,10 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
 - **`external`** — the REAL ProjectDiscovery toolchain (`pipelines/external/tasks.py`), a faithful port of
   bash recon scripts (`scope2surface.sh` breadth, `surfagr.sh` clustering). Stages:
   - **Breadth** (activity scope): `provision_wl` (resolve global wordlist roles → `wl_global/`) ∥
-    `expand` → `resolve` → `portscan` (FAST: ~250 curated web ports `WEB_PORTS` → honeypot filter → `naabu_web.txt`) → `httpx`
+    `expand` → `resolve` → `scope_gate` (offline RoE authorization gate — filters discovery down to the
+    authorized `inscope_*` set before any active scan; see the scope-gate note in "External design
+    decisions" below) → `portscan`
+    (FAST: ~250 curated web ports `WEB_PORTS` → honeypot filter → `naabu_web.txt`) → `httpx`
     → `cluster` fan-out. The expensive **full 65535-port scan is off the critical path**:
     `portscan_full` (**spanning**, after `portscan`) → `naabu_full.txt` → `nerva` (**spanning**)
     run ∥ clustering + the loops, joined at the fan-in. `httpx` only needs the fast top-1k web set,
@@ -973,6 +979,41 @@ flow changed:
 
 The architecture sections above say *what* the external pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **A per-scope authorization gate (`scope_gate`) enforces the RoE boundary at the discovery→active-scan
+  seam — an offline stage between `resolve` and `portscan`.** External discovery *harvests names it never
+  verifies against the authorized scope*: `expand` pulls candidates from TLS-SAN (`tlsx -san -cn`), reverse
+  DNS (`dnsx -ptr`) and `subfinder`/`assetfinder`, then `resolve` writes them all — so a SAN/PTR name on a
+  **third-party apex** (a shared cert, a cloud provider's PTR) and any IP it resolves to flowed straight into
+  the active stages. The only prior hygiene was CDN-heuristic (`naabu -exclude-cdn` + `split_cdn_ip_records`),
+  which is not authorization-based — a non-CDN third party (an ALB, a third-party apex from a SAN) passed
+  straight through. This is an RoE/legal problem (observed live: Google `142.250.x`, AWS ALB `34.x`), so the
+  gate derives an **allowlist** from the scope file and keeps only authorized assets. **Membership (four
+  rules, in `core/scope.py`):** an asset is in scope if (1) its name is an exact `domain`/`url` host (a bare
+  `acme.com` authorizes itself, NOT `app.acme.com`); (2) its name matches a `*.apex` wildcard (apex + every
+  depth); (3) its IP is inside an explicit scope `net` (`ip`/`cidr`); or (4) its resolved IP is inside an
+  explicit scope `net` — the **IP→names pivot** that recovers SAN/PTR/vhost names on an IP-only scope (a
+  common external PT where the client gives IPs and no DNS; a naive domain allowlist would drop every
+  recovered name). *Decisions:* (a) a recovered name resolving **off** the authorized IPs is dropped (no
+  Host-header/SNI pinning in v1); (b) recovering a name does **not** auto-expand to its apex; and
+  **anti-transitivity** — rule 4 uses ONLY the explicitly-listed nets, so domain-derived IPs are scanned but
+  never authorize further names (otherwise domain→IP→new-names→new-IPs would chain-expand scope). *Why offline
+  / complements CDN filters:* the gate makes no target traffic (`net=False`) — it keeps domain-derived IPs in
+  the set and lets the existing `naabu -exclude-cdn`/`split_cdn_ip_records` drop the CDN ones, so it needs no
+  CDN classification of its own. *Why a new stage + `inscope_*` files (not overwrite in place):* write-once —
+  `scope_gate` is the **single writer** of `inscope_subdomains.txt`/`inscope_tls_names.txt`/`inscope_ips.txt`/
+  `inscope_domain_ip_map.txt` + the RoE audit `excluded_out_of_scope.jsonl`; `expand`/`resolve` keep writing
+  their raw discovery record, and the active stages (`portscan`/`portscan_full`/`httpx`/`nuclei_scope` + the
+  CVE software collector's `domain_ip_map` read) are rewired to read the `inscope_*` set. An **empty allowlist**
+  (malformed/empty scope) drops everything and logs a WARNING rather than silently scanning all-or-nothing.
+  *Why no PSL/`tldextract`:* the confirmed semantics need only exact-match + suffix-match + stdlib `ipaddress`
+  — so `classify` was also tightened to be IPv6-aware and reject bad octets (`999.0.0.1` → `domain`) instead of
+  the old IPv4-only regexes. *Scope of change:* external only — `webscan` (uses `ingest`, not `expand`/`resolve`)
+  and `internal` (its own IP/CIDR model) are untouched. *Rejected:* Host-header/SNI pinning to scan a recovered
+  name against a specific authorized IP when public DNS diverges (v1 drops it — roadmap); a zero-traffic early
+  `cdncheck` on `unique_ips.txt` (marginal over `naabu -exclude-cdn`); opt-in apex auto-expansion of recovered
+  hosts; the PSL/`tldextract` dependency (unneeded). See
+  `docs/superpowers/specs/2026-07-05-scope-gate-design.md`.
 
 - **Cross-group discovered surface reaches phase 2, not only phase 4 — via a per-app `xref_catalog`
   stage, made race-free by the loop barrier.** The 2026-07-04 cross-group routing (`_cross_group_surface`)
