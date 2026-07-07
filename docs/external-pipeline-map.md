@@ -15,7 +15,7 @@ expand["expand<br>mapcidr -silent                                  # espande i C
 resolve["resolve<br>shuffledns -mode resolve -r resolvers-trusted    # fallback: dnsx -silent<br>dnsx -a -resp-only -silent                       # → unique_ips<br>dnsx -a -resp -nc -silent                        # → domain_ip_map"]
 scope_gate["scope_gate  ·  net=False<br># build_allowlist(scope_init) + filter_assets(subdomains + tls_names, domain_ip_map, unique_ips)<br># offline (net=False) · complementa naabu -exclude-cdn / split_cdn_ip_records (niente check CDN qui)"]
 portscan["portscan<br>naabu -p &lt;~250 WEB_PORTS&gt; -exclude-cdn -c 50 -rate 1000   # rate=profilo<br># → honeypot_split (≥15 porte aperte = honeypot) + select_web_ports"]
-httpx["httpx<br>httpx -sc -cl -td -title -ip -hash sha256<br>      -favicon -location -fr -irh -j<br>split_cdn_ip_records → drop bare-IP CDN/cloud/WAF (→ excluded_cdn.jsonl)"]
+httpx["httpx<br>httpx -sc -cl -td -title -ip -hash sha256<br>      -favicon -location -fr -irh -nf -j   # -nf: probe http+https (alt TLS ports)<br>split_cdn_ip_records → drop bare-IP CDN/cloud/WAF (→ excluded_cdn.jsonl)"]
 end
 scope -.->|∥ offline| provision_wl
 scope --> expand

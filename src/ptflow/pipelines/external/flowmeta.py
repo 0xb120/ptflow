@@ -79,7 +79,7 @@ FLOWMETA: dict[str, StepMeta] = {
         summary="Fingerprint HTTP + segnali per il cluster (favicon, body-hash, redirect-final, header). "
                 "Scope hygiene: scarta le probe by-IP di infra CDN/cloud/WAF (tiene gli hostname).",
         commands=("httpx -sc -cl -td -title -ip -hash sha256",
-                  "      -favicon -location -fr -irh -j",
+                  "      -favicon -location -fr -irh -nf -j   # -nf: probe http+https (alt TLS ports)",
                   "split_cdn_ip_records → drop bare-IP CDN/cloud/WAF (→ excluded_cdn.jsonl)"),
         outputs=("httpx_full_metadata.jsonl", "unique_webapps.txt", "excluded_cdn.jsonl"),
         notes=("legge solo il set web veloce (naabu_web.txt) — il full-port è spanning",

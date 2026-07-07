@@ -27,7 +27,7 @@ _TRUE = {"1", "on", "true", "yes"}
 _ENUMS = {
     "PTFLOW_PROFILE": ("wide", "home"),
     "PTFLOW_RECRAWL": ("off", "preview", "on"),
-    "PTFLOW_AI_PROVIDER": ("anthropic",),
+    "PTFLOW_AI_PROVIDER": ("claude-code", "openai"),
 }
 _ROLES_PREFIX = "wordlists.roles."   # dynamic: wordlists.roles.<role> → PTFLOW_WL_<ROLE>
 _STEPS_PREFIX = "steps."   # dynamic: steps.<pipeline>.<step> → per-step on/off (filters pipeline.stages)

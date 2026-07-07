@@ -961,17 +961,22 @@ flow changed:
   (50 vs 150) and feroxbuster `-t`/`-L`, for a domestic line. Aggregate load ≈ concurrency × rate,
   so the per-tool rate is the real lever (a `net` concurrency cap alone won't tame the single
   full-port/nuclei stages). The active profile is logged at run start (preflight).
-- **AI layer (opt-in, `--ai` / `PTFLOW_AI=on`)** — adds four best-effort LLM stages via the
-  `core/ai/` seam (`LLMClient` + `AnthropicClient`, Anthropic Messages API, `claude-opus-4-8` default;
-  `anthropic` is the OPTIONAL `ai` extra, imported lazily). Key via the standard `ANTHROPIC_API_KEY` /
-  `ant` profile — NOT a ptflow knob. Stages: `ai_wordlist` (phase 2 → `wl_custom/ai_seed.txt`, folded
-  by `build_content_wordlist`), `ai_secret_triage` (phase 4 → sidecar `findings/secrets_triage.jsonl`),
+- **AI layer (opt-in, `--ai` / `PTFLOW_AI=on`)** — adds four best-effort LLM stages via a
+  **provider-agnostic** `core/ai/` seam (`LLMClient` Protocol + `make_client()`). Two backends,
+  selected by **`PTFLOW_AI_PROVIDER`**: **`claude-code`** (default) drives the Claude Code Agent
+  SDK on the operator's own subscription — auth via `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`)
+  or `ANTHROPIC_API_KEY` — and **requires the `claude` CLI on PATH**; **`openai`** talks to any
+  OpenAI-compatible endpoint (Ollama local/cloud, OpenRouter, …) via `PTFLOW_AI_BASE_URL` +
+  **`PTFLOW_AI_MODEL` (required for this provider)** + `OPENAI_API_KEY`. Structured output is
+  **hybrid**: native schema support first, falling back to prompt+validate+retry for models (e.g.
+  local Ollama) that don't support one. `claude-agent-sdk` + `openai` are the OPTIONAL `ai` extra,
+  imported lazily. Stages: `ai_wordlist` (phase 2 → `wl_custom/ai_seed.txt`, folded by
+  `build_content_wordlist`), `ai_secret_triage` (phase 4 → sidecar `findings/secrets_triage.jsonl`),
   `ai_triage` (revives the agent seam → `findings/hypotheses.jsonl`, correlating consolidated findings),
   `ai_report` (terminal `report()` hook → `report.md`). All `net=False`, additive, failure-isolated;
-  with AI off, `ExternalPipeline.stages` is byte-identical to the deterministic default. Knobs:
-  `PTFLOW_AI_MODEL` / `PTFLOW_AI_BASE_URL` (Anthropic-compatible gateways/Bedrock/Vertex) /
-  `PTFLOW_AI_PROVIDER` (v1: `anthropic`). Roadmap: `ai_mine_bodies`, `ai_cve_rank`, `ai_param_values`,
-  native non-Anthropic provider (see `docs/superpowers/specs/2026-07-04-ai-layer-design.md`).
+  with AI off, `ExternalPipeline.stages` is byte-identical to the deterministic default. Roadmap:
+  `ai_mine_bodies`, `ai_cve_rank`, `ai_param_values` (see
+  `docs/superpowers/specs/2026-07-04-ai-layer-design.md`).
 - **Authorized test scope only:** `https://ginandjuice.shop/` (PortSwigger demo), `scanme.nmap.org`
   (Nmap-sanctioned).
 
@@ -1298,7 +1303,7 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
   fed bare hosts, defaults to https, and *ignores the input scheme* — and its Go TLS happily
   handshakes a legacy endpoint (unsafe renegotiation / weak DH) that rustls/OpenSSL scanners refuse,
   so `hosts.txt` came out `https://` and feroxbuster/arjun/x8 then reached **nothing** (`-k` is
-  cert-only; no flag fixes it). Two complementary mechanisms fix this. **(1) Honor an explicit scope
+  cert-only; no flag fixes it). Three complementary mechanisms fix this. **(1) Honor an explicit scope
   scheme:** `cluster` re-applies the operator's `http://`/`https://` onto the group's hosts
   (`_scheme_pins` + `force_scheme`), at OUTPUT only — clustering keys on scheme-independent signals
   and the id anchor on `url_host`, so pinning never shifts a group/`app_id`. **(2) Reach the working
@@ -1308,10 +1313,21 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
   and retries the round over http; param_fuzz can't do the same reactively (arjun/x8 fail the
   handshake **silently** — no signal, indistinguishable from a clean 0-param result), so it instead
   routes targets to the empirically-reached scheme (`_working_schemes`: `hosts.txt` scheme overridden
-  by `content_discovery.jsonl` hit URLs, which already carry feroxbuster's http fallback). *Why not
-  `-nfs`/`-nf` on httpx:* `-nfs` (honor input scheme) flips *every* schemeless discovered host to
-  http (kills the https default) and `-nf` (probe both) doubles breadth records yet still can't tell
-  the scheme that works for the *scanners* (httpx's https probe succeeds regardless). *Why not a
+  by `content_discovery.jsonl` hit URLs, which already carry feroxbuster's http fallback). **(3) Probe
+  BOTH schemes in breadth (`httpx -nf`):** the breadth fingerprint runs httpx with `-no-fallback`, so
+  every host:port is probed over http AND https — not just the first that answers. Without it an
+  HTTPS-only alt port (a UniFi/Tomcat admin console on :8443/:8843) is silently missed: httpx probes
+  `http://host:port`, the TLS server returns 400 to the plaintext request (a *valid* HTTP response, so
+  the http→https fallback never fires), and the real webapp never enters `httpx_full_metadata.jsonl`.
+  This CORRECTS the earlier "httpx's https probe succeeds regardless" assumption — true for schemeless
+  hostnames (where the https default works), FALSE for alt ports answering http with a 400 (verified on
+  a live UniFi controller: default → `http://:8443` 400 only; `-nf` → also `https://:8443` 302). `-nf`
+  doubles a record only when both schemes genuinely respond (a plain-http :8080 stays single); `cluster()`
+  reads the full metadata (not the deduped `unique_webapps.txt`), so the recovered https record is
+  clustered/crawled with the right scheme, and `-fr` follows its redirect so it keeps a distinct
+  signature. *Why not `-nfs` on httpx:* `-nfs` (honor input scheme) flips *every* schemeless discovered
+  host to http (kills the https default) — it's right only for `webscan`'s ingest, where every target
+  carries an explicit scheme. *Why not a
   curl/openssl preflight probe:* extra per-host network cost on the healthy path; the reactive
   detect-and-fallback pays only on actual failure. *Rejected:* leaving it to `-k` (cert-only, no
   effect); `OPENSSL_CONF` legacy-renegotiation (feroxbuster is rustls, unaffected; the server also

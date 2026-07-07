@@ -13,7 +13,8 @@ ptflow = "ptflow.cli:main"
 
 [project.optional-dependencies]
 ai = [
-    "anthropic>=0.116.0",
+    "claude-agent-sdk>=0.2.110",
+    "openai>=2.44.0",
 ]
 
 [build-system]
