@@ -1892,8 +1892,13 @@ def httpx_fingerprint(activity: Activity) -> None:
     ]))
     out = _run(
         "httpx",
+        # -nf (no-fallback) probes BOTH http and https, not just the first that answers. Without it an
+        # HTTPS-only alt port (a UniFi/Tomcat admin console on :8443/:8843) is missed: httpx probes
+        # http://host:port, the TLS server answers 400 to the plaintext request — a *valid* HTTP
+        # response, so the fallback to https never fires and the real webapp stays invisible. -nf only
+        # doubles a record when both schemes genuinely respond (a plain-http :8080 stays single).
         [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
-         "-favicon", "-location", "-fr", "-irh", "-j"],
+         "-favicon", "-location", "-fr", "-irh", "-nf", "-j"],
         stdin=httpx_input, dest=activity.asset_discovery_raw("httpx") / "fingerprint.jsonl",
         label="fingerprint",
     )
