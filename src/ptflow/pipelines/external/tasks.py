@@ -83,11 +83,12 @@ NAABU_CONC = PROFILE.naabu_conc
 HONEYPOT_MIN_OPEN_PORTS = 15      # >= this many open ports => suspected honeypot
 RESOLVERS = "/opt/resolvers/resolvers-trusted.txt"
 
-# Curated WEB ports for the FAST portscan (feeds httpx -> cluster). 250 distinct HTTP(S)-bearing
+# Curated WEB ports for the FAST portscan. 250 distinct HTTP(S)-bearing
 # ports: union of aquatone-xlarge, hosting-panels, 8xxx alt-HTTP, app/dev servers, data/ops UIs,
 # containers, IoT/devices, proxies. NOT nmap's generic top-1k - so httpx sees web apps on uncommon
 # ports (5601/8161/9200/7001/...) that top-1k misses, while staying fast. Non-web ports (SSH/DB/SMB/
-# RDP) are deliberately absent - portscan_full (full 65535, spanning) + nerva cover those.
+# RDP) are deliberately absent. The pre-cluster full scan supplies every additional open port to
+# httpx and nerva, so uncommon HTTP services cannot appear too late for the application loops.
 WEB_PORTS = (
     "80,81,82,83,84,85,86,87,88,89,90,280,300,443,591,593,631,777,832,880,888,981,1010,"
     "1024,1080,1311,2052,2053,2080,2082,2083,2086,2087,2095,2096,2222,2375,2376,2379,2380,"
@@ -568,22 +569,160 @@ def honeypot_split(naabu_lines: list[str], threshold: int = HONEYPOT_MIN_OPEN_PO
 
 def select_web_ports(naabu_lines: list[str], valid_ips: list[str]) -> list[str]:
     """Open `ip:port` lines on the VALID (non-honeypot) IPs — the FAST web target set httpx probes,
-    so the full 65535-port scan can move off the breadth critical path (it becomes spanning). Pure."""
+    while the full 65535-port scan supplies the exhaustive pre-cluster target set. Pure."""
     valid = set(valid_ips)
     return [ln for ln in naabu_lines if ":" in ln and ln.rsplit(":", 1)[0] in valid]
 
 
+def _url_authority(url: str) -> str:
+    """Normalized URL authority while preserving an explicitly-written port."""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return ""
+        rendered = f"[{host}]" if ":" in host else host
+    except ValueError:
+        return ""
+    else:
+        return f"{rendered}:{parsed.port}" if parsed.port is not None else rendered
+
+
+def _service_socket(record: Mapping[str, Any]) -> tuple[str, int | str] | None:
+    """Scheme-independent network socket for an httpx record.
+
+    ``httpx -nf`` deliberately emits both HTTP and HTTPS observations.  On an
+    HTTPS-only port the HTTP observation is commonly a synthetic 400 response;
+    grouping by host + effective port lets us keep the best response for that
+    physical service without conflating another app on a different port.
+    """
+    raw = str(record.get("url") or "")
+    try:
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return None
+        port: int | str = parsed.port or {"http": 80, "https": 443}.get(parsed.scheme.lower(), "")
+    except ValueError:
+        return None
+    else:
+        return host, port
+
+
+def _terminal_url(record: Mapping[str, Any], pins: Mapping[str, str] | None = None) -> str:
+    """The reached URL for a record, preferring httpx's redirect-final URL.
+
+    A final URL is already direct network evidence and wins over an operator
+    scheme pin.  Pins are a compatibility fallback for records produced from a
+    discovery input whose scheme httpx rewrote; they are authority-scoped, so a
+    pin for ``host:3552`` can never rewrite the same host on 443.
+    """
+    raw = str(record.get("url") or "")
+    final = str(record.get("final_url") or "")
+    if final.startswith(("http://", "https://")):
+        return final
+    if not raw or not pins:
+        return raw
+    scheme = pins.get(_url_authority(raw))
+    if not scheme or "://" not in raw:
+        return raw
+    return f"{scheme}://{raw.split('://', 1)[1]}"
+
+
+def _origin_identity(url: str) -> tuple[str, str, int | str] | None:
+    """Redirect/clustering identity that distinguishes non-default ports."""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        scheme = parsed.scheme.lower()
+        if not host or scheme not in {"http", "https"}:
+            return None
+        port: int | str = parsed.port or {"http": 80, "https": 443}[scheme]
+    except ValueError:
+        return None
+    else:
+        return scheme, host, port
+
+
+def _httpx_record_rank(record: Mapping[str, Any], pins: Mapping[str, str] | None = None) -> tuple:
+    """Deterministic preference order for aliases of one HTTP service.
+
+    Prefer a reached 2xx response, then 3xx/auth responses, a direct canonical
+    record, a named host and HTTPS.  The terminal URL is the stable tie-breaker.
+    """
+    try:
+        status = int(record.get("status_code") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if 200 <= status < 300:  # noqa: PLR2004
+        status_rank = 0
+    elif 300 <= status < 400:  # noqa: PLR2004
+        status_rank = 1
+    elif status in {401, 403}:
+        status_rank = 2
+    else:
+        status_rank = 3
+    terminal = _terminal_url(record, pins)
+    raw = str(record.get("url") or "")
+    direct = terminal.rstrip("/") == raw.rstrip("/")
+    host = urlsplit(terminal).hostname or "" if terminal else ""
+    return (
+        status_rank,
+        0 if direct else 1,
+        0 if host and not is_ip(host) else 1,
+        0 if terminal.startswith("https://") else 1,
+        terminal,
+    )
+
+
+def select_httpx_services(httpx_records: Iterable[dict]) -> list[dict]:
+    """Keep one best observation per host+port service from httpx's dual-scheme output."""
+    buckets: dict[tuple[str, int | str], list[dict]] = {}
+    unknown: list[dict] = []
+    order: list[tuple[str, int | str]] = []
+    for record in httpx_records:
+        if not record.get("url"):
+            continue
+        socket = _service_socket(record)
+        if socket is None:
+            unknown.append(record)
+            continue
+        if socket not in buckets:
+            buckets[socket] = []
+            order.append(socket)
+        buckets[socket].append(record)
+    return [*(min(buckets[s], key=_httpx_record_rank) for s in order), *unknown]
+
+
+def merge_httpx_records(*record_sets: Iterable[dict]) -> list[dict]:
+    """Merge multiple httpx invocations by observed URL, retaining the strongest response."""
+    by_url: dict[str, dict] = {}
+    order: list[str] = []
+    for records in record_sets:
+        for record in records:
+            url = str(record.get("url") or "")
+            if not url:
+                continue
+            if url not in by_url:
+                by_url[url] = record
+                order.append(url)
+            elif _httpx_record_rank(record) < _httpx_record_rank(by_url[url]):
+                by_url[url] = record
+    return [by_url[url] for url in order]
+
+
 def select_unique_webapps(httpx_records: list[dict]) -> list[str]:
-    """Dedup httpx records by (Title, Content-Length, Webserver); return their URLs."""
-    seen: set[tuple] = set()
-    out: list[str] = []
-    for r in httpx_records:
-        key = (r.get("title"), r.get("content_length"), r.get("webserver"))
-        if key not in seen:
-            seen.add(key)
-            if r.get("url"):
-                out.append(r["url"])
-    return out
+    """Dedup by root signature and return the best reached/canonical URL for each app."""
+    buckets: dict[tuple, list[dict]] = {}
+    order: list[tuple] = []
+    for record in select_httpx_services(httpx_records):
+        key = (record.get("title"), record.get("content_length"), record.get("webserver"))
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(record)
+    selected = [_terminal_url(min(buckets[key], key=_httpx_record_rank)) for key in order]
+    return tools.dedupe(selected)
 
 
 def url_host(url: str) -> str:
@@ -1731,7 +1870,12 @@ def _app_id(anchor_key: str, anchor_value: str) -> str:
     the full anchor preserves identity — two groups can't share an anchor, so the dir name is stable
     across runs and never collides (even when the slug repeats, e.g. two ``appspot.com`` apps).
     Filesystem-safe. NOT derived from a mutable host/title string — only the stable cluster anchor."""
-    readable = anchor_value.split("@", 1)[-1] if anchor_key == "favicon" else anchor_value
+    if anchor_key == "favicon":
+        readable = anchor_value.split("@", 1)[-1]
+    elif anchor_key == "origin":
+        readable = url_host(anchor_value)
+    else:
+        readable = anchor_value
     digest = hashlib.sha1(f"{anchor_key}:{anchor_value}".encode()).hexdigest()[:8]  # noqa: S324
     return f"{_slug(readable)}-{digest}"
 
@@ -1891,15 +2035,14 @@ def scope_gate(activity: Activity) -> None:
 
 
 def portscan(activity: Activity) -> None:
-    """Phase 3 — FAST web-port scan: WEB_PORTS → honeypot filter → naabu_web.txt (the web target set
-    httpx probes). Reads inscope_ips.txt; writes honeypots.txt + naabu_web.txt (canonical).
+    """Phase 3 — FAST web-port scan: WEB_PORTS → honeypot filter → naabu_web.txt.
 
     Scans the curated ~250 HTTP(S)-bearing ports (WEB_PORTS), NOT nmap's generic top-1k — so httpx
     sees web apps on uncommon ports (5601/8161/9200/7001/…) that top-1k would miss, while staying
-    fast. The expensive full 65535-port scan is split into the SPANNING `portscan_full` stage so it
-    no longer serializes in front of httpx→cluster→loops (the observed ~15-min breadth block);
-    non-web ports are picked up there ∥ in the background (→ nerva). The naabu stdout is provenance
-    (raw/naabu/), consumed in memory by honeypot_split/select_web_ports."""
+    fast. The full scan follows this cheap pass and remains behind the pre-cluster barrier: correctness
+    requires every late open port to be available to httpx/nerva before application grouping begins.
+    The naabu stdout is provenance (raw/naabu/), consumed in memory by
+    honeypot_split/select_web_ports."""
     canon = activity.asset_discovery_canonical
     unique_ips = tools.read_lines(canon("inscope_ips.txt"))
     scanned = _lines(
@@ -1913,11 +2056,11 @@ def portscan(activity: Activity) -> None:
 
 
 def portscan_full(activity: Activity) -> None:
-    """SPANNING — full 65535-port scan on the valid (non-honeypot) IPs → naabu_full.txt, which feeds
-    nerva (non-HTTP service fingerprint). Launched after `portscan`, runs ∥ clustering + the per-app
-    loops, joined at the fan-in — off the critical path, since breadth→cluster→loops only needs the
-    fast top-1k web set (naabu_web.txt). Recomputes the valid set from disk (inscope_ips.txt minus
-    honeypots) — only strings cross the stage boundary."""
+    """Full 65535-port scan on valid IPs → naabu_full.txt for pre-cluster httpx + nerva.
+
+    Recomputes the valid set from disk (inscope_ips.txt minus honeypots). This stage intentionally sits
+    on the breadth barrier: a service discovered here must not miss clustering and all per-app loops.
+    """
     canon = activity.asset_discovery_canonical
     honeypots = set(tools.read_lines(canon("honeypots.txt")))
     valid = [ip for ip in tools.read_lines(canon("inscope_ips.txt")) if ip not in honeypots]
@@ -1929,7 +2072,9 @@ def portscan_full(activity: Activity) -> None:
 def httpx_fingerprint(activity: Activity) -> None:
     """Phase 4a — HTTP fingerprinting (httpx) → httpx_full_metadata.jsonl + unique_webapps.txt.
 
-    Independent of nerva, so the two fingerprint stages run in parallel. SCOPE HYGIENE: httpx flags
+    Runs after the full scan and in parallel with nerva. Explicit scope URLs are probed separately with
+    ``-nfs`` so their scheme, port and path are honored verbatim; discovered names/ports use ``-nf`` to
+    try both HTTP and HTTPS. SCOPE HYGIENE: httpx flags
     CDN/cloud/WAF hosts (cdncheck), and split_cdn_ip_records drops the raw-IP probes of that shared
     PROVIDER infra (out of scope — the IP is the provider's, not the target's) while KEEPING the
     CDN-fronted hostnames and any explicitly-in-scope IP. So the raw httpx dump (everything probed)
@@ -1938,13 +2083,14 @@ def httpx_fingerprint(activity: Activity) -> None:
     deliverable excluded_cdn.jsonl (RoE evidence of what we deliberately skipped).
     """
     canon = activity.asset_discovery_canonical
-    httpx_input = "\n".join(tools.dedupe([
+    discovery_input = "\n".join(tools.dedupe([
         *tools.read_lines(canon("inscope_tls_names.txt")),
         *tools.read_lines(canon("inscope_subdomains.txt")),
-        *tools.read_lines(canon("naabu_web.txt")),  # fast top-1k web set (full scan is now spanning)
+        *tools.read_lines(canon("naabu_web.txt")),
+        *tools.read_lines(canon("naabu_full.txt")),
         *tools.read_lines(canon("honeypots.txt")),
     ]))
-    out = _run(
+    discovery_out = _run(
         "httpx",
         # -nf (no-fallback) probes BOTH http and https, not just the first that answers. Without it an
         # HTTPS-only alt port (a UniFi/Tomcat admin console on :8443/:8843) is missed: httpx probes
@@ -1953,11 +2099,23 @@ def httpx_fingerprint(activity: Activity) -> None:
         # doubles a record when both schemes genuinely respond (a plain-http :8080 stays single).
         [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
          "-favicon", "-location", "-fr", "-irh", "-nf", *_header_flags("-H"), "-j"],
-        stdin=httpx_input, dest=activity.asset_discovery_raw("httpx") / "fingerprint.jsonl",
+        stdin=discovery_input, dest=activity.asset_discovery_raw("httpx") / "fingerprint.jsonl",
         label="fingerprint",
     )
-    records = _jsonl_str(out)  # tolerant: a stray non-JSON line from httpx must not crash this CORE stage
-    kept, dropped = split_cdn_ip_records(records, set(tools.read_lines(activity.scope_ip)))
+    explicit_urls = tools.read_lines(activity.scope_urls)
+    explicit_out = _run(
+        "httpx",
+        [HTTPX, "-silent", "-nfs", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
+         "-favicon", "-location", "-fr", "-irh", *_header_flags("-H"), "-j"],
+        stdin="\n".join(explicit_urls),
+        dest=activity.asset_discovery_raw("httpx") / "scope_urls.jsonl", label="scope_urls",
+    )
+    # Tolerant parsers: a stray non-JSON line from either httpx run must not crash this CORE stage.
+    records = merge_httpx_records(_jsonl_str(explicit_out), _jsonl_str(discovery_out))
+    explicit_ips = {url_host(url) for url in explicit_urls if is_ip(url_host(url))}
+    kept, dropped = split_cdn_ip_records(
+        records, { *tools.read_lines(activity.scope_ip), *explicit_ips },
+    )
     tools.write_jsonl(canon("httpx_full_metadata.jsonl"), kept)
     tools.write_jsonl(canon("excluded_cdn.jsonl"), dropped)
     telemetry.record_drop("cdn_ip_targets", len(dropped))
@@ -2035,7 +2193,8 @@ def _cluster_signals(record: dict) -> dict:
     no edge. The fuzzy app-fingerprint signals (fav, sig) are APEX-SCOPED — keyed by (value,
     apex) — so they can never merge across organizations, only sibling subdomains of one apex.
     """
-    host = url_host(record.get("url") or "")
+    terminal = _terminal_url(record)
+    host = url_host(terminal or record.get("url") or "")
     apex_of = apex(host)
     digests = record.get("hash") or {}
     favicon = record.get("favicon")
@@ -2046,7 +2205,11 @@ def _cluster_signals(record: dict) -> dict:
     signature = f"{title}|{record.get('content_length')}|{server}"
     return {
         "host": host, "apex": apex_of,
-        "final": host or None,                              # GLOBAL, safe: redirect-converged final host
+        # Same host on different ports is not automatically the same app. `socket` only collapses
+        # httpx's dual-scheme observations of one physical host:port; `final` joins aliases that
+        # actually converged on the same redirect-final origin.
+        "socket": _service_socket(record),
+        "final": _origin_identity(terminal),
         "body": body or None,                               # GLOBAL, safe: identical 2xx/3xx bytes (demoted)
         "fav": (favicon, apex_of) if favicon else None,     # apex-scoped app fingerprint
         "sig": (signature, apex_of) if (title or server) else None,  # apex-scoped, non-blank only
@@ -2054,9 +2217,10 @@ def _cluster_signals(record: dict) -> dict:
 
 
 # Only APP-IDENTITY edges. Dropped vs the first v2: `cert` and `iht` (ip+header+tech) — those are
-# INFRASTRUCTURE (one cert / one box routinely fronts distinct apps) and over-merge. `final`+`body`
-# are cross-apex safe; `fav`+`sig` are apex-scoped so they never merge across organizations.
-_CLUSTER_EDGES = ("final", "body", "fav", "sig")
+# INFRASTRUCTURE (one cert / one box routinely fronts distinct apps) and over-merge. `socket` only
+# joins the http/https views of one host+effective-port, `final`+`body` are cross-apex safe;
+# `fav`+`sig` are apex-scoped so they never merge across organizations.
+_CLUSTER_EDGES = ("socket", "final", "body", "fav", "sig")
 
 
 def _connected_components(n: int, to_union: list[list[int]]) -> list[list[int]]:
@@ -2103,32 +2267,43 @@ def cluster_partition(records: list[dict]) -> list[list[int]]:
 
 
 def _cluster_anchor(members: list[dict]) -> tuple[str, str]:
-    """Stable, collision-free id anchor for a group: plurality (favicon, apex), else host.
+    """Stable, collision-free id anchor: plurality (favicon, apex), else reached origin.
 
     A (favicon, apex) pair is unique across groups — two groups sharing it would have merged via
     the apex-scoped favicon edge — and intrinsic, so it stays stable when a minority member joins
-    or leaves. Failing that, a host is in exactly one group, so plurality host is also unique.
-    Ties broken deterministically (highest count, then value).
+    or leaves. The origin includes scheme + effective port, so two independent apps on the same
+    hostname cannot collide. Ties are broken deterministically (highest count, then value).
     """
     sigs = [_cluster_signals(r) for r in members]
     favs = Counter(s["fav"] for s in sigs if s["fav"])  # keys are (favicon, apex)
     if favs:
         favicon, apex_of = max(favs, key=lambda k: (favs[k], k))
         return "favicon", f"{favicon}@{apex_of}"
+    origins = Counter(s["final"] for s in sigs if s["final"])
+    if origins:
+        scheme, host, port = max(origins, key=lambda v: (origins[v], v))
+        rendered = f"[{host}]" if ":" in host else host
+        return "origin", f"{scheme}://{rendered}:{port}"
     hosts = Counter(s["host"] for s in sigs)
     return "host", max(hosts, key=lambda v: (hosts[v], v))
 
 
 def _scheme_pins(activity: Activity) -> dict[str, str]:
-    """Bare host → explicit scheme for every scope entry the operator wrote WITH a scheme
-    (http://h / https://h). httpx defaults to https and ignores the input scheme, so an explicit
-    `http://` is lost by the time cluster builds hosts.txt; this re-applies it on the scan hosts."""
-    if not activity.scope.exists():
-        return {}
+    """Exact authority (host[:port]) → operator-pinned scheme from explicit scope URLs.
+
+    Port scoping is essential: ``http://h:3552`` must not rewrite ``https://h:443``. The expanded
+    scope_urls artifact is authoritative; the original scope is only a compatibility fallback for
+    unit tests/older workspaces.
+    """
+    raw_urls = tools.read_lines(activity.scope_urls)
+    if not raw_urls and activity.scope.exists():
+        raw_urls = [t.raw for t in scope.parse_scope(
+            activity.scope.read_text(encoding="utf-8", errors="replace")) if t.kind == "url"]
     pins: dict[str, str] = {}
-    for t in scope.parse_scope(activity.scope.read_text(encoding="utf-8", errors="replace")):
-        if t.kind == "url":
-            pins[url_host(t.raw)] = t.raw.split("://", 1)[0].lower()
+    for raw in raw_urls:
+        authority = _url_authority(raw)
+        if authority and "://" in raw:
+            pins[authority] = raw.split("://", 1)[0].lower()
     return pins
 
 
@@ -2143,24 +2318,34 @@ def cluster(activity: Activity) -> list[str]:
     hosts.txt. Returns the sorted app_ids.
     """
     canon = activity.asset_discovery_canonical
-    records = [r for r in tools.read_jsonl(canon("httpx_full_metadata.jsonl")) if r.get("url")]
-    pins = _scheme_pins(activity)  # honor an explicit scope scheme on the scan hosts (see _scheme_pins)
+    records = select_httpx_services(tools.read_jsonl(canon("httpx_full_metadata.jsonl")))
+    pins = _scheme_pins(activity)  # authority-scoped compatibility pins; finals remain authoritative
 
     app_ids: list[str] = []
     for idxs in cluster_partition(records):
         members = [records[i] for i in idxs]
         key, value = _cluster_anchor(members)
         app_id = _app_id(key, value)
-        rep = min(members, key=lambda r: r["url"])
-        # scheme is honored at OUTPUT only — clustering keys on scheme-independent signals
-        # (favicon/body/redirect) and the id anchor on url_host, so pinning never shifts a group/id.
-        urls = tools.dedupe(force_scheme(r["url"], pins) for r in members)
+        # Collapse redirect aliases to their reached URL and retain the strongest observation for
+        # each canonical URL. This makes a direct named-host 2xx response beat an IP redirect or the
+        # plaintext 400 emitted by an HTTPS socket, while keeping different ports distinct.
+        by_url: dict[str, tuple[str, dict]] = {}
+        for member in members:
+            reached = _terminal_url(member, pins)
+            url_key = reached.rstrip("/")
+            previous = by_url.get(url_key)
+            if previous is None or _httpx_record_rank(member, pins) < _httpx_record_rank(previous[1], pins):
+                by_url[url_key] = (reached, member)
+        selected = sorted(by_url.values(), key=lambda item: _httpx_record_rank(item[1], pins))
+        urls = [url for url, _ in selected]
+        rep = selected[0][1]
         # per-host response-body hash → lets per-app stages dedup same-backend hosts (domain+IP,
         # http+https) while keeping distinct environments (staging vs test). See dedup_by_body.
-        body_by_host = {force_scheme(r["url"], pins): (r.get("hash") or {}).get("body_sha256") for r in members}
+        body_by_host = {url: (record.get("hash") or {}).get("body_sha256")
+                        for url, record in selected}
         # raw response headers (httpx -irh) kept per host for later reasoning; header_signals is the
         # curated, gate-on-able view (cache/cdn/backend/stack/waf), unioned over the group's hosts.
-        headers_by_host = {force_scheme(r["url"], pins): (r.get("header") or {}) for r in members}
+        headers_by_host = {url: (record.get("header") or {}) for url, record in selected}
         signals = sorted({s for hdrs in headers_by_host.values() for s in header_signals(hdrs)})
         if len(urls) > CLUSTER_MAX_HOSTS:
             log.warning("⚠ cluster %s has %d hosts — possible residual collision (id_anchor=%s)",

@@ -30,12 +30,12 @@ class ExternalPipeline:
         Stage("resolve", tasks.resolve, needs=("expand",)),
         Stage("scope_gate", tasks.scope_gate, needs=("resolve",), net=False),  # RoE authorization gate
         Stage("portscan", tasks.portscan, needs=("scope_gate",)),
-        Stage("httpx", tasks.httpx_fingerprint, needs=("portscan",)),
-        # full 65535-port scan + non-HTTP fingerprint — SPANNING: ∥ clustering + all per-app loops,
-        # joined at the fan-in. httpx only needs the fast top-1k web set (naabu_web.txt), so the
-        # expensive full scan no longer serializes in front of the breadth→cluster→loops path.
-        Stage("portscan_full", tasks.portscan_full, needs=("portscan",), spanning=True),
-        Stage("nerva", tasks.nerva_fingerprint, needs=("portscan_full",), spanning=True),
+        # Correctness barrier: the full scan must complete before clustering, otherwise late web
+        # services never enter any per-app loop. httpx and nerva then fan out in parallel over the
+        # complete port set; explicit scope URLs are also fed directly to httpx by the task.
+        Stage("portscan_full", tasks.portscan_full, needs=("portscan",)),
+        Stage("httpx", tasks.httpx_fingerprint, needs=("portscan_full",)),
+        Stage("nerva", tasks.nerva_fingerprint, needs=("portscan_full",)),
         # whole-scope nuclei — spanning: runs ∥ clustering + all per-app loops, joined at the fan-in
         Stage("nuclei_scope", tasks.nuclei_scope, needs=("httpx",), spanning=True),
         # post-cluster spanning — ONE batched screenshot run (1 host/group) → unified gallery, ∥ loops

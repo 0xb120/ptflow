@@ -20,9 +20,11 @@ def test_normalize_url_drops_explicit_port():
     # a host:port is not a resolvable DNS name — the port must not leak into scope_dns
     assert scope.normalize("https://example.com:8443/admin", "url") == "example.com"
     assert scope.normalize("http://10.0.0.1:8080", "url") == "10.0.0.1"
-    # two ports on one host collapse to one resolution target (one Target after dedup)
+    # DNS normalization is shared, but explicit scan coordinates remain distinct Targets.
     text = "https://example.com:8443/\nhttps://example.com:9000/x\n"
-    assert sorted(t.normalized for t in scope.parse_scope(text)) == ["example.com"]
+    targets = scope.parse_scope(text)
+    assert [t.raw for t in targets] == ["https://example.com:8443/", "https://example.com:9000/x"]
+    assert [t.normalized for t in targets] == ["example.com", "example.com"]
 
 
 def test_target_id_stable_and_prefixed():
@@ -35,9 +37,16 @@ def test_target_id_stable_and_prefixed():
 def test_parse_scope_dedups_and_skips_comments():
     text = "example.com\n# comment\n\nhttps://example.com/path\nnmap.org\n"
     targets = scope.parse_scope(text)
-    # example.com and https://example.com/path normalize to the same host -> one target
+    # The domain is one DNS seed; the explicit URL is also retained as an exact HTTP target.
     norms = sorted(t.normalized for t in targets)
-    assert norms == ["example.com", "nmap.org"]
+    assert norms == ["example.com", "example.com", "nmap.org"]
+    assert [t.raw for t in targets] == ["example.com", "https://example.com/path", "nmap.org"]
+
+
+def test_parse_scope_dedups_exact_url_but_preserves_scheme_and_port():
+    targets = scope.parse_scope(
+        "http://example.com:3552\nhttp://example.com:3552\nhttps://example.com:443\n")
+    assert [t.raw for t in targets] == ["http://example.com:3552", "https://example.com:443"]
 
 
 def test_target_from_meta_roundtrip():

@@ -198,6 +198,19 @@ def test_select_unique_webapps_dedups_by_signature():
     assert tasks.select_unique_webapps(records) == ["https://a.example", "https://c.example"]
 
 
+def test_select_unique_webapps_prefers_final_named_2xx_and_drops_plaintext_tls_alias():
+    records = [
+        {"url": "http://10.0.0.5:443", "status_code": 400,
+         "title": "400 The plain HTTP request was sent to HTTPS port", "content_length": 264,
+         "webserver": "nginx"},
+        {"url": "https://10.0.0.5:443", "final_url": "https://app.test/", "status_code": 200,
+         "title": "App", "content_length": 100, "webserver": "nginx"},
+        {"url": "https://app.test", "status_code": 200,
+         "title": "App", "content_length": 100, "webserver": "nginx"},
+    ]
+    assert tasks.select_unique_webapps(records) == ["https://app.test"]
+
+
 def test_pipeline_object_shape():
     from ptflow.pipelines.external.pipeline import PIPELINE
 
@@ -209,10 +222,12 @@ def test_pipeline_object_shape():
     cluster_scope = [s.name for s in PIPELINE.stages if s.cluster_scope]
     checkpoints = [s.name for s in PIPELINE.stages if s.after_phase is not None]
     app = [s.name for s in PIPELINE.stages if s.per_app]
-    # full-port scan + nerva are now SPANNING (off the breadth critical path); httpx needs only
-    # the fast top-1k web set, so the breadth chain stops at httpx.
-    assert activity == ["provision_wl", "expand", "resolve", "scope_gate", "portscan", "httpx"]
-    assert spanning == ["portscan_full", "nerva", "nuclei_scope"]
+    # Full-port + service fingerprints are a correctness barrier before cluster. Only the
+    # whole-scope nuclei pass remains spanning over the per-app loops.
+    assert activity == [
+        "provision_wl", "expand", "resolve", "scope_gate", "portscan", "portscan_full", "httpx", "nerva",
+    ]
+    assert spanning == ["nuclei_scope"]
     assert cluster_scope == ["screenshot"]  # batched screenshot, post-cluster ∥ the loops
     assert checkpoints == ["surface_checkpoint"]
     assert app == [
@@ -224,11 +239,11 @@ def test_pipeline_object_shape():
         "cve_lookup_full", "tech_vulnscan",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
-    # httpx is the breadth tail; the expensive full scan runs ∥ as a spanning chain → nerva
-    assert by_name["httpx"].needs == ("portscan",)
-    assert by_name["portscan_full"].spanning is True
+    # httpx/nerva both consume the complete pre-cluster port set.
+    assert by_name["httpx"].needs == ("portscan_full",)
+    assert by_name["portscan_full"].spanning is False
     assert by_name["portscan_full"].needs == ("portscan",)
-    assert by_name["nerva"].spanning is True
+    assert by_name["nerva"].spanning is False
     assert by_name["nerva"].needs == ("portscan_full",)
     # whole-scope nuclei is spanning: starts after httpx, runs ∥ cluster + per-app, joins at fan-in
     assert by_name["nuclei_scope"].spanning is True
@@ -763,6 +778,54 @@ def test_cluster_honors_explicit_scope_scheme(tmp_path):
     assert hosts == ["http://zero.example.com", "https://api.example.net", "https://shop.example.org"]
 
 
+def test_cluster_scope_scheme_pin_is_port_scoped(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    tools.write_lines(act.scope_urls, ["http://app.test:3552"])
+    tools.write_jsonl(
+        act.asset_discovery_canonical("httpx_full_metadata.jsonl"),
+        [
+            {"url": "https://app.test", "status_code": 200, "title": "Main",
+             "content_length": 100, "webserver": "nginx"},
+            {"url": "http://app.test:3552", "status_code": 200, "title": "Agent",
+             "content_length": 200, "webserver": "python"},
+        ],
+    )
+    tasks.cluster(act)
+    hosts = sorted(h for app in act.list_apps() for h in tools.read_lines(app.hosts))
+    assert hosts == ["http://app.test:3552", "https://app.test"]
+
+
+def test_cluster_uses_direct_final_2xx_as_canonical_and_preserves_port(tmp_path):
+    from ptflow.core import tools, workspace
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("demo", root=tmp_path).ensure()
+    body = {"hash": {"body_sha256": "same"}}
+    tools.write_jsonl(
+        act.asset_discovery_canonical("httpx_full_metadata.jsonl"),
+        [
+            {"url": "http://10.0.0.5:443", "status_code": 400,
+             "title": "400 The plain HTTP request was sent to HTTPS port", "content_length": 264,
+             "webserver": "nginx"},
+            {"url": "https://10.0.0.5:443", "final_url": "https://app.test:8443/",
+             "status_code": 200, "title": "App", "content_length": 100,
+             "webserver": "nginx", **body},
+            {"url": "https://app.test:8443", "status_code": 200, "title": "App",
+             "content_length": 100, "webserver": "nginx", **body},
+        ],
+    )
+
+    [app_id] = tasks.cluster(act)
+    meta = workspace.read_meta(act.app(app_id).meta)
+    assert tools.read_lines(act.app(app_id).hosts) == ["https://app.test:8443"]
+    assert meta["status_code"] == 200
+    assert meta["title"] == "App"
+    assert meta["hosts"] == ["https://app.test:8443"]
+
+
 def test_working_schemes_prefers_content_discovery_over_hosts(tmp_path):
     from ptflow.core import tools
     from ptflow.core.paths import AppWorkspace
@@ -1227,6 +1290,44 @@ def test_auth_headers_are_webscan_only(monkeypatch):
 def _has_header_flags(cmd: list[str], flag: str) -> bool:
     want = [flag, "Cookie: s=1", flag, "Authorization: Bearer x"]
     return any(cmd[i:i + len(want)] == want for i in range(len(cmd) - len(want) + 1))
+
+
+def test_httpx_fingerprint_reads_explicit_urls_and_full_scan_ports(monkeypatch, tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_run(cmd, **kwargs):
+        stdin = kwargs.get("stdin") or ""
+        calls.append((list(cmd), stdin))
+        if "-nfs" in cmd:
+            return json.dumps({
+                "url": "http://app.test:3552", "status_code": 200, "title": "Agent",
+                "content_length": 20, "webserver": "python",
+            }) + "\n"
+        return json.dumps({
+            "url": "http://10.0.0.5:9999", "status_code": 200, "title": "Late",
+            "content_length": 10, "webserver": "go",
+        }) + "\n"
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    act = Activity.named("httpx-inputs", root=tmp_path).ensure()
+    canon = act.asset_discovery_canonical
+    tools.write_lines(act.scope_urls, ["http://app.test:3552"])
+    tools.write_lines(canon("inscope_subdomains.txt"), ["app.test"])
+    tools.write_lines(canon("naabu_web.txt"), ["10.0.0.5:443"])
+    tools.write_lines(canon("naabu_full.txt"), ["10.0.0.5:443", "10.0.0.5:9999"])
+
+    tasks.httpx_fingerprint(act)
+
+    discovery = next(stdin for cmd, stdin in calls if "-nf" in cmd)
+    explicit = next(stdin for cmd, stdin in calls if "-nfs" in cmd)
+    assert "10.0.0.5:9999" in discovery
+    assert explicit == "http://app.test:3552"
+    assert {r["url"] for r in tools.read_jsonl(canon("httpx_full_metadata.jsonl"))} == {
+        "http://app.test:3552", "http://10.0.0.5:9999",
+    }
 
 
 def test_auth_headers_reach_remaining_http_target_tools(monkeypatch, tmp_path):

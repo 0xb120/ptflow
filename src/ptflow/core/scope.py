@@ -33,8 +33,8 @@ def normalize(token: str, kind: str) -> str:
     t = token.strip().lower()
     if kind == "url":
         # bare host only: drop scheme, path AND any :port — a host:port (https://h:8443/x → h) is not a
-        # resolvable DNS name, so the port must not leak into scope_dns (it would fail to resolve). The
-        # specific port isn't honored for scanning anyway (portscan covers the curated WEB_PORTS).
+        # resolvable DNS name, so the port must not leak into scope_dns (it would fail to resolve).
+        # The exact raw URL is retained separately and fed directly to HTTP fingerprinting.
         return t.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
     if kind == "wildcard":
         return t[2:]
@@ -53,7 +53,13 @@ def parse_scope(text: str) -> list[Target]:
             continue
         kind = classify(token)
         norm = normalize(token, kind)
-        tid = target_id(norm)
+        # A URL is both a DNS-resolution seed (``normalized`` = bare host) and an
+        # operator-pinned HTTP target.  Do not collapse two explicit URLs merely
+        # because they share a host: scheme, port and path are meaningful scan
+        # coordinates (http://h:8080 and https://h:8443 can be different apps).
+        # Non-URL targets retain the historical host/network identity.
+        identity = f"url:{token}" if kind == "url" else norm
+        tid = target_id(identity)
         if tid not in seen:
             seen[tid] = Target(raw=token, kind=kind, normalized=norm, tid=tid)
     return list(seen.values())

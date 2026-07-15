@@ -15,24 +15,24 @@ expand["expand<br>mapcidr -silent                                  # espande i C
 resolve["resolve<br>shuffledns -mode resolve -r resolvers-trusted    # fallback: dnsx -silent<br>dnsx -a -resp-only -silent                       # → unique_ips<br>dnsx -a -resp -nc -silent                        # → domain_ip_map"]
 scope_gate["scope_gate  ·  net=False<br># build_allowlist(scope_init) + filter_assets(subdomains + tls_names, domain_ip_map, unique_ips)<br># offline (net=False) · complementa naabu -exclude-cdn / split_cdn_ip_records (niente check CDN qui)"]
 portscan["portscan<br>naabu -p &lt;~250 WEB_PORTS&gt; -exclude-cdn -c 50 -rate 1000   # rate=profilo<br># → honeypot_split (≥15 porte aperte = honeypot) + select_web_ports"]
-httpx["httpx<br>httpx -sc -cl -td -title -ip -hash sha256<br>      -favicon -location -fr -irh -nf -j   # -nf: probe http+https (alt TLS ports)<br>split_cdn_ip_records → drop bare-IP CDN/cloud/WAF (→ excluded_cdn.jsonl)"]
+portscan_full["portscan_full<br>naabu -top-ports full -exclude-cdn -c 50 -rate 1000   # rate=profilo"]
+httpx["httpx<br>httpx -sc -cl -td -title -ip -hash sha256<br>      -favicon -location -fr -irh -nf -j   # discovery: probe http+https<br>httpx -nfs ... &lt; scope_urls.txt             # preserva scheme+porta espliciti<br>split_cdn_ip_records → drop bare-IP CDN/cloud/WAF (→ excluded_cdn.jsonl)"]
+nerva["nerva<br>nerva --json"]
 end
 scope -.->|∥ offline| provision_wl
 scope --> expand
 expand --> resolve
 resolve --> scope_gate
 scope_gate --> portscan
-portscan --> httpx
+portscan --> portscan_full
+portscan_full --> httpx
+portscan_full --> nerva
 CLUSTER{{"② CLUSTER · pivot fan-out<br>→ scans/&lt;app_id&gt;/"}}
 BREADTH ==> CLUSTER
 subgraph SPAN["SPANNING · ∥ cluster + tutti i loop — join al fan-in"]
 direction TB
-portscan_full["portscan_full<br>naabu -top-ports full -exclude-cdn -c 50 -rate 1000   # rate=profilo"]
-nerva["nerva<br>nerva --json"]
 nuclei_scope["nuclei_scope<br># template aggiornati/pinnati fuori dalla run (nessuna race con i pass DAST)<br>nuclei -stats -nmhe -c 25 -bs 25 -rl 150 -timeout 10 -retries 2 -j -silent -duc"]
 end
-portscan -.->|∥| portscan_full
-portscan_full --> nerva
 httpx -.->|∥| nuclei_scope
 screenshot["screenshot<br>httpx -ss -system-chrome -no-screenshot-full-page -st 20 -srd &lt;screenshots&gt; -svrc<br>      -sc -cl -title -td -server -ip -favicon -location -irh -j   # fingerprint (-j)<br>eyewitness --web -f &lt;1 url/gruppo&gt; -d &lt;out&gt; --no-prompt --timeout 15   # opzionale"]
 CLUSTER -.->|∥ loop| screenshot
@@ -114,7 +114,6 @@ param_fuzz --> sqli_full
 BAR4 ==> P4
 FANIN[["④ FAN-IN · consolidate<br>findings/&lt;tipo&gt;.jsonl"]]
 P4 ==> FANIN
-nerva -.->|join| FANIN
 nuclei_scope -.->|join| FANIN
 screenshot -.->|join| FANIN
 classDef breadth fill:#0d2f54,stroke:#4f9be6,color:#dbe9fb;
@@ -127,8 +126,8 @@ classDef phase1 fill:#10331c,stroke:#4cc46b,color:#dcf6e3;
 classDef phase2 fill:#3a2f06,stroke:#e6c247,color:#f8edc2;
 classDef phase3 fill:#3a0f23,stroke:#ef6a9b,color:#fbd9e6;
 classDef phase4 fill:#3a1a08,stroke:#f08a4c,color:#fbe2d2;
-class provision_wl,expand,resolve,scope_gate,portscan,httpx breadth
-class portscan_full,nerva,nuclei_scope,screenshot span
+class provision_wl,expand,resolve,scope_gate,portscan,portscan_full,httpx,nerva breadth
+class nuclei_scope,screenshot span
 class surface_checkpoint checkpoint
 class passive_probe,crawl,crawl_headless,subenum,takeover,fetch_delta,api_spec,mine_responses,request_catalog phase1
 class xref_catalog,dast,xss,sqli,cve_lookup phase2

@@ -64,30 +64,30 @@ FLOWMETA: dict[str, StepMeta] = {
     ),
     "portscan": StepMeta(
         summary="Scan VELOCE su ~250 porte WEB curate (WEB_PORTS) → filtro honeypot → naabu_web.txt "
-                "(il set che legge httpx). Il full-port è spanning (portscan_full), fuori dal percorso critico.",
+                "(segnale rapido). Il full-port completa la superficie prima del cluster.",
         commands=("naabu -p <~250 WEB_PORTS> -exclude-cdn -c 50 -rate 1000   # rate=profilo",
                   "# → honeypot_split (≥15 porte aperte = honeypot) + select_web_ports"),
         outputs=("honeypots.txt", "naabu_web.txt"),
     ),
     "portscan_full": StepMeta(
-        summary="SPANNING — scan full 65535 porte sugli IP validi (non-honeypot) → naabu_full.txt "
-                "(alimenta nerva). Gira ∥ cluster + loop, joinato al fan-in: il full-port non blocca la breadth.",
+        summary="BREADTH — scan full 65535 porte sugli IP validi (non-honeypot) → naabu_full.txt. "
+                "Barriera pre-cluster: alimenta sia httpx sia nerva, così i servizi tardivi entrano nei loop.",
         commands=("naabu -top-ports full -exclude-cdn -c 50 -rate 1000   # rate=profilo",),
         outputs=("naabu_full.txt",),
     ),
     "httpx": StepMeta(
         summary="Fingerprint HTTP + segnali per il cluster (favicon, body-hash, redirect-final, header). "
-                "Scope hygiene: scarta le probe by-IP di infra CDN/cloud/WAF (tiene gli hostname).",
+                "Legge URL espliciti + tutte le porte del full scan; scope hygiene sulle probe CDN by-IP.",
         commands=("httpx -sc -cl -td -title -ip -hash sha256",
-                  "      -favicon -location -fr -irh -nf -j   # -nf: probe http+https (alt TLS ports)",
+                  "      -favicon -location -fr -irh -nf -j   # discovery: probe http+https",
+                  "httpx -nfs ... < scope_urls.txt             # preserva scheme+porta espliciti",
                   "split_cdn_ip_records → drop bare-IP CDN/cloud/WAF (→ excluded_cdn.jsonl)"),
         outputs=("httpx_full_metadata.jsonl", "unique_webapps.txt", "excluded_cdn.jsonl"),
-        notes=("legge solo il set web veloce (naabu_web.txt) — il full-port è spanning",
-               "httpx ignora lo scheme di input (default https): lo scheme esplicito di scope viene "
-               "ri-applicato dal cluster (vedi pivot)"),
+        notes=("input discovery = nomi in-scope + naabu_web + naabu_full",
+               "canonical URL = redirect-final 2xx; host+porta distinti non vengono fusi automaticamente"),
     ),
     "nerva": StepMeta(
-        summary="Fingerprint dei servizi non-HTTP (SPANNING, dopo portscan_full, ∥ cluster + loop).",
+        summary="Fingerprint servizi dopo portscan_full, nella barriera pre-cluster (∥ httpx).",
         commands=("nerva --json",),
         outputs=("nerva_full_metadata.jsonl",),
     ),
