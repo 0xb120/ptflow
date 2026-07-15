@@ -10,9 +10,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess
 from collections import defaultdict
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from pydantic import BaseModel, Field
 
@@ -323,6 +327,313 @@ def ai_wordlist(activity: Activity, app_id: str) -> None:
     log.info("  → ai_wordlist (%s) — %d candidate token(s) → ai_seed.txt", app_id, count)
 
 
+# --- CVE PoC interpretation + policy-gated verification ------------------------------------------
+
+_CVE_POC_MAX = 20
+_CVE_POC_BODY_MAX = 131_072
+_CVE_POC_TIMEOUT = 12
+_CVE_POC_PATH_MAX = 512
+_CVE_POC_LITERAL_MIN = 4
+_CVE_POC_LITERAL_MAX = 160
+_CONTROL_CODEPOINT_MAX = 32
+_HTTP_STATUS_MIN = 100
+_HTTP_STATUS_MAX = 599
+_CVE_POC_UNSAFE_QUERY_KEYS = frozenset({
+    "callback", "cmd", "command", "code", "exec", "file", "host", "path", "redirect",
+    "target", "template", "uri", "url", "webhook",
+})
+_CVE_POC_UNSAFE_PATH_SEGMENTS = frozenset({
+    "create", "delete", "destroy", "exec", "execute", "import", "install", "logout", "remove",
+    "reset", "restart", "run", "shutdown", "trigger", "update", "upload", "webhook", "write",
+})
+
+CVE_POC_SYSTEM = (
+    "You are interpreting known-vulnerability PoC references for an authorized web assessment. For "
+    "each indexed CVE choose exactly one action: safe_http_probe, manual_review, or skip. A "
+    "safe_http_probe is allowed only when the supplied CVE description and PoC references justify "
+    "one target-local, read-only HTTP request. It MUST use GET, HEAD, or OPTIONS; use a relative path "
+    "on the assessed target; and include literal response evidence that would distinguish the "
+    "vulnerable behavior. Never propose credentials, shell commands, Nuclei templates, payload "
+    "execution, writes/state changes, SSRF destinations, file reads, traversal, callbacks/OAST, "
+    "brute force, denial of service, or more than one request. If a PoC URL alone is insufficient, "
+    "choose manual_review and explain what an operator must inspect. Do not claim to have opened a "
+    "linked PoC: only the supplied fields are available. "
+    + _UNTRUSTED
+)
+
+
+class SafeHTTPProbe(BaseModel):
+    method: Literal["GET", "HEAD", "OPTIONS"]
+    path: str
+    expected_statuses: list[int] = []
+    expected_body_contains: list[str] = []
+    expected_header_contains: list[str] = []
+
+
+class CVEPocDecision(BaseModel):
+    index: int
+    action: Literal["safe_http_probe", "manual_review", "skip"]
+    rationale: str
+    probe: SafeHTTPProbe | None = None
+
+
+class CVEPocOut(BaseModel):
+    decisions: list[CVEPocDecision]
+
+
+def _poc_refs(finding: dict[str, Any]) -> list[str]:
+    refs: list[object] = []
+    for field in ("poc", "exploits"):
+        values = finding.get(field) or []
+        refs.extend([values] if isinstance(values, str) else values)
+    return list(dict.fromkeys(str(ref)[:500] for ref in refs if ref))
+
+
+def _poc_sort_key(finding: dict[str, Any]) -> tuple[Any, ...]:
+    try:
+        cvss = float(finding.get("cvss") or 0)
+    except (TypeError, ValueError):
+        cvss = 0.0
+    return (not finding.get("kev"), not finding.get("exploited"), -cvss,
+            str(finding.get("cve") or ""))
+
+
+def _poc_candidates(findings: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted((finding for finding in findings if _poc_refs(finding)), key=_poc_sort_key)[:_CVE_POC_MAX]
+
+
+def _poc_user(candidates: Sequence[dict[str, Any]]) -> str:
+    keys = ("cve", "vulnerability_id", "advisory_id", "advisory_ids", "aliases", "product",
+            "version", "affected_components", "cvss", "kev", "cwe", "description",
+            "match_reason", "hosts")
+    records = [
+        {"index": index, **{key: finding.get(key) for key in keys}, "poc": _poc_refs(finding)}
+        for index, finding in enumerate(candidates)
+    ]
+    return (
+        "CVE records and PoC references (JSON lines). Return at most one decision per index:\n"
+        + "\n".join(json.dumps(record, sort_keys=True) for record in records)
+    )
+
+
+def _safe_literal(raw: object) -> str | None:
+    literal = str(raw or "")
+    if not _CVE_POC_LITERAL_MIN <= len(literal) <= _CVE_POC_LITERAL_MAX:
+        return None
+    if any(ord(character) < _CONTROL_CODEPOINT_MAX and character != "\t" for character in literal):
+        return None
+    return literal
+
+
+def validate_safe_http_probe(  # noqa: PLR0911
+    probe: SafeHTTPProbe | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Enforce the non-negotiable execution policy independently of model output. Pure."""
+    if probe is None:
+        return None, "missing probe"
+    path = probe.path.strip()
+    if not path.startswith("/") or len(path) > _CVE_POC_PATH_MAX:
+        return None, "path must be a bounded target-local absolute path"
+    parsed = urlsplit(path)
+    if parsed.scheme or parsed.netloc or parsed.fragment:
+        return None, "scheme, authority and fragment are forbidden"
+    decoded = path
+    for _ in range(3):
+        decoded = unquote(decoded)
+    decoded = decoded.casefold()
+    if any(token in decoded for token in (
+        "\r", "\n", "\x00", "..", "\\", "://", "file:", "gopher:", "dict:", "ftp:",
+        "localhost", "127.0.0.1", "169.254.", "[::1]", "/etc/", "/proc/", "$(", "${",
+    )) or any(character in path for character in ("`", "|", "<", ">", ";")):
+        return None, "path contains a forbidden traversal, destination or execution primitive"
+    decoded_path = urlsplit(decoded).path
+    segments = {segment.casefold() for segment in decoded_path.split("/") if segment}
+    if any(segment.startswith(unsafe) for segment in segments
+           for unsafe in _CVE_POC_UNSAFE_PATH_SEGMENTS):
+        return None, "path appears state-changing"
+    query = parse_qsl(decoded.split("?", 1)[1] if "?" in decoded else "")
+    if any(key.casefold() in _CVE_POC_UNSAFE_QUERY_KEYS for key, _ in query):
+        return None, "query parameter could select a destination, file or executable input"
+    if any(any(unsafe in value.casefold() for unsafe in _CVE_POC_UNSAFE_PATH_SEGMENTS)
+           for _, value in query):
+        return None, "query value appears state-changing"
+    statuses = sorted({status for status in probe.expected_statuses
+                       if _HTTP_STATUS_MIN <= status <= _HTTP_STATUS_MAX})[:5]
+    body_literals = [literal for raw in probe.expected_body_contains
+                     if (literal := _safe_literal(raw))][:_CVE_POC_MAX]
+    header_literals = [literal for raw in probe.expected_header_contains
+                       if (literal := _safe_literal(raw))][:_CVE_POC_MAX]
+    if not statuses or (not body_literals and not header_literals):
+        return None, "a bounded status and at least one literal response matcher are required"
+    return {
+        "method": probe.method,
+        "path": path,
+        "expected_statuses": statuses,
+        "expected_body_contains": body_literals,
+        "expected_header_contains": header_literals,
+    }, "allowed"
+
+
+def _probe_matches(probe: dict[str, Any], status: int, headers: str, body: str) -> bool:
+    statuses = probe["expected_statuses"]
+    return (
+        (not statuses or status in statuses)
+        and all(literal in body for literal in probe["expected_body_contains"])
+        and all(literal.casefold() in headers.casefold()
+                for literal in probe["expected_header_contains"])
+    )
+
+
+def _execute_safe_http_probe(
+    activity: Activity,
+    app_id: str,
+    finding: dict[str, Any],
+    probe: dict[str, Any],
+    mode: str,
+) -> dict[str, Any]:
+    """Execute one validated curl request against one already-authorized app representative."""
+    from ptflow.pipelines.external import tasks as external_tasks  # noqa: PLC0415
+
+    ws = activity.app(app_id)
+    hosts = external_tasks._scan_hosts(ws)  # noqa: SLF001 - shared target/RoE selection invariant
+    if not hosts or shutil.which("curl") is None:
+        return {"executed": False, "matched": False, "reason": "no target or curl unavailable"}
+    base = urlsplit(hosts[0])
+    if base.scheme not in {"http", "https"} or not base.netloc:
+        return {"executed": False, "matched": False, "reason": "invalid app target"}
+    target = f"{base.scheme}://{base.netloc}{probe['path']}"
+    safe_cve = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(finding.get("cve") or "cve"))
+    raw = ws.raw("cve_poc") / mode / safe_cve
+    raw.mkdir(parents=True, exist_ok=True)
+    headers_path = raw / "headers.txt"
+    body_path = raw / "body.txt"
+    cmd = [
+        "curl", "--disable", "--noproxy", "*", "-k", "-sS", "--compressed",
+        "--connect-timeout", "5", "--max-time", str(_CVE_POC_TIMEOUT), "--limit-rate", "256K",
+        "--max-filesize", str(_CVE_POC_BODY_MAX), "--proto", "=http,https",
+        "--proto-redir", "=http,https", "--max-redirs", "0", "-D", str(headers_path),
+        "-o", str(body_path), "-w", "%{http_code}",
+    ]
+    if probe["method"] == "HEAD":
+        cmd.append("--head")
+    elif probe["method"] == "OPTIONS":
+        cmd.extend(["-X", "OPTIONS"])
+    cmd.extend([*external_tasks._header_flags("-H"), target])  # noqa: SLF001
+    try:
+        output = tools.run(cmd, timeout=_CVE_POC_TIMEOUT + 3)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"executed": False, "matched": False, "reason": "probe command failed"}
+    try:
+        status = int(output.strip()[-3:])
+    except ValueError:
+        status = 0
+    headers = (headers_path.read_text(encoding="utf-8", errors="replace")
+               if headers_path.exists() else "")[:_CVE_POC_BODY_MAX]
+    body = (body_path.read_text(encoding="utf-8", errors="replace")
+            if body_path.exists() else "")[:_CVE_POC_BODY_MAX]
+    matched = _probe_matches(probe, status, headers, body)
+    return {
+        "executed": True,
+        "matched": matched,
+        "status": status,
+        "target": target,
+        "headers_artifact": str(headers_path.relative_to(ws.root)),
+        "body_artifact": str(body_path.relative_to(ws.root)),
+    }
+
+
+def _run_ai_cve_poc(  # noqa: PLR0913
+    activity: Activity,
+    app_id: str,
+    *,
+    input_name: str,
+    triage_name: str,
+    verified_name: str,
+    mode: str,
+) -> None:
+    client = make_client("cve_poc", activity)
+    if client is None:
+        return
+    ws = activity.app(app_id)
+    candidates = _poc_candidates(tools.read_jsonl(ws.findings / input_name))
+    if not candidates:
+        tools.write_jsonl(ws.canonical(triage_name), [])
+        tools.write_jsonl(ws.findings / verified_name, [])
+        return
+    result = client.complete_json(CVE_POC_SYSTEM, _poc_user(candidates), CVEPocOut)
+    if result.value is None:
+        return
+    decisions = {decision.index: decision for decision in result.value.decisions
+                 if 0 <= decision.index < len(candidates)}
+    triage: list[dict[str, Any]] = []
+    verified: list[dict[str, Any]] = []
+    for index, finding in enumerate(candidates):
+        decision = decisions.get(index)
+        if decision is None:
+            triage.append({
+                "cve": finding.get("cve"), "product": finding.get("product"),
+                "version": finding.get("version"), "poc": _poc_refs(finding),
+                "action": "manual_review", "rationale": "LLM returned no decision for this CVE",
+                "policy": "no decision; no request executed", "provider": result.provider,
+                "model": result.model,
+            })
+            continue
+        effective_action = decision.action
+        probe_record: dict[str, Any] | None = None
+        outcome: dict[str, Any] = {"executed": False, "matched": False}
+        policy = "not executable"
+        if decision.action == "safe_http_probe":
+            probe_record, policy = validate_safe_http_probe(decision.probe)
+            if probe_record is None:
+                effective_action = "manual_review"
+            else:
+                outcome = _execute_safe_http_probe(
+                    activity, app_id, finding, probe_record, mode,
+                )
+        record = {
+            "cve": finding.get("cve"), "product": finding.get("product"),
+            "version": finding.get("version"), "hosts": finding.get("hosts") or [],
+            "poc": _poc_refs(finding), "action": decision.action,
+            "effective_action": effective_action, "rationale": decision.rationale,
+            "probe": probe_record, "policy": policy, "outcome": outcome,
+            "provider": result.provider, "model": result.model,
+        }
+        triage.append(record)
+        if effective_action == "safe_http_probe" and outcome.get("matched"):
+            verified.append({
+                **finding,
+                "type": "cve-poc-verified",
+                "verification": "llm-planned-safe-http",
+                "verification_confidence": "high",
+                "probe": probe_record,
+                "probe_result": outcome,
+            })
+    # Decisions that did not verify a vulnerability are audit/operations data, not findings. Keeping
+    # them at the app root prevents manual_review/skip records from inflating deterministic reports.
+    n_triage = tools.write_jsonl(ws.canonical(triage_name), triage)
+    n_verified = tools.write_jsonl(ws.findings / verified_name, verified)
+    log.info(
+        "  → ai_cve_poc%s (%s) — %d PoC decision(s) · %d safely verified",
+        "_full" if mode == "full" else "", app_id, n_triage, n_verified,
+    )
+
+
+def ai_cve_poc(activity: Activity, app_id: str) -> None:
+    """Interpret phase-2 search_vulns PoCs and execute only policy-approved passive HTTP probes."""
+    _run_ai_cve_poc(
+        activity, app_id, input_name="cve.jsonl", triage_name="cve_poc_triage.jsonl",
+        verified_name="cve_verified.jsonl", mode="surface",
+    )
+
+
+def ai_cve_poc_full(activity: Activity, app_id: str) -> None:
+    """Interpret phase-4 CVE-delta PoCs under the same non-negotiable probe policy."""
+    _run_ai_cve_poc(
+        activity, app_id, input_name="cve_full.jsonl", triage_name="cve_poc_triage_full.jsonl",
+        verified_name="cve_verified_full.jsonl", mode="full",
+    )
+
+
 # --- privacy-safe secret triage ------------------------------------------------------------------
 
 _SECRETS_MAX = 100
@@ -465,6 +776,11 @@ def per_app_stages() -> tuple[Stage, ...]:
     return tuple(stage for stage in (
         Stage("ai_wordlist", ai_wordlist, per_app=True, phase=2, net=False)
         if stage_enabled("wordlist") else None,
+        Stage("ai_cve_poc", ai_cve_poc, needs=("cve_lookup",), per_app=True, phase=2, net=True)
+        if stage_enabled("cve_poc") else None,
         Stage("ai_secret_triage", ai_secret_triage, per_app=True, phase=4, net=False)
         if stage_enabled("secret_triage") else None,
+        Stage("ai_cve_poc_full", ai_cve_poc_full, needs=("cve_lookup_full",), per_app=True,
+              phase=4, net=True)
+        if stage_enabled("cve_poc") else None,
     ) if stage is not None)

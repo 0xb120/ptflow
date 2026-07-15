@@ -119,6 +119,119 @@ def test_build_content_wordlist_folds_ai_seed(tmp_path):
     assert "login" in combined
 
 
+def test_safe_http_probe_policy_accepts_read_only_and_rejects_dangerous_shapes():
+    probe, reason = ai.validate_safe_http_probe(ai.SafeHTTPProbe(
+        method="GET", path="/api/version", expected_statuses=[200],
+        expected_body_contains=["1.13.0"],
+    ))
+    assert reason == "allowed"
+    assert probe["path"] == "/api/version"
+
+    for unsafe in (
+        ai.SafeHTTPProbe(method="GET", path="//evil.test/x", expected_body_contains=["owned"]),
+        ai.SafeHTTPProbe(method="GET", path="/api/delete", expected_body_contains=["deleted"]),
+        ai.SafeHTTPProbe(method="GET", path="/fetch?url=http%3A%2F%2F127.0.0.1",
+                         expected_body_contains=["metadata"]),
+        ai.SafeHTTPProbe(method="GET", path="/%252e%252e/etc/passwd",
+                         expected_body_contains=["root:"]),
+        ai.SafeHTTPProbe(method="GET", path="/api/version"),
+    ):
+        assert ai.validate_safe_http_probe(unsafe)[0] is None
+
+
+def test_ai_cve_poc_downgrades_unsafe_model_probe_without_execution(tmp_path, monkeypatch):
+    act = Activity.named("poc-policy", root=tmp_path).ensure()
+    ws = act.app("a").ensure()
+    tools.write_jsonl(ws.findings / "cve.jsonl", [{
+        "cve": "CVE-2026-1", "product": "Arcane API", "version": "1.13.0",
+        "poc": ["https://example.test/poc"], "description": "unsafe PoC",
+    }])
+    output = ai.CVEPocOut(decisions=[ai.CVEPocDecision(
+        index=0, action="safe_http_probe", rationale="try traversal",
+        probe=ai.SafeHTTPProbe(
+            method="GET", path="/read?file=/etc/passwd", expected_body_contains=["root:"],
+        ),
+    )])
+    monkeypatch.setattr(ai, "make_client", lambda *_args: _FakeClient(json_out=output))
+    monkeypatch.setattr(
+        ai, "_execute_safe_http_probe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not execute")),
+    )
+
+    ai.ai_cve_poc(act, "a")
+
+    [triage] = tools.read_jsonl(ws.canonical("cve_poc_triage.jsonl"))
+    assert triage["action"] == "safe_http_probe"
+    assert triage["effective_action"] == "manual_review"
+    assert triage["outcome"]["executed"] is False
+    assert tools.read_jsonl(ws.findings / "cve_verified.jsonl") == []
+
+
+def test_ai_cve_poc_persists_only_matched_policy_validated_probe(tmp_path, monkeypatch):
+    act = Activity.named("poc-match", root=tmp_path).ensure()
+    ws = act.app("a").ensure()
+    poc = "https://github.com/example/advisory"
+    tools.write_jsonl(ws.findings / "cve.jsonl", [{
+        "cve": "CVE-2026-2", "product": "Arcane API", "version": "1.13.0", "cvss": 9.8,
+        "poc": [poc], "description": "GET /api/version exposes the vulnerable build",
+    }])
+    output = ai.CVEPocOut(decisions=[ai.CVEPocDecision(
+        index=0, action="safe_http_probe", rationale="version endpoint is read-only",
+        probe=ai.SafeHTTPProbe(
+            method="GET", path="/api/version", expected_statuses=[200],
+            expected_body_contains=["1.13.0"],
+        ),
+    )])
+    client = _FakeClient(json_out=output)
+    monkeypatch.setattr(ai, "make_client", lambda *_args: client)
+    monkeypatch.setattr(ai, "_execute_safe_http_probe", lambda *_args, **_kwargs: {
+        "executed": True, "matched": True, "status": 200,
+        "target": "https://arcane.test/api/version",
+        "body_artifact": "raw/cve_poc/surface/CVE-2026-2/body.txt",
+    })
+
+    ai.ai_cve_poc(act, "a")
+
+    assert poc in client.last_user
+    [verified] = tools.read_jsonl(ws.findings / "cve_verified.jsonl")
+    assert verified["verification"] == "llm-planned-safe-http"
+    assert verified["probe_result"]["matched"] is True
+
+
+def test_safe_http_probe_executor_uses_one_curl_request_and_no_nuclei(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from ptflow.pipelines.external import tasks
+
+    act = Activity.named("poc-curl", root=tmp_path).ensure()
+    act.app("a").ensure()
+    monkeypatch.setattr(tasks, "_scan_hosts", lambda _ws: ["https://arcane.test"])
+    monkeypatch.setattr(ai.shutil, "which", lambda _name: "/usr/bin/curl")
+    calls = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        header_path = cmd[cmd.index("-D") + 1]
+        body_path = cmd[cmd.index("-o") + 1]
+        tools.write_text(Path(header_path), "HTTP/1.1 200 OK\nContent-Type: application/json\n")
+        tools.write_text(Path(body_path), '{"version":"1.13.0"}')
+        return "200"
+
+    monkeypatch.setattr(ai.tools, "run", fake_run)
+    result = ai._execute_safe_http_probe(
+        act, "a", {"cve": "CVE-2026-2"}, {
+            "method": "GET", "path": "/api/version", "expected_statuses": [200],
+            "expected_body_contains": ["1.13.0"], "expected_header_contains": [],
+        }, "surface",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "curl"
+    assert "nuclei" not in calls[0]
+    assert calls[0][-1] == "https://arcane.test/api/version"
+    assert result["matched"] is True
+
+
 def test_ai_secret_triage_writes_verdicts(tmp_path, monkeypatch):
     act = Activity.named("s", root=tmp_path).ensure()
     ws = act.app("a").ensure()
@@ -205,6 +318,8 @@ def test_ai_stages_absent_when_off(monkeypatch):
     names = {s.name for s in p.PIPELINE.stages}
     assert "ai_wordlist" not in names
     assert "ai_secret_triage" not in names
+    assert "ai_cve_poc" not in names
+    assert "ai_cve_poc_full" not in names
 
 
 def test_ai_stages_present_when_on(monkeypatch):
@@ -213,10 +328,17 @@ def test_ai_stages_present_when_on(monkeypatch):
     names = {s.name for s in p.PIPELINE.stages}
     assert "ai_wordlist" in names
     assert "ai_secret_triage" in names
+    assert "ai_cve_poc" in names
+    assert "ai_cve_poc_full" in names
     by_name = {s.name: s for s in p.PIPELINE.stages}
     assert by_name["ai_wordlist"].phase == 2
     assert by_name["ai_wordlist"].net is False
     assert by_name["ai_secret_triage"].phase == 4
+    assert by_name["ai_cve_poc"].phase == 2
+    assert by_name["ai_cve_poc"].needs == ("cve_lookup",)
+    assert by_name["ai_cve_poc"].net is True
+    assert by_name["ai_cve_poc_full"].phase == 4
+    assert by_name["ai_cve_poc_full"].needs == ("cve_lookup_full",)
     monkeypatch.delenv("PTFLOW_AI", raising=False)
     _reload_pipeline()  # restore module state for later tests
 

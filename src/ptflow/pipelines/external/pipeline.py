@@ -51,7 +51,7 @@ class ExternalPipeline:
         Stage("takeover", tasks.takeover, needs=("crawl", "subenum"), per_app=True, phase=1),
         # download the OSINT/crawley delta, then mine the corpus offline (extract + jsluice endpoints)
         Stage("fetch_delta", tasks.fetch_delta, needs=("crawl_headless",), per_app=True, phase=1),
-        # API spec discovery (OpenAPI/Swagger/GraphQL) → requests_api.jsonl (∥; reads hosts only)
+        # API spec discovery → request shapes + version-pinned software observations (∥; hosts only)
         Stage("api_spec", tasks.api_spec, per_app=True, phase=1),
         Stage("mine_responses", tasks.mine_responses, needs=("fetch_delta",), per_app=True, phase=1,
               net=False),  # offline: extract + jsluice the stored corpus, no network
@@ -60,10 +60,10 @@ class ExternalPipeline:
         Stage("request_catalog", tasks.request_catalog,
               needs=("crawl_headless", "mine_responses", "api_spec"), per_app=True, phase=1, net=False),
         # ── per-app PHASE 2 — DAST the explorable surface (low-hanging fruit) ────────────────────────
-        # cross-group catalog first: pulls in peer groups' explorable-surface requests whose host
-        # belongs to THIS group (requests_xref.jsonl), so dast/xss/sqli also cover cross-group surface
-        # on the fast pass, not only in phase 4. Safe: the 1→2 barrier means every group finished
-        # phase 1 already (race-free read).
+        # cross-group catalog first: pulls in peer groups' explorable-surface request SHAPES whose host
+        # belongs to THIS group, rebases them onto this group's full scheme+authority, and drops plain
+        # passive fetches (JS/MJS/CSS stay eligible). dast/xss/sqli cover the useful cross-group surface. Safe: the
+        # 1→2 barrier means every group finished phase 1 already (race-free read).
         Stage("xref_catalog", tasks.xref_catalog, per_app=True, phase=2, net=False),
         # nuclei -dast over the surface catalog (observed params) — fast, high-signal findings on the
         # real attack surface BEFORE sinking hours into fuzzing. Reads requests.jsonl across the barrier.
@@ -73,10 +73,11 @@ class ExternalPipeline:
         # high-signal complement to nuclei -dast's generic templates. Best-effort; run ∥ dast/cve_lookup.
         Stage("xss", tasks.xss, needs=("xref_catalog",), per_app=True, phase=2),
         Stage("sqli", tasks.sqli, needs=("xref_catalog",), per_app=True, phase=2),
-        # CVE lookup over the explorable-surface enumerated software (web server + tech + service banners
-        # + corpus libs) — OFFLINE correlation (net=False, no target traffic), runs ∥ dast (same phase,
-        # no needs). Records the covered (product,version) set so the phase-4 pass reports only the delta.
-        Stage("cve_lookup", tasks.cve_lookup, per_app=True, phase=2, net=False),
+        # CVE lookup over versioned server/tech/banner/corpus/OpenAPI observations — OFFLINE correlation.
+        # The explicit edges document both structured observation producers (the phase barrier has
+        # already completed all phase-1 work). Records covered pairs so phase 4 reports only the delta.
+        Stage("cve_lookup", tasks.cve_lookup, needs=("api_spec", "mine_responses"), per_app=True,
+              phase=2, net=False),
         # Global barrier checkpoint: snapshot every mature surface finding and publish the early
         # deterministic report before the expensive guessing/deep loops start.
         Stage("surface_checkpoint", tasks.surface_checkpoint, after_phase=2, net=False),

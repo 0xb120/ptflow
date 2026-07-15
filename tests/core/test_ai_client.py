@@ -52,12 +52,16 @@ def test_make_client_openai_builds_with_model(monkeypatch):
 
 
 @pytest.mark.parametrize(("provider", "key_env", "key", "base_url"), [
+    ("ollama-cloud", "OLLAMA_API_KEY", "ollama-key", "https://ollama.com/v1"),
     ("openrouter", "OPENROUTER_API_KEY", "or-key", "https://openrouter.ai/api/v1"),
     ("huggingface", "HF_TOKEN", "hf-key", "https://router.huggingface.co/v1"),
 ])
 def test_make_client_named_hosted_provider(monkeypatch, provider, key_env, key, base_url):
     pytest.importorskip("openai")
-    for name in ("OPENROUTER_API_KEY", "HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN", "OPENAI_API_KEY"):
+    for name in (
+        "OLLAMA_API_KEY", "OPENROUTER_API_KEY", "HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN",
+        "OPENAI_API_KEY",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PTFLOW_AI", "on")
     monkeypatch.setenv("PTFLOW_AI_PROVIDER", provider)
@@ -71,11 +75,15 @@ def test_make_client_named_hosted_provider(monkeypatch, provider, key_env, key, 
     assert c.name == provider
     assert c._base_url == base_url
     assert c._api_key == key
+    assert c.remote is True
 
 
-@pytest.mark.parametrize("provider", ["openrouter", "huggingface"])
+@pytest.mark.parametrize("provider", ["ollama-cloud", "openrouter", "huggingface"])
 def test_make_client_hosted_provider_requires_credential(monkeypatch, provider):
-    for name in ("OPENROUTER_API_KEY", "HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN", "OPENAI_API_KEY"):
+    for name in (
+        "OLLAMA_API_KEY", "OPENROUTER_API_KEY", "HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN",
+        "OPENAI_API_KEY",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PTFLOW_AI", "on")
     monkeypatch.setenv("PTFLOW_AI_PROVIDER", provider)

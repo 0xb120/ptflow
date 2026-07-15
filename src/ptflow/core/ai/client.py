@@ -34,15 +34,22 @@ _TRUE = {"1", "on", "true", "yes"}
 _FALSE = {"0", "off", "false", "no"}
 _DEFAULT_PROVIDER = "ollama"
 _OPENAI_COMPATIBLE_PROVIDERS = frozenset({
-    "ollama", "openrouter", "huggingface", "openai-compatible", "openai",
+    "ollama", "ollama-cloud", "openrouter", "huggingface", "openai-compatible", "openai",
 })
 _DEFAULT_BASE_URLS = {
     "ollama": "http://127.0.0.1:11434/v1",
+    "ollama-cloud": "https://ollama.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "huggingface": "https://router.huggingface.co/v1",
 }
+_HOSTED_API_KEY_ENVS = {
+    "ollama-cloud": ("OLLAMA_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "huggingface": ("HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN"),
+}
 _DEFAULT_STAGE_MAX_TOKENS = {
     "wordlist": 2_000,
+    "cve_poc": 6_000,
     "secret_triage": 4_000,
     "triage": 8_000,
     "report": 12_000,
@@ -640,10 +647,8 @@ def _first_env(*names: str) -> str | None:
 def _provider_api_key(provider: str) -> str | None:
     if provider == "ollama":
         return "ollama"
-    if provider == "openrouter":
-        return _first_env("OPENROUTER_API_KEY")
-    if provider == "huggingface":
-        return _first_env("HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN")
+    if names := _HOSTED_API_KEY_ENVS.get(provider):
+        return _first_env(*names)
     return _first_env("OPENAI_API_KEY") or "not-needed"
 
 
@@ -685,8 +690,8 @@ def make_client(  # noqa: PLR0911
             log.warning("openai-compatible requires a base_url — AI disabled")
             return None
         api_key = _provider_api_key(provider)
-        if provider in {"openrouter", "huggingface"} and not api_key:
-            expected = "OPENROUTER_API_KEY" if provider == "openrouter" else "HF_TOKEN"
+        if provider in _HOSTED_API_KEY_ENVS and not api_key:
+            expected = _HOSTED_API_KEY_ENVS[provider][0]
             log.warning("AI provider %s requires %s — AI disabled", provider, expected)
             return None
         try:

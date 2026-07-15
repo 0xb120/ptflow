@@ -169,9 +169,10 @@ FLOWMETA: dict[str, StepMeta] = {
             "httpx -srd store/ -mc 200   # sonda ~10 path spec noti (/openapi.json, /swagger.json, /v3/api-docs…)",
             "# expand_openapi: ogni operazione (path x metodo) → richiesta (path-param '1', query/header,",
             "#   requestBody/in:body → skeleton JSON|urlencoded), cap API_SPEC_MAX_OPS=300",
+            "# info.title + info.version → software_observations; GET /version dichiarati corroborano",
             "httpx -mc 200,400,405      # endpoint GraphQL → richiesta POST-json ({query:{__typename}})",
         ),
-        outputs=("requests_api.jsonl",),
+        outputs=("requests_api.jsonl", "software_observations.jsonl"),
         notes=("best-effort: nessuna spec → file vuoto · gestisce OpenAPI v3 (servers/requestBody) e Swagger v2 (basePath/in:body)",
                "auth passthrough PTFLOW_HTTP_HEADER → httpx -H solo in webscan (ignorato da external)"),
     ),
@@ -182,8 +183,11 @@ FLOWMETA: dict[str, StepMeta] = {
         commands=("jsluice urls <js dello store + sorgenti da sourcemap>   # → endpoints_js.txt",
                   "# _reconstruct_sourcemaps: .map (fetchati) + data: inline → raw/extracted/sourcemap/*.js",
                   "# parse_sourcemap: sourcesContent → sorgenti de-bundlati (endpoint + secret fleet li vedono)"),
-        outputs=("endpoints_js.txt", "findings/sourcemap.jsonl", "raw/extracted/sourcemap/"),
-        notes=("il fleet segreti NON gira qui — è in coda al fixpoint di content_discovery (vede anche i body fuzzati)",
+        outputs=("endpoints_js.txt", "software_observations_corpus.jsonl",
+                 "findings/sourcemap.jsonl", "raw/extracted/sourcemap/"),
+        notes=("manifest noti + metadati precisi JS/MJS → osservazioni software raw, dedup e bounded; "
+               "i package ecosystem restano queryable=false finché il punto 3 non li canonicalizza",
+               "il fleet segreti NON gira qui — è in coda al fixpoint di content_discovery (vede anche i body fuzzati)",
                "l'estrazione raw/extracted/ serve a request_catalog per minare le shape POST/form/XHR del corpus",
                "sourcemap-exposed (info): sorgenti webpack de-bundlati → resa molto più alta di secret/endpoint"),
     ),
@@ -213,10 +217,13 @@ FLOWMETA: dict[str, StepMeta] = {
         summary="FASE 2 (testa) — assembla il CATALOGO CROSS-GRUPPO (requests_xref.jsonl): richieste/"
                 "endpoint scoperti in ALTRI gruppi in-scope il cui host appartiene a QUESTO gruppo, così "
                 "dast/xss/sqli testano la superficie cross-gruppo sul passaggio VELOCE, non solo in FASE 4. "
+                "Ribasa ogni shape sulla authority completa del destinatario e scarta i fetch passivi senza input; "
+                "JS/MJS/CSS restano eleggibili per reflection dinamiche. "
                 "Sicuro grazie alla barriera 1→2 (tutti i gruppi hanno finito la FASE 1 → lettura race-free).",
         commands=(
             "# _cross_group_surface(activity, ws): dagli ALTRI gruppi le richieste/endpoint con host ∈ ws.hosts",
-            "#   (taggate xref:<origine>) → _finalize_catalog (scheme raggiungibile · in-scope · dead-drop 404)",
+            "#   rebase su authority canonica · rebuild Host · drop GET passivi (eccetto JS/MJS/CSS)",
+            "#   tag xref:<origine> → _finalize_catalog (in-scope · dedup shape · dead-drop 404)",
         ),
         outputs=("requests_xref.jsonl",),
         notes=("offline (net=False) · RoE-safe (solo host di gruppi in-scope) · gruppo solo ⇒ sidecar vuoto",),
@@ -227,7 +234,7 @@ FLOWMETA: dict[str, StepMeta] = {
                 "crawl ha visto). Findings veloci ad alto segnale PRIMA del fuzzing pesante; niente "
                 "scoperta di param nascosti (è guessing → FASE 4).",
         commands=(
-            "# input: requests.jsonl (parametri osservati), dedup per shape, cap DAST_MAX_REQUESTS=1500",
+            "# input: requests.jsonl + requests_xref.jsonl; drop GET statici senza input; dedup per shape; cap 1500",
             "# tutti i template di tutti i pack abilitati; selezione esatta nel manifest",
             "#   → raw/dast/input.jsonl + raw/dast/template-selection.json",
             "nuclei -dast -im jsonl -l input.jsonl -t <pack>...",
@@ -242,6 +249,7 @@ FLOWMETA: dict[str, StepMeta] = {
             "multi-pack: ufficiale + PTFlow stable + pack engagement; legacy PTFLOW_NUCLEI_DAST_TEMPLATES",
             "nessun filtro tag/ID: query/body/header/cookie e OAST vengono sempre selezionati",
             "manifest = hash/revisione pack + aggressività/frequenza + template ID; finding marcato con pack/revisione",
+            "JS/MJS/CSS restano eleggibili; font/image e altri fetch passivi senza input non consumano slot DAST",
             "dedup per punto-di-iniezione: niente conteggio gonfiato (lo stesso template su N varianti = 1)",
         ),
     ),
@@ -279,18 +287,25 @@ FLOWMETA: dict[str, StepMeta] = {
     "cve_lookup": StepMeta(
         summary="FASE 2 — CVE NOTE sui software ENUMERATI della superficie esplorabile (∥ dast). "
                 "Correlazione OFFLINE (net=False, zero traffico): web server + tech wappalyzer + banner "
-                "servizi non-HTTP (nerva) + librerie minate dal corpus crawl → DB locale search_vulns. "
+                "servizi non-HTTP (nerva) + librerie minate dal corpus crawl + info OpenAPI → DB locale search_vulns. "
                 "Solo version-pinned.",
         commands=(
-            "# software = collect_software(tech, Server header, banner nerva, lib del corpus) — solo con versione",
+            "# software = collect_software(tech, Server, banner, corpus, OpenAPI info) — solo con versione",
             "search_vulns -q '<Prodotto Versione>' -f json --ignore-general-product-vulns --use-created-product-ids",
             "# --use-created-product-ids: product ID alla versione ESATTA (no ladder) · cache memo process-wide · offline DB locale",
         ),
-        outputs=("findings/cve.jsonl", "raw/cve/seen.txt"),
+        outputs=("software_inventory.jsonl", "findings/cve.jsonl", "raw/cve/seen.txt"),
         notes=(
             "DB costruito FUORI dal run (search_vulns -u) · best-effort: salta se binario/DB assenti",
-            "record: cve · cvss · epss · cisa_kev · exploits · cwe · hosts · sources — ordinati per triage (exploited/KEV first)",
-            "seen.txt = coppie (prodotto,versione) coperte → la passata FASE 4 fa solo il delta",
+            "software_inventory.jsonl preserva display/raw evidence ma deduplica componenti con identità "
+            "PURL > CPE > ecosystem/package > prodotto NFKC+casefold",
+            "software_observations*.jsonl conserva URL evidenza/confidence; package raw non alimentano "
+            "il fuzzy matcher prima della normalizzazione ecosystem-aware",
+            "alias CVE/GHSA/advisory risolti transitivamente; dedup tecnico = "
+            "(app, vulnerabilità, componente, versione)",
+            "report: un record per (app, vulnerabilità), con tutti i componenti/evidenze in "
+            "affected_components",
+            "seen.txt = coppie (component_id,versione canonica) coperte → la passata FASE 4 fa solo il delta",
             "override binario: PTFLOW_SEARCH_VULNS · normalizzazione versione (lezione 6.6.1p1) · search_vulns fa lui il check dei range",
         ),
     ),
@@ -479,12 +494,13 @@ FLOWMETA: dict[str, StepMeta] = {
         commands=(
             "# stessa correlazione offline di cve_lookup, sul corpus ora esteso",
             "search_vulns -q '<Prodotto Versione>' -f json --ignore-general-product-vulns",
-            "# delta = (prodotto,versione) NON in raw/cve/seen.txt · cache memo condivisa con la passata FASE 2",
+            "# delta = (component_id,versione canonica) NON in raw/cve/seen.txt · cache memo condivisa con FASE 2",
         ),
-        outputs=("findings/cve_full.jsonl",),
+        outputs=("software_inventory.jsonl", "findings/cve_full.jsonl"),
         notes=("offline (net=False) · best-effort: salta se search_vulns/DB assenti",
                "vede le librerie scaricate fuzzando (responses/discovered, recrawl) che la FASE 2 non aveva",
-               "per-app findings → consolidate (fan-in terminale)"),
+               "fan-in riespande eventuali record intermedi e riaggrega per vulnerability_id senza perdere "
+               "affected_components"),
     ),
     "tech_vulnscan": StepMeta(
         summary="FASE 4 (findings) — scanner per-stack FINDINGS-only, gated sulla tech rilevata (il "
@@ -507,12 +523,30 @@ FLOWMETA: dict[str, StepMeta] = {
         outputs=("wl_custom/ai_seed.txt",),
         notes=("opt-in (PTFLOW_AI) · net=False · best-effort (skip se AI off/assente)",),
     ),
+    "ai_cve_poc": StepMeta(
+        summary="[--ai] FASE 2 — interpreta description + campi poc/exploits di search_vulns. Può "
+                "eseguire UNA sola richiesta HTTP read-only, target-local e validata da policy; ogni "
+                "PoC ambiguo/invasivo resta manual_review. Non usa Nuclei.",
+        commands=("# LLM structured decision: safe_http_probe | manual_review | skip",
+                  "curl GET|HEAD|OPTIONS <host in-scope><relative-path>  # solo dopo validazione policy"),
+        outputs=("cve_poc_triage.jsonl", "findings/cve_verified.jsonl",
+                 "raw/cve_poc/surface/"),
+        notes=("needs cve_lookup · net=True · nessun comando/payload arbitrario dal modello",
+               "verifica solo con status + literal body/header matcher; altrimenti nessun finding verified"),
+    ),
     "ai_secret_triage": StepMeta(
         summary="[--ai] FASE 4, offline — classifica i lead secret (real/test/noise) via LLM → "
                 "findings/secrets_triage.jsonl (sidecar; NON muta secrets.jsonl). consolidate lo solleva.",
         commands=("# core/ai — LLMClient.complete_json (selected provider)",),
         outputs=("findings/secrets_triage.jsonl",),
         notes=("opt-in (PTFLOW_AI) · net=False · best-effort",),
+    ),
+    "ai_cve_poc_full": StepMeta(
+        summary="[--ai] FASE 4 — applica lo stesso interprete/policy ai soli CVE del delta expanded.",
+        commands=("# stesso runner ai_cve_poc, input findings/cve_full.jsonl",),
+        outputs=("cve_poc_triage_full.jsonl", "findings/cve_verified_full.jsonl",
+                 "raw/cve_poc/full/"),
+        notes=("needs cve_lookup_full · net=True · nessun Nuclei",),
     ),
     "surface_checkpoint": StepMeta(
         summary="CHECKPOINT GLOBALE dopo la FASE 2 — quando TUTTI i gruppi hanno concluso il DAST della "
@@ -542,8 +576,9 @@ _PIVOT = StepMeta(
 _FANIN = StepMeta(
     summary="Fan-in terminale DETERMINISTICO (consolidate): solleva i findings per-app in "
             "<activity>/findings/<tipo>.jsonl — un file per categoria, ogni record con app_id. cve e "
-            "dast uniscono superficie (fase 2) + deep (fase 4); takeover.txt → record. nuclei_scope è "
-            "già a livello activity. Il seam dell'agente (StubProvider) resta dormiente accanto.",
+            "dast uniscono superficie (fase 2) + deep (fase 4); CVE duplicate fondono sources/hosts e i "
+            "cloud asset condivisi fondono gli app_ids. takeover.txt → record. nuclei_scope è già a "
+            "livello activity. Il seam dell'agente (StubProvider) resta dormiente accanto.",
     outputs=("findings/cve.jsonl", "findings/dast.jsonl", "findings/tilde_enum.jsonl",
              "findings/wpprobe.jsonl", "findings/cloud_assets.jsonl", "findings/sourcemap.jsonl",
              "findings/secrets.jsonl", "findings/takeover.jsonl",

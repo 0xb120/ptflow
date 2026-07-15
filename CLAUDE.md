@@ -998,9 +998,11 @@ flow changed:
 - **AI layer (opt-in, `--ai` / `PTFLOW_AI=on` / `[ai].enabled=true`)** — adds four best-effort LLM
   functions via a **provider-agnostic** `core/ai/` seam (`LLMClient` Protocol + `make_client()`).
   **`PTFLOW_AI_PROVIDER`** selects `ollama` (default, local endpoint
-  `http://127.0.0.1:11434/v1`), `openrouter`, `huggingface`, or an arbitrary
+  `http://127.0.0.1:11434/v1`), `ollama-cloud` (`https://ollama.com/v1`, `OLLAMA_API_KEY`),
+  `openrouter`, `huggingface`, or an arbitrary
   `openai-compatible` endpoint. All use the `openai` SDK from the optional `ai` extra; named hosted
-  providers read `OPENROUTER_API_KEY` / `HF_TOKEN`, while `PTFLOW_AI_MODEL` is always explicit.
+  providers read `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `HF_TOKEN`, while `PTFLOW_AI_MODEL` is
+  always explicit.
   `claude-code` remains a legacy opt-in backend isolated in `ai-claude`; it is no longer installed or
   selected by default. Structured output is **hybrid**: native schema support first, falling back to
   prompt+validate+retry. Every call returns `LLMResult`; managed clients add per-activity cache,

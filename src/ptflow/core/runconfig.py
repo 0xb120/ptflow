@@ -26,9 +26,10 @@ log = get_logger()
 _HTTP_HEADER_SEP = ";;"          # PTFLOW_HTTP_HEADER multi-value separator (env reader also accepts \n)
 _TRUE = {"1", "on", "true", "yes"}
 _AI_PROVIDERS = (
-    "ollama", "openrouter", "huggingface", "openai-compatible", "openai", "claude-code",
+    "ollama", "ollama-cloud", "openrouter", "huggingface", "openai-compatible", "openai",
+    "claude-code",
 )
-_AI_STAGE_NAMES = ("wordlist", "secret_triage", "triage", "report")
+_AI_STAGE_NAMES = ("wordlist", "cve_poc", "secret_triage", "triage", "report")
 _ENUMS = {
     "PTFLOW_PROFILE": ("wide", "home"),
     "PTFLOW_RECRAWL": ("off", "preview", "on"),

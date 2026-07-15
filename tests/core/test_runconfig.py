@@ -191,7 +191,8 @@ def test_snapshot_nothing_set_returns_none(tmp_path):
 def test_ai_provider_enum_accepts_new_values():
     from ptflow.core import runconfig
     providers = (
-        "ollama", "openrouter", "huggingface", "openai-compatible", "openai", "claude-code",
+        "ollama", "ollama-cloud", "openrouter", "huggingface", "openai-compatible", "openai",
+        "claude-code",
     )
     for prov in providers:
         resolved = runconfig.resolve({"ai": {"provider": prov}}, {})
@@ -200,13 +201,15 @@ def test_ai_provider_enum_accepts_new_values():
 
 def test_ai_provider_presets_are_valid_and_enabled():
     root = Path(__file__).resolve().parents[2]
-    for name in ("ollama", "openrouter", "huggingface", "mixed"):
+    for name in ("ollama", "ollama-cloud", "openrouter", "huggingface", "mixed"):
         config = runconfig.load_config(str(root / "configs" / "ai" / f"{name}.toml"))
         envs = _envmap(runconfig.resolve(config, {}, None))
         assert envs["PTFLOW_AI"] == "on"
         assert envs["PTFLOW_AI_PROVIDER"] == ("ollama" if name == "mixed" else name)
         assert envs["PTFLOW_AI_MODEL"]
         assert envs["PTFLOW_AI_BASE_URL"].startswith(("http://", "https://"))
+        if name == "ollama-cloud":
+            assert envs["PTFLOW_PROFILE"] == "home"
 
 
 def test_ai_provider_enum_rejects_unknown():
@@ -243,6 +246,17 @@ def test_ai_stage_routing_and_runtime_controls_resolve():
     assert envs["PTFLOW_AI_STAGE_REPORT_PROVIDER"] == "openrouter"
     assert envs["PTFLOW_AI_STAGE_REPORT_MODEL"] == "vendor/model"
     assert envs["PTFLOW_AI_STAGE_REPORT_MAX_OUTPUT_TOKENS"] == "9000"
+
+
+def test_ai_cve_poc_stage_routing_resolves():
+    envs = _envmap(runconfig.resolve({
+        "ai": {"stages": {"cve_poc": {
+            "enabled": True, "provider": "ollama", "model": "local", "max_output_tokens": 6000,
+        }}},
+    }, {}, None))
+    assert envs["PTFLOW_AI_STAGE_CVE_POC_ENABLED"] == "on"
+    assert envs["PTFLOW_AI_STAGE_CVE_POC_PROVIDER"] == "ollama"
+    assert envs["PTFLOW_AI_STAGE_CVE_POC_MAX_OUTPUT_TOKENS"] == "6000"
 
 
 def test_ai_stage_provider_enum_rejects_unknown():

@@ -88,6 +88,8 @@ def test_webscan_ai_stages_absent_when_off(monkeypatch):
 
     assert "ai_wordlist" not in names
     assert "ai_secret_triage" not in names
+    assert "ai_cve_poc" not in names
+    assert "ai_cve_poc_full" not in names
 
 
 def test_webscan_ai_stages_reuse_external_ai_when_on(monkeypatch):
@@ -104,8 +106,16 @@ def test_webscan_ai_stages_reuse_external_ai_when_on(monkeypatch):
     assert by_name["ai_secret_triage"].run is ai.ai_secret_triage
     assert by_name["ai_secret_triage"].phase == 4
     assert by_name["ai_secret_triage"].net is False
+    assert by_name["ai_cve_poc"].run is ai.ai_cve_poc
+    assert by_name["ai_cve_poc"].phase == 2
+    assert by_name["ai_cve_poc"].net is True
+    assert by_name["ai_cve_poc_full"].run is ai.ai_cve_poc_full
+    assert by_name["ai_cve_poc_full"].phase == 4
+    assert by_name["ai_cve_poc_full"].net is True
     assert isinstance(pipeline.PIPELINE.provider(), ai.LLMHypothesisProvider)
-    assert {"ai_wordlist", "ai_secret_triage"} <= pipeline.PIPELINE.flowmap_spec().steps.keys()
+    assert {"ai_wordlist", "ai_secret_triage", "ai_cve_poc", "ai_cve_poc_full"} <= (
+        pipeline.PIPELINE.flowmap_spec().steps.keys()
+    )
 
     monkeypatch.delenv("PTFLOW_AI", raising=False)
     _reload_pipeline()

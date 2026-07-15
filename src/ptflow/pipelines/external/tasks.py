@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -29,7 +30,16 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import (
+    parse_qsl,
+    quote,
+    unquote,
+    unquote_plus,
+    urlencode,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+)
 
 from ptflow.core import dast as dastconfig
 from ptflow.core import reporting, scope, telemetry, tools, workspace
@@ -157,6 +167,13 @@ NOISE_EXTENSIONS = frozenset({
     "woff", "woff2", "ttf", "eot", "otf", "css",
     "mp3", "mp4", "wav", "avi", "mov", "webm",
 })
+# Asset fetches belong in the crawl/mining corpus, but a parameter-less GET for one is generally not
+# a useful DAST/xref request shape. Keep scripts and stylesheets eligible: despite their extensions,
+# their responses can be generated dynamically from query parameters, cookies, headers or session
+# state and can contain exploitable reflections.
+DAST_STATIC_EXTENSIONS = (NOISE_EXTENSIONS - frozenset({"css"})) | frozenset({
+    "map", "wasm", "webmanifest",
+})
 
 # wordlist synthesis (PHASE 3 — active collection → custom per-app wordlist)
 _TOKEN_MAX_LEN = 40                       # drop longer "segments" (hashes/junk)
@@ -234,6 +251,10 @@ API_SPEC_PATHS = ("/openapi.json", "/swagger.json", "/v2/api-docs", "/v3/api-doc
                   "/api/v1/openapi.json", "/swagger/doc.json")
 GRAPHQL_PATHS = ("/graphql", "/api/graphql", "/v1/graphql", "/query")
 API_SPEC_MAX_OPS = 300     # cap operations expanded per app (logged when it bites)
+_OPENAPI_GENERIC_TITLES = frozenset({"api", "openapi", "swagger", "rest api", "api reference"})
+_OPENAPI_VERSION_PATH_RE = re.compile(r"(?:^|/)(?:app-)?version/?$", re.IGNORECASE)
+_OPENAPI_TITLE_MAX = 120
+_OPENAPI_VERSION_BODY_MAX = 200
 
 # re-seed crawl (PHASE 3) — when fuzzing finds an entry point into UN-CRAWLED territory (e.g. a
 # /debugging dir the link-crawler never reached), crawl it so its linked/rendered surface + request
@@ -481,7 +502,7 @@ _OPTIONAL_TOOLS = {
     "crawley": CRAWLEY, "jsluice": JSLUICE, "shortscan": SHORTSCAN, "shortutil": SHORTUTIL,
     "gitleaks": GITLEAKS, "trufflehog": TRUFFLEHOG, "detect-secrets": DETECT_SECRETS,
     "arjun": ARJUN, "x8": X8, "search_vulns": SEARCH_VULNS, "wpprobe": WPPROBE, "dalfox": DALFOX,
-    "interactsh-client": INTERACTSH,
+    "interactsh-client": INTERACTSH, "curl": "curl",
 }
 
 
@@ -841,6 +862,51 @@ def force_scheme(url: str, by_host: dict[str, str]) -> str:
     if not scheme:
         return url
     return f"{scheme}://{url.split('://', 1)[1] if '://' in url else url}"
+
+
+def rebase_url_authority(url: str, target: str) -> str:
+    """Move a URL's path/query/fragment onto ``target``'s complete scheme+authority.
+
+    Cross-group routing is about reusing a request *shape* on the application group that owns it.
+    Rewriting only the scheme is incorrect when two apps share a hostname on different ports
+    (``http://h:3552/x`` routed to ``https://h`` must not become ``https://h:3552/x``).
+    Invalid/relative inputs are returned unchanged. Pure.
+    """
+    try:
+        source_parts = urlsplit(url)
+        target_parts = urlsplit(target)
+    except ValueError:
+        return url
+    if not source_parts.scheme or not source_parts.netloc or not target_parts.scheme or not target_parts.netloc:
+        return url
+    return urlunsplit((target_parts.scheme, target_parts.netloc, source_parts.path,
+                       source_parts.query, source_parts.fragment))
+
+
+def _request_on_authority(record: dict, target: str) -> dict:
+    """Rebase one structured request and rebuild its raw HTTP Host header for ``target``. Pure."""
+    url = rebase_url_authority(str(record.get("url") or ""), target)
+    method = str(record.get("method") or "GET")
+    headers = record.get("headers") if isinstance(record.get("headers"), Mapping) else {}
+    body = str(record.get("body") or "")
+    return {**record, "url": url, "raw": build_raw_request(method, url, headers, body)}
+
+
+def is_static_dast_request(record: Mapping[str, Any]) -> bool:
+    """True for a parameter-less, body-less GET to a static asset URL.
+
+    JavaScript and CSS remain fuzzable even without an explicit parameter because their responses
+    may be generated dynamically from headers, cookies or session state. Pure.
+    """
+    if str(record.get("method") or "GET").upper() != "GET" or record.get("body") or record.get("params"):
+        return False
+    try:
+        path = urlsplit(str(record.get("url") or "")).path
+    except ValueError:
+        return False
+    last = path.rsplit("/", 1)[-1]
+    extension = last.rsplit(".", 1)[-1].lower() if "." in last else ""
+    return extension in DAST_STATIC_EXTENSIONS
 
 
 def denoise(urls: list[str]) -> list[str]:
@@ -1837,18 +1903,65 @@ def is_js_url(url: str) -> bool:
     return last.lower().endswith(".js")
 
 
+def _decode_chunked_body(body: str) -> str | None:
+    """Decode an HTTP chunked body captured as UTF-8 text; None when malformed. Pure."""
+    data = body.encode("utf-8")
+    position = 0
+    chunks: list[bytes] = []
+    while position < len(data):
+        line_end = data.find(b"\n", position)
+        if line_end < 0:
+            return None
+        size_raw = data[position:line_end].rstrip(b"\r").split(b";", 1)[0]
+        try:
+            size = int(size_raw, 16)
+        except ValueError:
+            return None
+        position = line_end + 1
+        if size == 0:
+            return b"".join(chunks).decode("utf-8", errors="replace")
+        end = position + size
+        if end > len(data):
+            return None
+        chunks.append(data[position:end])
+        position = end
+        if data[position:position + 2] == b"\r\n":
+            position += 2
+        elif data[position:position + 1] == b"\n":
+            position += 1
+        else:
+            return None
+    return None
+
+
 def http_body(text: str) -> str:
-    """Body of a katana/httpx -srd stored response (URL + request + response headers +
-    body). Returns the text after the response headers — the lines after the first blank
-    line that follows the 'HTTP/...' status line. '' if no response line is found."""
-    lines = text.splitlines()
-    start = next((i for i, ln in enumerate(lines) if ln.startswith("HTTP/")), None)
-    if start is None:
+    """Body of a katana/httpx ``-srd`` response, with transfer framing removed.
+
+    ProjectDiscovery stores URL/request/response/body in one file and may retain HTTP chunk framing
+    plus a trailing source URL. Decode ``Transfer-Encoding: chunked`` and honor ``Content-Length`` so
+    JSON parsing sees only the actual response entity. Returns ``''`` without a response status line.
+    Pure.
+    """
+    status = re.search(r"(?m)^HTTP/[^\r\n]*\r?\n", text)
+    if status is None:
         return ""
-    for j in range(start + 1, len(lines)):
-        if not lines[j].strip():
-            return "\n".join(lines[j + 1:]).strip("\n")
-    return ""
+    rest = text[status.end():]
+    separator = "\r\n\r\n" if "\r\n\r\n" in rest else "\n\n"
+    headers, found, body = rest.partition(separator)
+    if not found:
+        return ""
+    header_map = {
+        name.strip().casefold(): value.strip()
+        for line in headers.splitlines() if ":" in line
+        for name, value in [line.split(":", 1)]
+    }
+    if "chunked" in header_map.get("transfer-encoding", "").casefold():
+        decoded = _decode_chunked_body(body)
+        return decoded.strip("\r\n") if decoded is not None else ""
+    if str(header_map.get("content-length") or "").isdigit():
+        length = int(header_map["content-length"])
+        return body.encode("utf-8")[:length].decode("utf-8", errors="replace").strip("\r\n")
+    return body.strip("\r\n")
 
 
 # --- helpers ---
@@ -2921,15 +3034,23 @@ def _schema_prop_names(schema: object) -> list[str]:
 
 
 def _openapi_base(spec: dict, spec_url: str) -> str:
-    """Base URL for a spec's operations: an absolute v3 server, else origin(spec_url) + (v3 relative
-    server path | v2 basePath). Pure."""
+    """Scope-safe base URL for a spec's operations.
+
+    A same-host absolute v3 server is honored. A different authority (commonly generated as
+    ``http://localhost:<port>/api``) contributes only its path, rebased onto the spec authority; this
+    avoids probing the operator's localhost or an unrelated documented host. Relative v3 servers and
+    Swagger v2 ``basePath`` are joined to the spec origin. Pure.
+    """
     parts = urlsplit(spec_url if "://" in spec_url else f"https://{spec_url}")
     origin = f"{parts.scheme}://{parts.netloc}"
     servers = spec.get("servers")
     if isinstance(servers, list) and servers and isinstance(servers[0], dict):
         srv = str(servers[0].get("url") or "")
         if srv.startswith("http"):
-            return srv.rstrip("/")
+            server_parts = urlsplit(srv)
+            if server_parts.hostname == parts.hostname:
+                return srv.rstrip("/")
+            return origin + server_parts.path.rstrip("/")
         if srv.startswith("/"):
             return origin + srv.rstrip("/")
     base_path = spec.get("basePath")
@@ -2989,6 +3110,88 @@ def is_openapi(obj: object) -> bool:
             and isinstance(obj.get("paths"), dict))
 
 
+def openapi_software_observation(spec: object, spec_url: str) -> dict | None:
+    """A version-pinned software observation from OpenAPI ``info`` metadata.
+
+    ``info.version`` is formally the API-document version, so it starts at medium confidence. A
+    declared GET version endpoint can later corroborate it. Generic titles and non-dotted versions
+    are rejected to avoid querying the CVE database for observations such as ``API v1``. Pure.
+    """
+    if not isinstance(spec, dict):
+        return None
+    info = spec.get("info")
+    if not isinstance(info, dict):
+        return None
+    product = re.sub(r"\s+", " ", str(info.get("title") or "")).strip()
+    version = _norm_version(info.get("version"))
+    if (not product or len(product) > _OPENAPI_TITLE_MAX
+            or product.casefold() in _OPENAPI_GENERIC_TITLES
+            or not version):
+        return None
+    return {
+        "product": product,
+        "version": version,
+        "source": "openapi.info",
+        "evidence_url": spec_url,
+        "where": [url_host(spec_url)],
+        "confidence": "medium",
+        "corroborated_by": [],
+    }
+
+
+def openapi_version_urls(spec: object, spec_url: str) -> list[str]:
+    """Declared, parameter-free GET endpoints whose final path is ``version``/``app-version``.
+
+    These are a narrow, spec-backed corroboration set rather than another blind path probe. Pure.
+    """
+    if not isinstance(spec, dict):
+        return []
+    paths = spec.get("paths")
+    if not isinstance(paths, dict):
+        return []
+    base = _openapi_base(spec, spec_url)
+    return tools.dedupe(
+        base + str(path)
+        for path, item in paths.items()
+        if isinstance(item, dict) and isinstance(item.get("get"), dict)
+        and "{" not in str(path) and _OPENAPI_VERSION_PATH_RE.search(str(path))
+    )
+
+
+def _reported_version(body: str) -> str | None:
+    """Version reported by a dedicated version endpoint body. Pure."""
+    obj = _try_json(body)
+    if isinstance(obj, dict):
+        values = {str(key).casefold(): value for key, value in obj.items()}
+        for key in ("version", "currentversion", "appversion"):
+            if version := _norm_version(values.get(key)):
+                return version
+        return None
+    if isinstance(obj, str):
+        return _norm_version(obj)
+    return _norm_version(body) if len(body) <= _OPENAPI_VERSION_BODY_MAX else None
+
+
+def corroborate_openapi_observations(
+    observations: Iterable[dict], version_responses: Mapping[str, str],
+) -> list[dict]:
+    """Raise OpenAPI observations to high confidence when a same-authority endpoint agrees. Pure."""
+    out: list[dict] = []
+    for observation in observations:
+        evidence = urlsplit(str(observation.get("evidence_url") or ""))
+        version = str(observation.get("version") or "")
+        corroborated = sorted(
+            url for url, body in version_responses.items()
+            if urlsplit(url).netloc == evidence.netloc and _reported_version(body) == version
+        )
+        out.append({
+            **observation,
+            "confidence": "high" if corroborated else observation.get("confidence", "medium"),
+            "corroborated_by": corroborated,
+        })
+    return out
+
+
 def expand_openapi(spec: object, spec_url: str, *, cap: int) -> list[dict]:
     """Expand an OpenAPI v3 / Swagger v2 JSON spec into catalog request records — one per operation
     (method x path), capped. Handles shared path-item params + per-operation params. Pure."""
@@ -3022,25 +3225,46 @@ def api_spec(activity: Activity, app_id: str) -> None:
 
     The richest source of method+body+param surface — exactly the API endpoints a link-crawler and a
     GET-only fuzzer miss. Probes a fixed set of well-known spec paths on the group's hosts (httpx, 200
-    only, bodies stored), parses each JSON spec and expands EVERY operation into a full request record;
+    only, bodies stored), parses each JSON spec and expands EVERY operation into a full request record.
+    OpenAPI info.title+info.version become audit-ready software observations; declared GET version
+    endpoints are probed to corroborate that the document version is the running product version.
     GraphQL endpoints that respond are recorded as a POST-json request the DAST can fuzz. Best-effort
-    (no spec → empty file). request_catalog folds requests_api.jsonl in across the barrier.
+    (no spec → empty files). request_catalog folds requests_api.jsonl in across the barrier.
     """
     ws = activity.app(app_id)
     roots = [h.rstrip("/") for h in _scan_hosts(ws)]
     if not roots:
+        tools.write_jsonl(ws.canonical("requests_api.jsonl"), [])
+        tools.write_jsonl(ws.canonical("software_observations.jsonl"), [])
         return
     store = ws.raw("api_spec")
     _run("httpx", [HTTPX, "-silent", "-srd", str(store / "store"), "-mc", "200", *_header_flags("-H")],
          stdin="\n".join(r + p for r in roots for p in API_SPEC_PATHS),
          dest=store / "probe.txt", label=app_id)
     records: list[dict] = []
-    for stored, url in _store_index(store / "store" / "index.txt"):
+    observations: list[dict] = []
+    version_urls: list[str] = []
+    for stored, url in _store_records(store / "store"):
         if not Path(stored).is_file():
             continue
         obj = _try_json(http_body(Path(stored).read_text(encoding="utf-8", errors="replace")))
         if is_openapi(obj):
             records += expand_openapi(obj, url, cap=API_SPEC_MAX_OPS)
+            if observation := openapi_software_observation(obj, url):
+                observations.append(observation)
+            version_urls += openapi_version_urls(obj, url)
+    version_responses: dict[str, str] = {}
+    if version_urls := tools.dedupe(version_urls):
+        version_store = store / "version"
+        _run("httpx", [HTTPX, "-silent", "-srd", str(version_store), "-mc", "200",
+                       *_header_flags("-H")],
+             stdin="\n".join(version_urls), dest=store / "version-probe.txt", label=app_id)
+        for stored, url in _store_records(version_store):
+            if Path(stored).is_file():
+                text = Path(stored).read_text(encoding="utf-8", errors="replace")
+                version_responses[url] = http_body(text)
+    observations = corroborate_openapi_observations(observations, version_responses)
+    tools.write_jsonl(ws.canonical("software_observations.jsonl"), observations)
     # GraphQL: any endpoint that responds (200/400/405 to the GET probe) → a POST-json request to fuzz
     gql = _run("httpx", [HTTPX, "-silent", "-mc", "200,400,405", *_header_flags("-H")],
                stdin="\n".join(r + p for r in roots for p in GRAPHQL_PATHS),
@@ -3048,7 +3272,9 @@ def api_spec(activity: Activity, app_id: str) -> None:
     records += [_synth_request("POST", u, {"Content-Type": "application/json"},
                                '{"query":"{__typename}"}', "graphql") for u in _lines(gql)]
     n = tools.write_jsonl(ws.canonical("requests_api.jsonl"), merge_requests(records))
-    log.info("  → api_spec (%s) — %d API request(s) from specs/graphql → requests_api.jsonl", app_id, n)
+    log.info("  → api_spec (%s) — %d API request(s) · %d software observation(s) (%d corroborated)",
+             app_id, n, len(observations),
+             sum(1 for observation in observations if observation.get("corroborated_by")))
 
 
 def _store_index(index: Path) -> list[tuple[str, str]]:
@@ -3060,6 +3286,19 @@ def _store_index(index: Path) -> list[tuple[str, str]]:
         if len(parts) >= 2:  # noqa: PLR2004
             out.append((parts[0], parts[1]))
     return out
+
+
+def _store_records(root: Path) -> list[tuple[str, str]]:
+    """Every unique stored response referenced below an httpx/katana store root.
+
+    ProjectDiscovery versions differ on whether ``-srd DIR`` writes ``DIR/index.txt`` or
+    ``DIR/response/index.txt``. Recursive discovery supports both layouts. Pure disk read.
+    """
+    if not root.exists():
+        return []
+    return list(dict.fromkeys(
+        record for index in sorted(root.rglob("index.txt")) for record in _store_index(index)
+    ))
 
 
 def _all_store_indices(ws: AppWorkspace) -> list[Path]:
@@ -3294,6 +3533,7 @@ def mine_responses(activity: Activity, app_id: str) -> None:
     (idempotent _extract_bodies), so the final fleet sees everything this step already wrote.
     """
     ws = activity.app(app_id)
+    n_software = _write_corpus_software_observations(ws)
     bodies, js_files = _extract_bodies(ws)
     if bodies is None:
         log.debug("  · skip mine_responses (empty response store) for %s", app_id)
@@ -3305,8 +3545,9 @@ def mine_responses(activity: Activity, app_id: str) -> None:
     if exposed:
         tools.write_jsonl(ws.findings / "sourcemap.jsonl",
                           [{"type": "sourcemap-exposed", "severity": "info", "url": u} for u in exposed])
-    log.info("  → mine_responses (%s) — %d JS (+%d sourcemap src) → %d endpoint(s) · %d map(s) exposed",
-             app_id, len(js_files), len(sm_files), n_ep, len(exposed))
+    log.info("  → mine_responses (%s) — %d JS (+%d sourcemap src) → %d endpoint(s) · "
+             "%d map(s) exposed · %d software observation(s)",
+             app_id, len(js_files), len(sm_files), n_ep, len(exposed), n_software)
 
 
 def _shortscan_surface(activity: Activity, ws: AppWorkspace, app_id: str) -> tuple[list[str], list[dict]]:
@@ -3543,6 +3784,7 @@ def _scan_secrets(ws: AppWorkspace, app_id: str) -> None:
     (--results=verified) ∥ detect-secrets, merged + deduped (merge_secrets) → secrets.jsonl.
     Best-effort; no-op when the corpus is empty."""
     bodies, _ = _extract_bodies(ws)
+    _write_corpus_software_observations(ws)  # phase-3 downloads may have grown manifests/bundles
     if bodies is None:
         log.debug("  · no corpus to secret-scan for %s", app_id)
         return
@@ -4039,15 +4281,41 @@ _XREF_REQUEST_FILES = ("requests_crawl.jsonl", "requests_headless.jsonl", "reque
 _XREF_ENDPOINT_FILES = ("endpoints.txt", "endpoints_js.txt", "endpoints_headless.txt")
 
 
+def _xref_record(record: dict, by_host: Mapping[str, str], tag: str) -> dict | None:
+    """Rebase one peer request onto its owning app authority, or drop it. Pure."""
+    target = by_host.get(url_host(record.get("url") or ""))
+    if not target:
+        return None
+    routed = _request_on_authority(
+        {**record, "sources": [*(record.get("sources") or []), tag]}, target,
+    )
+    return None if is_static_dast_request(routed) else routed
+
+
+def _xref_url(url: str, by_host: Mapping[str, str], tag: str) -> dict | None:
+    """Rebase one peer URL onto its owning app authority as a GET, or drop it. Pure."""
+    target = by_host.get(url_host(url))
+    if not target:
+        return None
+    routed = _url_to_get_request(rebase_url_authority(url, target), tag)
+    return None if is_static_dast_request(routed) else routed
+
+
 def _cross_group_surface(activity: Activity, ws: AppWorkspace) -> list[dict]:
-    """Request records discovered in OTHER app groups whose host belongs to `ws` — cross-group routing
-    that carries an API host's surface (only discoverable from another group's frontend JS) into that
-    host's OWN group. Returns request records (bare endpoints converted to GET via _url_to_get_request),
-    each with `xref:<origin app_id>` appended to `sources`. Reads only other groups' DERIVED discovery
-    artifacts (no re-mining, no network). RoE-safe: only hosts owned by `ws` are kept, so a host that is
-    no group's host is never routed. Pure-ish (reads disk only)."""
-    mine = {url_host(h) for h in tools.read_lines(ws.hosts)}
-    if not mine:
+    """Request shapes from OTHER groups rebased onto the authority owned by ``ws``.
+
+    The source host still gates RoE ownership, but scheme *and port* come from this group's canonical
+    host. This matters when independent apps share a hostname on different ports. Plain passive-asset
+    GETs are excluded before they can inflate the xref/DAST catalogs; JS, MJS and CSS remain eligible
+    because their responses may be dynamic. Every routed record carries ``xref:<origin app_id>`` provenance.
+    Pure-ish (reads disk only).
+    """
+    by_host: dict[str, str] = {}
+    for target_host in tools.read_lines(ws.hosts):
+        bare = url_host(target_host)
+        if bare:
+            by_host.setdefault(bare, target_host)
+    if not by_host:
         return []
     out: list[dict] = []
     for other in activity.list_apps():
@@ -4056,13 +4324,11 @@ def _cross_group_surface(activity: Activity, ws: AppWorkspace) -> list[dict]:
             continue
         tag = f"xref:{origin}"
         for fname in _XREF_REQUEST_FILES:
-            out.extend({**rec, "sources": [*(rec.get("sources") or []), tag]}
-                       for rec in tools.read_jsonl(other.canonical(fname))
-                       if url_host(rec.get("url") or "") in mine)
+            out.extend(routed for rec in tools.read_jsonl(other.canonical(fname))
+                       if (routed := _xref_record(rec, by_host, tag)) is not None)
         for fname in _XREF_ENDPOINT_FILES:
-            out.extend(_url_to_get_request(u, tag)
-                       for u in tools.read_lines(other.canonical(fname))
-                       if url_host(u) in mine)
+            out.extend(routed for url in tools.read_lines(other.canonical(fname))
+                       if (routed := _xref_url(url, by_host, tag)) is not None)
     return out
 
 
@@ -4276,8 +4542,13 @@ def build_fuzz_requests(params: Iterable[dict]) -> list[dict]:
 
 def dast_requests(catalog: Iterable[dict], params: Iterable[dict], *, cap: int) -> list[dict]:
     """The full request set to fuzz: the catalog + the synthesized requests for discovered hidden
-    params, deduped by shape (merge_requests) and capped (logged when it bites). Pure (logging only)."""
-    merged = merge_requests([*catalog, *build_fuzz_requests(params)])
+    params, with parameter-less static asset GETs removed, deduped by shape (merge_requests) and
+    capped (logged when it bites). Pure (telemetry/logging only)."""
+    candidates = [*catalog, *build_fuzz_requests(params)]
+    filtered = [record for record in candidates if not is_static_dast_request(record)]
+    if n_static := len(candidates) - len(filtered):
+        telemetry.record_drop("static_dast_requests", n_static)
+    merged = merge_requests(filtered)
     if len(merged) > cap:
         telemetry.record_cap("dast_requests", limit=cap, observed=len(merged), selected=cap)
         telemetry.record_drop("dast_request_cap", len(merged) - cap)
@@ -4715,6 +4986,46 @@ def sqli_full(activity: Activity, app_id: str) -> None:
 _VERSION_RE = re.compile(r"\d+(?:\.\d+)+")          # dotted version, ≥ X.Y (single major is too vague)
 _CVE_BODY_HEAD = 4096                               # bytes/body to scan — lib banners live at the head
 _CVE_DESC_MAX = 500                                 # trim CVE descriptions in the finding record
+_SOFTWARE_BUNDLE_SCAN_MAX = 2_000_000               # bounded full-bundle metadata scan per response
+_SOFTWARE_OBSERVATIONS_MAX = 500                     # app-wide audit sidecar cap
+_SOFTWARE_OBSERVATIONS_PER_BODY = 100                # one dependency-heavy bundle cannot crowd it out
+_SOFTWARE_PRODUCT_MAX = 120
+_CPE_MIN_PARTS = 6
+_SOFTWARE_MANIFESTS = frozenset({
+    "package.json", "package-lock.json", "npm-shrinkwrap.json", "bower.json",
+    "composer.json", "version.json",
+})
+_SOFTWARE_GENERIC_NAMES = frozenset({
+    "app", "application", "backend", "client", "frontend", "package", "server", "website",
+})
+_PRODUCT_PACKAGE_ALIASES: dict[str, tuple[str, str]] = {
+    "mcp-inspector": ("npm", "@modelcontextprotocol/inspector"),
+}
+_PACKAGE_NAME = r"[@A-Za-z0-9][@A-Za-z0-9._/-]{1,119}"
+_FLAT_PACKAGE_RES = (
+    re.compile(
+        rf"""[{{,]\s*["']?(?:packageName|name)["']?\s*[:=]\s*["'](?P<name>{_PACKAGE_NAME})["']"""
+        rf"""[^{{}}]{{0,240}}?["']?(?:packageVersion|version)["']?\s*[:=]\s*["']v?"""
+        rf"""(?P<version>\d+\.\d+(?:\.\d+)*[^"']*)["']""",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"""[{{,]\s*["']?(?:packageVersion|version)["']?\s*[:=]\s*["']v?"""
+        rf"""(?P<version>\d+\.\d+(?:\.\d+)*[^"']*)["']"""
+        rf"""[^{{}}]{{0,240}}?["']?(?:packageName|name)["']?\s*[:=]\s*["']"""
+        rf"""(?P<name>{_PACKAGE_NAME})["']""",
+        re.IGNORECASE,
+    ),
+)
+_SCOPED_PACKAGE_REF_RE = re.compile(
+    r"(?P<name>@[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*)@v?"
+    r"(?P<version>\d+\.\d+(?:\.\d+)*)",
+    re.IGNORECASE,
+)
+_BUNDLE_PRODUCT_RES = (
+    (re.compile(r"\bMCP[ -]Inspector\b[^\r\n]{0,80}?v?(\d+\.\d+(?:\.\d+)*)",
+                re.IGNORECASE), "MCP Inspector"),
+)
 # service banners (nerva metadata.banner) → (product, version). Precision-first: only known patterns.
 _BANNER_PATTERNS = (
     (re.compile(r"OpenSSH[_/ ]?([\w.]+)", re.IGNORECASE), "OpenSSH"),
@@ -4772,7 +5083,7 @@ _ASSET_RE = tuple(
     for tok, product in _ASSET_PRODUCTS
 )
 
-_CVE_CACHE: dict[tuple[str, str], list[dict]] = {}   # (product.lower, version) → CVE records
+_CVE_CACHE: dict[tuple[str, str], list[dict]] = {}   # (normalized product, version) → CVE records
 _CVE_CACHE_LOCK = threading.Lock()                   # the fan-out runs in one process → dedup across apps
 
 
@@ -4782,6 +5093,264 @@ def _norm_version(raw: object) -> str | None:
     Pure."""
     m = _VERSION_RE.search(str(raw or ""))
     return m.group(0) if m else None
+
+
+def normalize_product_key(raw: object) -> str:
+    """Stable fallback identity for a display product; raw evidence is never mutated. Pure."""
+    text = unicodedata.normalize("NFKC", str(raw or "")).casefold().strip()
+    return re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+
+
+def _versionless_purl(raw: object) -> str | None:
+    """Canonical lower-case PURL without version/qualifiers/subpath. Pure."""
+    value = str(raw or "").strip()
+    if not value.casefold().startswith("pkg:"):
+        return None
+    value = value.split("#", 1)[0].split("?", 1)[0]
+    version_at = value.rfind("@")
+    if version_at > value.rfind("/"):
+        value = value[:version_at]
+    return value.casefold()
+
+
+def _package_purl(ecosystem: object, package: object) -> str | None:
+    """A versionless PURL for ecosystems whose package coordinates are unambiguous. Pure."""
+    eco = str(ecosystem or "").strip().casefold()
+    name = str(package or "").strip()
+    if eco not in {"npm", "composer"} or not name:
+        return None
+    return f"pkg:{eco}/{quote(name, safe='/')}".casefold()
+
+
+def _versionless_cpe(raw: object) -> str | None:
+    """CPE 2.3 part/vendor/product identity, excluding the version. Pure."""
+    value = str(raw or "").strip().casefold()
+    parts = value.split(":")
+    return ":".join(parts[:5]) if len(parts) >= _CPE_MIN_PARTS and parts[:2] == ["cpe", "2.3"] else None
+
+
+def canonical_component_id(
+    product: object,
+    *,
+    ecosystem: object = None,
+    package: object = None,
+    purl: object = None,
+    cpe: object = None,
+) -> str:
+    """Preferred component identity: PURL → CPE → ecosystem package → normalized product. Pure."""
+    product_key = normalize_product_key(product)
+    alias_ecosystem, alias_package = _PRODUCT_PACKAGE_ALIASES.get(product_key, ("", ""))
+    resolved_ecosystem = ecosystem or alias_ecosystem
+    resolved_package = package or alias_package
+    if canonical_purl := (_versionless_purl(purl)
+                          or _package_purl(resolved_ecosystem, resolved_package)):
+        return f"purl:{canonical_purl}"
+    if canonical_cpe := _versionless_cpe(cpe):
+        return canonical_cpe
+    if resolved_ecosystem and resolved_package:
+        return f"package:{str(resolved_ecosystem).casefold()}:{normalize_product_key(resolved_package)}"
+    return f"product:{product_key}" if product_key else "product:unknown"
+
+
+def _software_product(raw: object) -> str | None:
+    """A bounded, human/package product identifier suitable for an observation. Pure."""
+    product = " ".join(str(raw or "").split()).strip(" /:")
+    if (not product or len(product) > _SOFTWARE_PRODUCT_MAX
+            or product.casefold() in _SOFTWARE_GENERIC_NAMES):
+        return None
+    return product
+
+
+def _software_observation(  # noqa: PLR0913
+    product: object,
+    version: object,
+    *,
+    url: str,
+    source: str,
+    ecosystem: str | None = None,
+    package: str | None = None,
+    confidence: str = "medium",
+) -> dict[str, Any] | None:
+    """Build one raw software observation.
+
+    Manifest/package identities are deliberately marked ``queryable=false``.  They are strong
+    evidence that a component exists, but ``search_vulns``' fuzzy title matcher can map a scoped npm
+    package to an unrelated CPE.  A later canonical inventory step must resolve ecosystem identity
+    before these observations are allowed to drive CVE queries.
+    """
+    normalized_product = _software_product(product)
+    normalized_version = _norm_version(version)
+    if not normalized_product or not normalized_version:
+        return None
+    product_key = normalize_product_key(normalized_product)
+    alias_ecosystem, alias_package = _PRODUCT_PACKAGE_ALIASES.get(product_key, ("", ""))
+    normalized_ecosystem = str(ecosystem or alias_ecosystem or "").casefold() or None
+    normalized_package = package or alias_package or None
+    purl = _package_purl(normalized_ecosystem, normalized_package)
+    return {
+        "product": normalized_product,
+        "observed_products": [normalized_product],
+        "canonical_product": product_key,
+        "version": normalized_version,
+        "canonical_version": normalized_version,
+        "component_id": canonical_component_id(
+            normalized_product, ecosystem=normalized_ecosystem, package=normalized_package, purl=purl,
+        ),
+        "source": source,
+        "evidence_url": url,
+        "where": [url_host(url)] if url_host(url) else [],
+        "confidence": confidence,
+        "ecosystem": normalized_ecosystem,
+        "package": normalized_package,
+        "purl": purl,
+        "queryable": False,
+    }
+
+
+def manifest_software_observations(text: str, url: str) -> list[dict[str, Any]]:
+    """Top-level product/version metadata from known package/version manifests. Pure.
+
+    Dependency trees are intentionally not expanded here: the served application itself is the
+    observation, while bundle metadata below catches precise embedded package identities.  Both stay
+    out of fuzzy CVE correlation until ecosystem-aware normalization exists.
+    """
+    filename = Path(urlsplit(url).path).name.casefold()
+    if filename not in _SOFTWARE_MANIFESTS:
+        return []
+    try:
+        document = json.loads(text[:_SOFTWARE_BUNDLE_SCAN_MAX])
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(document, dict):
+        return []
+    root = document
+    packages = document.get("packages")
+    if isinstance(packages, dict) and isinstance(packages.get(""), dict):
+        root = {**document, **packages[""]}
+    product = root.get("product") or root.get("title") or root.get("name")
+    version = root.get("version") or root.get("packageVersion")
+    ecosystem = (
+        "composer" if filename == "composer.json"
+        else "bower" if filename == "bower.json"
+        else "npm" if filename in {"package.json", "package-lock.json", "npm-shrinkwrap.json"}
+        else None
+    )
+    package = _software_product(root.get("name")) if ecosystem else None
+    observation = _software_observation(
+        product, version, url=url, source=f"manifest:{filename}", ecosystem=ecosystem,
+        package=package, confidence="high",
+    )
+    return [observation] if observation else []
+
+
+def bundle_software_observations(text: str, url: str) -> list[dict[str, Any]]:  # noqa: C901
+    """Precise name/version metadata embedded in bounded JS/MJS bundles. Pure.
+
+    Matches only adjacent flat metadata, exact scoped-package references and a small curated product
+    banner set.  Generic ``foo-1.2.3`` strings are not treated as software identities.
+    """
+    path = urlsplit(url).path.casefold()
+    if not path.endswith((".js", ".mjs")):
+        return []
+    bounded = text[:_SOFTWARE_BUNDLE_SCAN_MAX]
+    observations: list[dict[str, Any]] = []
+
+    def add(product: object, version: object, *, package: str | None = None,
+            confidence: str = "medium") -> None:
+        if len(observations) >= _SOFTWARE_OBSERVATIONS_PER_BODY:
+            return
+        observation = _software_observation(
+            product, version, url=url, source="bundle-metadata", ecosystem="npm",
+            package=package, confidence=confidence,
+        )
+        if observation:
+            observations.append(observation)
+
+    for rx, product in _BUNDLE_PRODUCT_RES:
+        for match in rx.finditer(bounded):
+            add(product, match.group(1), confidence="high")
+    for rx in _FLAT_PACKAGE_RES:
+        for match in rx.finditer(bounded):
+            package = _software_product(match.group("name"))
+            if package:
+                add(package, match.group("version"), package=package, confidence="high")
+    for match in _SCOPED_PACKAGE_REF_RE.finditer(bounded):
+        package = match.group("name")
+        add(package, match.group("version"), package=package)
+    return dedup_software_observations(observations)
+
+
+def dedup_software_observations(records: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate raw detector observations and retain every evidence URL/source. Pure."""
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in records:
+        product = _software_product(record.get("product"))
+        version = _norm_version(record.get("version"))
+        if not product or not version:
+            continue
+        ecosystem = str(record.get("ecosystem") or "")
+        package = str(record.get("package") or "")
+        component_id = str(record.get("component_id") or canonical_component_id(
+            product, ecosystem=ecosystem, package=package, purl=record.get("purl"),
+            cpe=record.get("cpe"),
+        ))
+        key = (component_id, version)
+        evidence = str(record.get("evidence_url") or "")
+        source = str(record.get("source") or "observation")
+        if key not in by_key:
+            by_key[key] = {
+                **record,
+                "product": product,
+                "observed_products": sorted({product, *(record.get("observed_products") or [])}),
+                "canonical_product": normalize_product_key(product),
+                "version": version,
+                "canonical_version": version,
+                "component_id": component_id,
+                "evidence_urls": [evidence] if evidence else [],
+                "sources": [source],
+            }
+            continue
+        current = by_key[key]
+        current["evidence_urls"] = sorted({*(current.get("evidence_urls") or []), evidence} - {""})
+        current["sources"] = sorted({*(current.get("sources") or []), source})
+        current["where"] = sorted({*(current.get("where") or []), *(record.get("where") or [])})
+        current["observed_products"] = sorted(
+            {*(current.get("observed_products") or []), product,
+             *(record.get("observed_products") or [])},
+            key=lambda value: (str(value).casefold(), str(value)),
+        )
+        if record.get("confidence") == "high":
+            current["confidence"] = "high"
+    return [by_key[key] for key in sorted(by_key)]
+
+
+def _corpus_software_observations(ws: AppWorkspace) -> list[dict[str, Any]]:
+    """Manifest/bundle observations from the self-describing stored-response corpus."""
+    observations: list[dict[str, Any]] = []
+    for index in _all_store_indices(ws):
+        if len(observations) >= _SOFTWARE_OBSERVATIONS_MAX:
+            break
+        for stored, url in _store_index(index):
+            if len(observations) >= _SOFTWARE_OBSERVATIONS_MAX:
+                break
+            source = Path(stored)
+            if not source.is_file():
+                continue
+            try:
+                body = http_body(source.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            observations.extend(manifest_software_observations(body, url))
+            observations.extend(bundle_software_observations(body, url))
+    return dedup_software_observations(observations)[:_SOFTWARE_OBSERVATIONS_MAX]
+
+
+def _write_corpus_software_observations(ws: AppWorkspace) -> int:
+    """Refresh the canonical raw-observation sidecar after corpus growth."""
+    return tools.write_jsonl(
+        ws.canonical("software_observations_corpus.jsonl"),
+        _corpus_software_observations(ws),
+    )
 
 
 def _split_name_version(s: str) -> tuple[str, str] | None:
@@ -4857,23 +5426,104 @@ def _corpus_software(texts: Iterable[str]) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def collect_software(*, tech: Iterable[str], server: object,  # noqa: PLR0913
+def _observed_software(
+    observation: Mapping[str, Any], default_where: list[str],
+) -> dict[str, Any] | None:
+    """Normalize one structured detector observation for ``collect_software``. Pure."""
+    product = str(observation.get("product") or "").strip()
+    version = _norm_version(observation.get("version"))
+    if not product or not version:
+        return None
+    source = str(observation.get("source") or "observation").strip()
+    observed_where = observation.get("where")
+    if isinstance(observed_where, str):
+        where = [observed_where]
+    elif isinstance(observed_where, list):
+        where = [str(value) for value in observed_where if value]
+    else:
+        where = default_where
+    return {
+        "product": product,
+        "version": version,
+        "source": source,
+        "where": where or default_where,
+        "ecosystem": observation.get("ecosystem"),
+        "package": observation.get("package"),
+        "purl": observation.get("purl"),
+        "cpe": observation.get("cpe"),
+        "queryable": observation.get("queryable") is not False,
+    }
+
+
+def _observed_software_records(
+    observations: Iterable[Mapping[str, Any]], default_where: list[str],
+) -> list[dict[str, Any]]:
+    """Valid normalized structured observations. Pure."""
+    return [record for observation in observations
+            if (record := _observed_software(observation, default_where))]
+
+
+def collect_software(*, tech: Iterable[str], server: object,  # noqa: C901, PLR0913
                      services: Iterable[tuple[str, str]],
                      corpus_texts: Iterable[str], app_hosts: Iterable[str],
-                     corpus_urls: Iterable[str] = ()) -> list[dict]:
-    """Deduped ENUMERATED software → [{product, version, sources, where}], version-pinned. Sources:
+                     corpus_urls: Iterable[str] = (),
+                     observations: Iterable[Mapping[str, Any]] = ()) -> list[dict]:
+    """Canonical version-pinned software inventory, deduped by component identity + version. Sources:
     web server (Server header), app tech (wappalyzer), non-HTTP service banners ((host:port, banner)),
     libs mined from the crawl corpus — body banners/generator/asset-refs (corpus_texts) AND the
-    versioned filenames of the fetched URLs (corpus_urls, e.g. .../jquery-3.6.0.min.js). tech/server/
-    corpus are attributed to the app's hosts; a service banner to its own host:port. Pure — the
-    query/attribution set for search_vulns."""
+    versioned filenames of the fetched URLs (corpus_urls, e.g. .../jquery-3.6.0.min.js) — plus
+    structured observations such as OpenAPI info metadata. App-level evidence is attributed to the
+    group's hosts; a service banner to its own host:port. Raw ecosystem observations remain in the
+    inventory with ``queryable=false`` until an exact advisory resolver can consume their PURL. Pure.
+    """
     grp = sorted(set(app_hosts))
-    by_pv: dict[tuple[str, str], dict[str, set]] = {}
+    by_pv: dict[tuple[str, str], dict[str, Any]] = {}
 
-    def add(product: str, version: str, source: str, where: Iterable[str]) -> None:
-        e = by_pv.setdefault((product, version), {"sources": set(), "where": set()})
+    def add(  # noqa: PLR0913
+        product: str,
+        version: str,
+        source: str,
+        where: Iterable[str],
+        *,
+        ecosystem: object = None,
+        package: object = None,
+        purl: object = None,
+        cpe: object = None,
+        queryable: bool = True,
+    ) -> None:
+        component_id = canonical_component_id(
+            product, ecosystem=ecosystem, package=package, purl=purl, cpe=cpe,
+        )
+        key = (component_id, version)
+        e = by_pv.setdefault(key, {
+            "product": product,
+            "observed_products": set(),
+            "canonical_product": normalize_product_key(product),
+            "component_id": component_id,
+            "canonical_version": version,
+            "sources": set(),
+            "where": set(),
+            "ecosystems": set(),
+            "packages": set(),
+            "purls": set(),
+            "cpes": set(),
+            "queryable": False,
+        })
+        if queryable and not e["queryable"]:
+            e["product"] = product
+            e["canonical_product"] = normalize_product_key(product)
+        e["observed_products"].add(product)
         e["sources"].add(source)
         e["where"].update(where)
+        e["queryable"] = bool(e["queryable"] or queryable)
+        if ecosystem:
+            e["ecosystems"].add(str(ecosystem).casefold())
+        if package:
+            e["packages"].add(str(package))
+        if canonical_purl := (_versionless_purl(purl) or _package_purl(ecosystem, package)):
+            e["purls"].add(canonical_purl)
+        if canonical_cpe := _versionless_cpe(cpe):
+            e["cpes"].add(canonical_cpe)
 
     for product, version in _tech_software(tech):
         add(product, version, "tech", grp)
@@ -4887,8 +5537,82 @@ def collect_software(*, tech: Iterable[str], server: object,  # noqa: PLR0913
     for url in corpus_urls:                                  # versioned asset filenames in fetched URLs
         for product, version in mine_asset_versions(url):
             add(product, version, "corpus", grp)
-    return [{"product": p, "version": v, "sources": sorted(e["sources"]), "where": sorted(e["where"])}
-            for (p, v), e in sorted(by_pv.items())]
+    for observation in _observed_software_records(observations, grp):
+        add(
+            observation["product"], observation["version"], observation["source"],
+            observation["where"], ecosystem=observation.get("ecosystem"),
+            package=observation.get("package"), purl=observation.get("purl"),
+            cpe=observation.get("cpe"), queryable=bool(observation.get("queryable")),
+        )
+    return [{
+        "product": e["product"],
+        "observed_products": sorted(e["observed_products"], key=lambda value: (value.casefold(), value)),
+        "canonical_product": e["canonical_product"],
+        "version": version,
+        "canonical_version": e["canonical_version"],
+        "component_id": e["component_id"],
+        "ecosystem": sorted(e["ecosystems"])[0] if e["ecosystems"] else None,
+        "package": sorted(e["packages"], key=str.casefold)[0] if e["packages"] else None,
+        "purl": sorted(e["purls"])[0] if e["purls"] else None,
+        "cpe": sorted(e["cpes"])[0] if e["cpes"] else None,
+        "queryable": e["queryable"],
+        "sources": sorted(e["sources"]),
+        "where": sorted(e["where"]),
+    } for (_, version), e in sorted(by_pv.items())]
+
+
+_KNOWN_ADVISORY_RE = re.compile(
+    r"(?i)\b(CVE-\d{4}-\d{4,}|GHSA-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4}-"
+    r"[23456789cfghjmpqrvwx]{4}|EUVD-\d{4}-\d+)\b",
+)
+
+
+def normalize_advisory_id(raw: object) -> str | None:
+    """Canonical display ID from an advisory key or URL. Pure."""
+    value = unicodedata.normalize("NFKC", str(raw or "")).strip()
+    if not value:
+        return None
+    if match := _KNOWN_ADVISORY_RE.search(value):
+        return match.group(1).upper()
+    candidate = value.removeprefix("cve:").removeprefix("ghsa:").strip().upper()
+    if candidate.startswith(("CVE-", "GHSA-", "EUVD-")) and not any(char.isspace() for char in candidate):
+        return candidate[:120]
+    return None
+
+
+def advisory_ids(record: Mapping[str, Any]) -> list[str]:
+    """Every normalized vulnerability/advisory identity carried by a record. Pure."""
+    values: list[object] = [record.get("cve"), record.get("advisory_id")]
+    existing = record.get("advisory_ids")
+    if isinstance(existing, (list, tuple, set)):
+        values.extend(existing)
+    aliases = record.get("aliases")
+    if isinstance(aliases, dict):
+        values.extend(aliases)
+        values.extend(aliases.values())
+    elif isinstance(aliases, (list, tuple, set)):
+        values.extend(aliases)
+    return sorted({identifier for value in values
+                   if (identifier := normalize_advisory_id(value))})
+
+
+def canonical_advisory_id(identifiers: Iterable[str]) -> str | None:
+    """Prefer CVE, then GHSA, then another advisory namespace. Pure."""
+    values = sorted(set(identifiers))
+    return (next((value for value in values if value.startswith("CVE-")), None)
+            or next((value for value in values if value.startswith("GHSA-")), None)
+            or (values[0] if values else None))
+
+
+def vulnerability_id(identifier: object) -> str | None:
+    """Namespaced canonical vulnerability key used for joins/dedup. Pure."""
+    normalized = normalize_advisory_id(identifier)
+    if not normalized:
+        return None
+    namespace = "cve" if normalized.startswith("CVE-") else (
+        "ghsa" if normalized.startswith("GHSA-") else "advisory"
+    )
+    return f"{namespace}:{normalized}"
 
 
 def parse_search_vulns(out: str, product: str, version: str) -> list[dict] | None:
@@ -4906,11 +5630,13 @@ def parse_search_vulns(out: str, product: str, version: str) -> list[dict] | Non
     product_ids = entry.get("product_ids")
     cpes = product_ids.get("cpe") if isinstance(product_ids, dict) else None
     cpes = cpes if isinstance(cpes, list) else []
+    purls = product_ids.get("purl") if isinstance(product_ids, dict) else None
+    purls = purls if isinstance(purls, list) else []
     vulns = entry.get("vulns")
     if not isinstance(vulns, dict):          # matched a product but no vulns → empty (not a no-match)
         return []
     recs: list[dict] = []
-    for cve_id, v in vulns.items():
+    for advisory_id, v in vulns.items():
         if not isinstance(v, dict):
             continue
         sev = v.get("severity")
@@ -4919,15 +5645,33 @@ def parse_search_vulns(out: str, product: str, version: str) -> list[dict] | Non
         cvss = cvss if isinstance(cvss, dict) else {}
         epss = sev.get("EPSS")
         epss = epss if isinstance(epss, dict) else {}
-        exploits = v.get("exploits") or []
-        kev = bool(v.get("cisa_kev"))
+        raw_exploits = v.get("exploits")
+        exploit_values = (raw_exploits if isinstance(raw_exploits, (list, tuple, set))
+                          else [raw_exploits] if raw_exploits else [])
+        exploits = sorted({str(value) for value in exploit_values if value})
+        aliases_raw = v.get("aliases")
+        aliases = ({str(key): str(value) for key, value in aliases_raw.items()}
+                   if isinstance(aliases_raw, dict) else {})
+        identifiers = advisory_ids({"cve": advisory_id, "aliases": aliases})
+        cve_id = canonical_advisory_id(identifiers) or str(advisory_id).upper()
+        cpe = str(cpes[0]) if cpes else None
+        purl = str(purls[0]) if purls else None
+        kev = bool(v.get("cisa_kev") or v.get("kev"))
         desc = v.get("description")
         recs.append({
             "cve": cve_id, "product": product, "version": version,
+            "observed_products": [product], "canonical_product": normalize_product_key(product),
+            "canonical_version": _norm_version(version) or version,
+            "component_id": canonical_component_id(product, purl=purl, cpe=cpe),
+            "advisory_id": advisory_id, "aliases": aliases,
+            "advisory_ids": identifiers, "vulnerability_id": vulnerability_id(cve_id),
             "cvss": cvss.get("score"), "cvss_version": cvss.get("version"),
             "epss": epss.get("score"), "kev": kev, "exploited": bool(exploits) or kev,
-            "exploits": exploits, "cwe": v.get("cwe_ids") or [], "match_reason": v.get("match_reason"),
-            "published": v.get("published"), "cpe": cpes[0] if cpes else None,
+            # ``search_vulns`` currently calls this field `exploits`; expose the policy-facing `poc`
+            # alias too so the LLM verifier consumes an explicit, stable contract.
+            "poc": exploits, "poc_available": bool(exploits), "exploits": exploits,
+            "cwe": v.get("cwe_ids") or [], "match_reason": v.get("match_reason"),
+            "published": v.get("published"), "cpe": cpe, "purl": purl,
             "description": (desc if isinstance(desc, str) else "")[:_CVE_DESC_MAX],
         })
     return recs
@@ -4942,7 +5686,7 @@ def _search_vulns_query(product: str, version: str) -> list[dict]:
     DIFFERENT version (a coarser one would falsely add/drop the exact-version-pinned CVEs). It's a no-op
     for products that already match, and never fabricates a match for an unknown product (→ 0 CVEs).
     Best-effort: [] on timeout/error/no-match. Offline (reads the local DB; no target traffic)."""
-    key = (product.lower(), version)
+    key = (normalize_product_key(product), version)
     with _CVE_CACHE_LOCK:
         if key in _CVE_CACHE:
             return _CVE_CACHE[key]
@@ -5004,8 +5748,13 @@ def _app_service_banners(activity: Activity, meta: dict) -> list[tuple[str, str]
 
 
 def _app_software(activity: Activity, ws: AppWorkspace) -> list[dict]:
-    """Gather the app's ENUMERATED software (web server + tech + service banners + corpus libs) →
-    collect_software records. Reads meta.json + breadth nerva + the extracted corpus (current state)."""
+    """Gather the app's version-pinned software into the CVE correlation inventory.
+
+    Reads meta.json, breadth nerva, the extracted corpus and structured detector observations.
+    ``software_observations*.jsonl`` remain evidence/audit sidecars while this function performs the
+    case-insensitive product/version merge used by search_vulns. Raw package identities marked
+    ``queryable=false`` stay out until ecosystem-aware normalization resolves them.
+    """
     meta = workspace.read_meta(ws.meta)
     servers = [h.get("Server") or h.get("server") for h in (meta.get("headers_by_host") or {}).values()]
     server = next((s for s in servers if s), None) or meta.get("webserver")
@@ -5013,7 +5762,11 @@ def _app_software(activity: Activity, ws: AppWorkspace) -> list[dict]:
         tech=meta.get("tech") or [], server=server,
         services=_app_service_banners(activity, meta), corpus_texts=_corpus_texts(ws),
         corpus_urls=_corpus_urls(ws),
-        app_hosts=[url_host(h) for h in (meta.get("hosts") or [])])
+        app_hosts=[url_host(h) for h in (meta.get("hosts") or [])],
+        observations=[
+            *tools.read_jsonl(ws.canonical("software_observations.jsonl")),
+            *tools.read_jsonl(ws.canonical("software_observations_corpus.jsonl")),
+        ])
 
 
 def _cve_sort_key(f: dict) -> tuple:
@@ -5023,6 +5776,208 @@ def _cve_sort_key(f: dict) -> tuple:
     except (TypeError, ValueError):
         cvss = 0.0
     return (not f.get("exploited"), not f.get("kev"), -cvss, f.get("cve") or "")
+
+
+def _canonicalize_advisory_records(records: list[dict]) -> list[dict]:
+    """Resolve transitive CVE/GHSA/advisory alias sets across all supplied records. Pure."""
+    parent: dict[str, str] = {}
+
+    def find(identifier: str) -> str:
+        parent.setdefault(identifier, identifier)
+        while parent[identifier] != identifier:
+            parent[identifier] = parent[parent[identifier]]
+            identifier = parent[identifier]
+        return identifier
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    identifiers_by_index: list[list[str]] = []
+    for record in records:
+        identifiers = advisory_ids(record)
+        identifiers_by_index.append(identifiers)
+        for identifier in identifiers[1:]:
+            union(identifiers[0], identifier)
+        if identifiers:
+            find(identifiers[0])
+
+    groups: dict[str, set[str]] = {}
+    for identifier in parent:
+        groups.setdefault(find(identifier), set()).add(identifier)
+    output: list[dict] = []
+    for index, (record, identifiers) in enumerate(zip(records, identifiers_by_index, strict=True)):
+        all_identifiers = sorted(groups.get(find(identifiers[0]), set(identifiers)) if identifiers else [])
+        canonical = canonical_advisory_id(all_identifiers)
+        output.append({
+            **record,
+            "cve": canonical or record.get("cve"),
+            "advisory_ids": all_identifiers,
+            "vulnerability_id": vulnerability_id(canonical) or f"record:{index}",
+        })
+    return output
+
+
+def _record_component_id(record: Mapping[str, Any]) -> str:
+    explicit = str(record.get("component_id") or "")
+    if explicit.startswith(("purl:", "cpe:", "package:")):
+        return explicit.casefold()
+    product = record.get("product")
+    return canonical_component_id(
+        product, ecosystem=record.get("ecosystem"), package=record.get("package"),
+        purl=record.get("purl"), cpe=record.get("cpe"),
+    )
+
+
+def _string_union(current: object, incoming: object) -> list[str]:
+    def values(raw: object) -> list[object]:
+        return list(raw) if isinstance(raw, (list, tuple, set)) else ([raw] if raw else [])
+    return sorted({str(value) for value in [*values(current), *values(incoming)] if value})
+
+
+def _higher_numeric(current: object, incoming: object) -> object:
+    def number(value: object) -> float:
+        if not isinstance(value, (int, float, str)):
+            return 0.0
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return incoming if number(incoming) > number(current) else current
+
+
+def _merge_cve_evidence(current: dict, incoming: Mapping[str, Any]) -> None:
+    """Union evidence and retain the strongest scalar metadata in-place. Pure mutation helper."""
+    for field in ("sources", "hosts", "exploits", "poc", "cwe", "observed_products",
+                  "advisory_ids"):
+        current[field] = _string_union(current.get(field), incoming.get(field))
+    raw_current_aliases = current.get("aliases")
+    raw_incoming_aliases = incoming.get("aliases")
+    current_aliases: dict = raw_current_aliases if isinstance(raw_current_aliases, dict) else {}
+    incoming_aliases: dict = raw_incoming_aliases if isinstance(raw_incoming_aliases, dict) else {}
+    current["aliases"] = {**current_aliases, **incoming_aliases}
+    for field in ("exploited", "poc_available", "kev"):
+        current[field] = bool(current.get(field)) or bool(incoming.get(field))
+    for field in ("cvss", "epss"):
+        current[field] = _higher_numeric(current.get(field), incoming.get(field))
+    if len(str(incoming.get("description") or "")) > len(str(current.get("description") or "")):
+        current["description"] = incoming.get("description")
+    published = sorted({str(value) for value in (current.get("published"), incoming.get("published"))
+                        if value})
+    if published:
+        current["published"] = published[0]
+
+
+def _expand_cve_components(records: Iterable[dict]) -> list[dict]:
+    """Expand previously aggregated report records back into technical occurrences. Pure."""
+    output: list[dict] = []
+    for record in records:
+        components = record.get("affected_components")
+        if not isinstance(components, list) or not components:
+            output.append(record)
+            continue
+        base = {key: value for key, value in record.items()
+                if key not in {"affected_components", "products", "versions", "component_count"}}
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            output.append({
+                **base,
+                "component_id": component.get("component_id"),
+                "product": component.get("product"),
+                "observed_products": component.get("observed_products") or [],
+                "version": component.get("version"),
+                "canonical_version": component.get("version"),
+                "sources": component.get("sources") or [],
+                "hosts": component.get("hosts") or [],
+                "cpe": component.get("cpe"),
+                "purl": component.get("purl"),
+                "verification": component.get("verification") or base.get("verification"),
+                "verification_confidence": (
+                    component.get("verification_confidence")
+                    or base.get("verification_confidence")
+                ),
+                "probe": component.get("probe") or base.get("probe"),
+                "probe_result": component.get("probe_result") or base.get("probe_result"),
+            })
+    return output
+
+
+def dedup_cve_occurrences(records: Iterable[dict]) -> list[dict]:
+    """Technical dedup by app + canonical vulnerability + canonical component + version. Pure."""
+    canonicalized = _canonicalize_advisory_records(_expand_cve_components(records))
+    by_key: dict[tuple[str, str, str, str], dict] = {}
+    for record in canonicalized:
+        app_id = str(record.get("app_id") or "")
+        vuln_id = str(record["vulnerability_id"])
+        component_id = _record_component_id(record)
+        version = _norm_version(record.get("canonical_version") or record.get("version")) or str(
+            record.get("version") or "",
+        )
+        key = (app_id, vuln_id, component_id, version)
+        normalized = {
+            **record,
+            "component_id": component_id,
+            "canonical_product": normalize_product_key(record.get("product")),
+            "canonical_version": version,
+            "observed_products": _string_union(record.get("observed_products"), record.get("product")),
+        }
+        if key not in by_key:
+            by_key[key] = normalized
+        else:
+            _merge_cve_evidence(by_key[key], normalized)
+    return sorted(by_key.values(), key=lambda item: (
+        *_cve_sort_key(item), str(item.get("app_id") or ""), item["component_id"],
+        item["canonical_version"],
+    ))
+
+
+def _affected_component(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "component_id": record.get("component_id"),
+        "product": record.get("product"),
+        "observed_products": record.get("observed_products") or [],
+        "version": record.get("canonical_version") or record.get("version"),
+        "sources": record.get("sources") or [],
+        "hosts": record.get("hosts") or [],
+        "cpe": record.get("cpe"),
+        "purl": record.get("purl"),
+        "verification": record.get("verification"),
+        "verification_confidence": record.get("verification_confidence"),
+        "probe": record.get("probe"),
+        "probe_result": record.get("probe_result"),
+    }
+
+
+def dedup_cve_findings(records: Iterable[dict]) -> list[dict]:
+    """One report record per app/vulnerability, retaining every affected component occurrence. Pure."""
+    occurrences = dedup_cve_occurrences(records)
+    by_key: dict[tuple[str, str], dict] = {}
+    for occurrence in occurrences:
+        key = (str(occurrence.get("app_id") or ""), str(occurrence["vulnerability_id"]))
+        if key not in by_key:
+            by_key[key] = {**occurrence, "affected_components": [_affected_component(occurrence)]}
+            continue
+        current = by_key[key]
+        _merge_cve_evidence(current, occurrence)
+        current["affected_components"].append(_affected_component(occurrence))
+    for record in by_key.values():
+        components = sorted(record["affected_components"], key=lambda item: (
+            str(item.get("component_id") or ""), str(item.get("version") or ""),
+        ))
+        record["affected_components"] = components
+        record["products"] = sorted({str(item["product"]) for item in components if item.get("product")},
+                                    key=str.casefold)
+        record["versions"] = sorted({str(item["version"]) for item in components if item.get("version")})
+        record["component_count"] = len(components)
+        if record["products"]:
+            record["product"] = record["products"][0]
+        if record["versions"]:
+            record["version"] = record["versions"][0]
+    return sorted(by_key.values(), key=lambda item: (
+        *_cve_sort_key(item), str(item.get("app_id") or ""), str(item["vulnerability_id"]),
+    ))
 
 
 def _run_cve(ws: AppWorkspace, software: list[dict], *, out_name: str,
@@ -5035,21 +5990,36 @@ def _run_cve(ws: AppWorkspace, software: list[dict], *, out_name: str,
     if shutil.which(SEARCH_VULNS) is None:
         log.debug("  · skip %s (search_vulns not installed) for %s", stage, label)
         return
+    queryable = [component for component in software if component.get("queryable") is not False]
     if seen_path is not None:   # record what this pass covers (read by the phase-4 delta), even if empty
-        tools.write_lines(seen_path, [f"{s['product']}\t{s['version']}" for s in software])
+        tools.write_lines(seen_path, [
+            f"{component['component_id']}\t{component['canonical_version']}"
+            for component in queryable
+        ])
     findings: list[dict] = []
-    if software:
+    if queryable:
         with ThreadPoolExecutor(max_workers=CVE_FANOUT) as pool:
             futs = [
                 (s, telemetry.submit(pool, _search_vulns_query, s["product"], s["version"]))
-                for s in software
+                for s in queryable
             ]
             for s, fut in futs:
-                findings += [{**cve, "sources": s["sources"], "hosts": s["where"]} for cve in fut.result()]
-    findings.sort(key=_cve_sort_key)
+                findings += [{
+                    **cve,
+                    "observed_component_id": s["component_id"],
+                    "observed_products": _string_union(
+                        cve.get("observed_products"), s.get("observed_products"),
+                    ),
+                    "ecosystem": s.get("ecosystem"),
+                    "package": s.get("package"),
+                    "sources": s["sources"],
+                    "hosts": s["where"],
+                } for cve in fut.result()]
+    findings = dedup_cve_findings(findings)
     n = tools.write_jsonl(ws.findings / out_name, findings)
     hot = sum(1 for f in findings if f.get("exploited"))
-    log.info("  → %s (%s) — %d software → %d CVE(s)%s → findings/%s", stage, label, len(software), n,
+    log.info("  → %s (%s) — %d component(s), %d queryable → %d CVE(s)%s → findings/%s",
+             stage, label, len(software), len(queryable), n,
              f" ({hot} known-exploited/KEV)" if hot else "", out_name)
 
 
@@ -5060,7 +6030,10 @@ def cve_lookup(activity: Activity, app_id: str) -> None:
     findings/cve.jsonl + the covered (product,version) set (raw/cve/seen.txt) so the phase-4 pass reports
     only the delta. Best-effort: skips if search_vulns / its DB is absent."""
     ws = activity.app(app_id)
-    _run_cve(ws, _app_software(activity, ws), out_name="cve.jsonl",
+    _write_corpus_software_observations(ws)
+    inventory = _app_software(activity, ws)
+    tools.write_jsonl(ws.canonical("software_inventory.jsonl"), inventory)
+    _run_cve(ws, inventory, out_name="cve.jsonl",
              seen_path=ws.raw("cve") / "seen.txt", label=app_id)
 
 
@@ -5069,9 +6042,15 @@ def cve_lookup_full(activity: Activity, app_id: str) -> None:
     /recrawl downloads grow the corpus, so this re-mines it and reports only the DELTA: software not
     already covered by the phase-2 pass (raw/cve/seen.txt). Output findings/cve_full.jsonl."""
     ws = activity.app(app_id)
-    seen = {tuple(line.split("\t", 1)) for line in tools.read_lines(ws.raw("cve") / "seen.txt")
-            if "\t" in line}
-    delta = [s for s in _app_software(activity, ws) if (s["product"], s["version"]) not in seen]
+    _write_corpus_software_observations(ws)
+    seen = {(component if component.startswith(("purl:", "cpe:", "package:", "product:"))
+             else canonical_component_id(component), version)
+            for line in tools.read_lines(ws.raw("cve") / "seen.txt") if "\t" in line
+            for component, version in [line.split("\t", 1)]}
+    inventory = _app_software(activity, ws)
+    tools.write_jsonl(ws.canonical("software_inventory.jsonl"), inventory)
+    delta = [component for component in inventory
+             if (component["component_id"], component["canonical_version"]) not in seen]
     _run_cve(ws, delta, out_name="cve_full.jsonl", seen_path=None, label=app_id)
 
 
@@ -5126,6 +6105,45 @@ def cloud_findings(public: set[str], exists: set[str], url_meta: dict[str, dict]
     findings += [{"type": "cloud-bucket-exists", "severity": "info", "url": u, **url_meta.get(u, {})}
                  for u in sorted(set(exists) - set(public))]
     return findings
+
+
+def dedup_cloud_findings(records: Iterable[dict]) -> list[dict]:
+    """One activity finding per cloud asset, with all originating app groups retained.
+
+    Candidate generation is apex-scoped, so sibling app groups routinely rediscover the same global
+    bucket. Public wins over exists; passive attribution wins over a guessed candidate. ``app_id`` is
+    retained for compatibility and ``app_ids`` records the complete attribution set. Pure.
+    """
+    by_asset: dict[tuple[str, str, str], dict] = {}
+    app_ids: dict[tuple[str, str, str], set[str]] = {}
+    origins: dict[tuple[str, str, str], set[str]] = {}
+    for record in records:
+        url = str(record.get("url") or "").rstrip("/")
+        provider = str(record.get("provider") or "").casefold()
+        bucket = str(record.get("bucket") or "").casefold()
+        # Provider+bucket is the logical asset even when one app saw vhost style and another path
+        # style. Fall back to the URL only for legacy records without structured metadata.
+        key = (provider, bucket, "" if provider and bucket else url)
+        candidate = {**record, "url": url}
+        current = by_asset.get(key)
+        if current is None or (candidate.get("type") == "cloud-bucket-public"
+                               and current.get("type") != "cloud-bucket-public"):
+            by_asset[key] = candidate
+        if source := str(record.get("source") or ""):
+            origins.setdefault(key, set()).add(source)
+        app_id = str(record.get("app_id") or "")
+        if app_id:
+            app_ids.setdefault(key, set()).add(app_id)
+    out: list[dict] = []
+    for key, record in sorted(by_asset.items(), key=lambda item: item[0]):
+        attributed = sorted(app_ids.get(key, set()))
+        if "passive" in origins.get(key, set()):
+            record["source"] = "passive"
+        if attributed:
+            record["app_id"] = attributed[0]
+            record["app_ids"] = attributed
+        out.append(record)
+    return out
 
 
 def _httpx_match(urls: list[str], flags: list[str], dest: Path) -> set[str]:
@@ -5186,10 +6204,20 @@ def cloud_assets(activity: Activity, app_id: str) -> None:
 # --- surface checkpoint (global barrier after phase 2) -------------------------------------------
 _SURFACE_CHECKPOINT_SOURCES: dict[str, tuple[str, ...]] = {
     "cve.jsonl": ("findings/cve.jsonl",),
+    "cve_verified.jsonl": ("findings/cve_verified.jsonl",),
     "dast.jsonl": ("findings/dast.jsonl",),
     "xss.jsonl": ("findings/xss.jsonl",),
     "sqli.jsonl": ("findings/sqli.jsonl",),
 }
+
+
+def _dedup_consolidated(out_name: str, records: list[dict]) -> list[dict]:
+    """Category-aware semantic deduplication for deterministic report inputs. Pure."""
+    if out_name in {"cve.jsonl", "cve_verified.jsonl"}:
+        return dedup_cve_findings(records)
+    if out_name == "cloud_assets.jsonl":
+        return dedup_cloud_findings(records)
+    return records
 
 
 def surface_checkpoint(activity: Activity) -> None:
@@ -5207,12 +6235,12 @@ def surface_checkpoint(activity: Activity) -> None:
 
     counts: dict[str, int] = {}
     for out_name, sources in _SURFACE_CHECKPOINT_SOURCES.items():
-        records = [
+        records = _dedup_consolidated(out_name, [
             {"app_id": ws.root.name, **record}
             for ws in apps
             for source in sources
             for record in tools.read_jsonl(ws.root / source)
-        ]
+        ])
         if records:
             counts[out_name.removesuffix(".jsonl")] = tools.write_jsonl(findings / out_name, records)
 
@@ -5245,6 +6273,7 @@ def surface_checkpoint(activity: Activity) -> None:
 # --- consolidate (terminal fan-in) ---------------------------------------------------------------
 _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "cve.jsonl": ("findings/cve.jsonl", "findings/cve_full.jsonl"),
+    "cve_verified.jsonl": ("findings/cve_verified.jsonl", "findings/cve_verified_full.jsonl"),
     "dast.jsonl": ("findings/dast.jsonl", "findings/dast_full.jsonl"),
     "xss.jsonl": ("findings/xss.jsonl", "findings/xss_full.jsonl"),
     "sqli.jsonl": ("findings/sqli.jsonl", "findings/sqli_full.jsonl"),
@@ -5261,7 +6290,8 @@ _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
 def consolidate(activity: Activity) -> dict[str, int]:
     """TERMINAL fan-in (deterministic, OFFLINE) — lift every app group's per-app findings into the
     activity level: one <activity>/findings/<type>.jsonl per finding TYPE, each record stamped with its
-    app_id for traceability. A scanner's surface+deep passes fold into one file (cve, dast); the
+    app_id for traceability. A scanner's surface+deep passes fold into one file (cve, dast); duplicate
+    CVE observations merge their evidence and shared cloud assets merge their app_ids; the
     subjack takeover lines become records too. Reads only on-disk artifacts; tolerant of a malformed
     line (read_jsonl skips it). Whole-scope nuclei_scope.jsonl is already an activity finding and is
     left untouched; the agent seam (hypotheses.jsonl) runs separately — dormant by default, LLM-backed
@@ -5270,9 +6300,12 @@ def consolidate(activity: Activity) -> dict[str, int]:
     apps = activity.list_apps()
     counts: dict[str, int] = {}
     for out_name, sources in _CONSOLIDATE_SOURCES.items():
-        records = [{"app_id": ws.root.name, **rec}
-                   for ws in apps for src in sources
-                   for rec in tools.read_jsonl(ws.root / src)]
+        records = _dedup_consolidated(
+            out_name,
+            [{"app_id": ws.root.name, **rec}
+             for ws in apps for src in sources
+             for rec in tools.read_jsonl(ws.root / src)],
+        )
         if records:
             counts[out_name.removesuffix(".jsonl")] = tools.write_jsonl(
                 activity.findings / out_name, records)

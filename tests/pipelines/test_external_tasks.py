@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from ptflow.core.scope import Target
 from ptflow.pipelines.external import tasks
@@ -278,8 +279,8 @@ def test_pipeline_phase_wiring():
     assert by_name["request_catalog"].net is False    # offline merge → requests.jsonl (surface only)
     assert set(by_name["request_catalog"].needs) == {"crawl_headless", "mine_responses", "api_spec"}
     # PHASE 2 = DAST the explorable surface (low-hanging fruit): reads requests.jsonl across the barrier.
-    # xref_catalog runs first (cross-group surface sidecar); dast/xss/sqli need it. cve_lookup runs ∥
-    # dast (same phase, no needs) — OFFLINE CVE correlation (net=False).
+    # xref_catalog runs first (cross-group surface sidecar); dast/xss/sqli need it. cve_lookup is
+    # OFFLINE and explicitly consumes both structured software-observation producers.
     assert by_name["xref_catalog"].phase == 2
     assert by_name["xref_catalog"].per_app is True
     assert by_name["xref_catalog"].net is False
@@ -292,7 +293,7 @@ def test_pipeline_phase_wiring():
     assert by_name["cve_lookup"].phase == 2
     assert by_name["cve_lookup"].per_app is True
     assert by_name["cve_lookup"].net is False
-    assert by_name["cve_lookup"].needs == ()
+    assert set(by_name["cve_lookup"].needs) == {"api_spec", "mine_responses"}
     # PHASE 3 = guessing / surface expansion: wordlist seed → tech_enum → content_discovery fixpoint →
     # recrawl. wordlist reads the PHASE-1 corpus across the barrier (no needs); content_discovery no
     # longer needs mine_responses (cross-barrier now).
@@ -707,6 +708,18 @@ def test_http_body_extracts_response_body():
     assert "HTTP/1.1 200 OK" not in body  # response headers stripped
     assert "GET /app.js" not in body      # request block stripped
     assert tasks.http_body("no http response here") == ""
+
+
+def test_http_body_decodes_chunked_framing_and_drops_store_trailer():
+    entity = '{"info":{"title":"Arcane API","version":"1.13.0"}}'
+    stored = (
+        "GET /api/openapi.json HTTP/1.1\r\nHost: x\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+        "Content-Type: application/json\r\n\r\n"
+        f"{len(entity.encode()):x}\r\n{entity}\r\n0\r\n\r\n\r\nhttps://x/api/openapi.json\r\n"
+    )
+
+    assert tasks.http_body(stored) == entity
 
 
 def test_best_host_prefers_non_ip_then_https():
@@ -1633,6 +1646,30 @@ def test_dast_requests_merges_catalog_and_synth_then_caps():
     assert len(tasks.dast_requests([], many, cap=5)) == 5         # cap bites
 
 
+def test_dast_requests_drops_plain_static_gets_but_keeps_fuzzable_shapes():
+    catalog = [
+        {"method": "GET", "url": "https://a/static/app.js", "body": "", "params": []},
+        {"method": "GET", "url": "https://a/static/app.mjs", "body": "", "params": []},
+        {"method": "GET", "url": "https://a/static/app.css", "body": "", "params": []},
+        {"method": "GET", "url": "https://a/static/logo.png", "body": "", "params": []},
+        {"method": "GET", "url": "https://a/api/users", "body": "", "params": []},
+        {"method": "GET", "url": "https://a/download/app.js?v=1", "body": "",
+         "params": [{"name": "v", "loc": "query", "value": "1"}]},
+        {"method": "POST", "url": "https://a/upload/file.js", "body": "name=x", "params": []},
+    ]
+
+    result = tasks.dast_requests(catalog, [], cap=20)
+    urls = {record["url"] for record in result}
+
+    assert "https://a/static/app.js" in urls
+    assert "https://a/static/app.mjs" in urls
+    assert "https://a/static/app.css" in urls
+    assert "https://a/static/logo.png" not in urls
+    assert "https://a/api/users" in urls
+    assert "https://a/download/app.js?v=1" in urls  # explicit input keeps an asset-looking URL fuzzable
+    assert "https://a/upload/file.js" in urls       # non-GET/body-bearing request is not a plain fetch
+
+
 def test_dedup_dast_findings_collapses_same_injection_point():
     def fz(tid, at, pos="query"):
         return {"template-id": tid, "matched-at": at, "is_fuzzing_result": True,
@@ -1790,6 +1827,61 @@ def test_is_openapi_detects_spec():
     assert not tasks.is_openapi("nope")
 
 
+def test_openapi_software_observation_and_declared_version_corroboration():
+    spec = {
+        "openapi": "3.1.0",
+        "info": {"title": "Arcane API", "version": "v1.13.0"},
+        "servers": [{"url": "/api"}],
+        "paths": {
+            "/version": {"get": {}},
+            "/app-version": {"get": {}},
+            "/environments/{id}/version": {"get": {}},  # unresolved path param → do not probe
+            "/status": {"get": {}},
+        },
+    }
+    spec_url = "http://kobold.htb:3552/api/openapi.json"
+
+    observation = tasks.openapi_software_observation(spec, spec_url)
+    assert observation == {
+        "product": "Arcane API", "version": "1.13.0", "source": "openapi.info",
+        "evidence_url": spec_url, "where": ["kobold.htb"], "confidence": "medium",
+        "corroborated_by": [],
+    }
+    assert tasks.openapi_version_urls(spec, spec_url) == [
+        "http://kobold.htb:3552/api/version",
+        "http://kobold.htb:3552/api/app-version",
+    ]
+
+    [corroborated] = tasks.corroborate_openapi_observations([observation], {
+        "http://kobold.htb:3552/api/version": '{"currentVersion":"1.13.0"}',
+        "http://other.htb/api/version": '{"version":"1.13.0"}',  # wrong authority
+    })
+    assert corroborated["confidence"] == "high"
+    assert corroborated["corroborated_by"] == ["http://kobold.htb:3552/api/version"]
+
+
+def test_openapi_rebases_foreign_or_localhost_server_authority():
+    spec = {
+        "openapi": "3.1.0", "servers": [{"url": "http://localhost:3552/api"}],
+        "paths": {"/version": {"get": {}}},
+    }
+    assert tasks.openapi_version_urls(spec, "http://kobold.htb:3552/api/openapi.json") == [
+        "http://kobold.htb:3552/api/version",
+    ]
+    [request] = tasks.expand_openapi(spec, "http://kobold.htb:3552/api/openapi.json", cap=10)
+    assert request["url"] == "http://kobold.htb:3552/api/version"
+
+
+def test_openapi_software_observation_rejects_generic_or_unpinned_info():
+    base = {"openapi": "3.0.0", "paths": {}}
+    assert tasks.openapi_software_observation(
+        {**base, "info": {"title": "API", "version": "1.2.3"}}, "https://a/openapi.json",
+    ) is None
+    assert tasks.openapi_software_observation(
+        {**base, "info": {"title": "Useful API", "version": "v1"}}, "https://a/openapi.json",
+    ) is None
+
+
 def test_expand_openapi_v3_operations_to_full_requests():
     spec = {
         "openapi": "3.0.0",
@@ -1830,6 +1922,69 @@ def test_expand_openapi_swagger_v2_body_and_basepath():
 def test_expand_openapi_caps_operations():
     spec = {"openapi": "3.0.0", "paths": {f"/p{i}": {"get": {}} for i in range(20)}}
     assert len(tasks.expand_openapi(spec, "https://h/openapi.json", cap=5)) == 5
+
+
+def test_api_spec_reads_nested_httpx_store_and_feeds_software_inventory(monkeypatch, tmp_path):
+    from ptflow.core import tools, workspace
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("openapi-inventory", root=tmp_path).ensure()
+    ws = act.app("arcane").ensure()
+    tools.write_lines(ws.hosts, ["http://kobold.htb:3552"])
+    workspace.write_meta(ws.meta, {
+        "hosts": ["http://kobold.htb:3552"], "tech": [], "headers_by_host": {},
+        "body_by_host": {},
+    })
+    spec = {
+        "openapi": "3.1.0",
+        "info": {"title": "Arcane API", "version": "1.13.0"},
+        "paths": {"/version": {"get": {}}, "/users": {"post": {}}},
+    }
+
+    def store_response(cmd: list[str], url: str, body: str, name: str) -> None:
+        root = Path(cmd[cmd.index("-srd") + 1]) / "response"  # actual modern httpx layout
+        saved = root / "kobold.htb_3552" / f"{name}.txt"
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        saved.write_text(
+            f"{url}\n\nGET / HTTP/1.1\nHost: kobold.htb:3552\n\n"
+            f"HTTP/1.1 200 OK\nContent-Type: application/json\n\n{body}\n",
+            encoding="utf-8",
+        )
+        index = root / "index.txt"
+        previous = index.read_text(encoding="utf-8") if index.exists() else ""
+        index.write_text(previous + f"{saved} {url} (200 OK)\n", encoding="utf-8")
+
+    def fake_run(tool, cmd, *, stdin, dest, label):
+        del tool, stdin, label
+        if dest.name == "probe.txt":
+            store_response(cmd, "http://kobold.htb:3552/api/openapi.json", json.dumps(spec), "spec")
+        elif dest.name == "version-probe.txt":
+            store_response(cmd, "http://kobold.htb:3552/version", '{"version":"1.13.0"}', "version")
+        return ""
+
+    monkeypatch.setattr(tasks, "_run", fake_run)
+    tasks.api_spec(act, "arcane")
+
+    assert {(record["method"], record["url"]) for record in tools.read_jsonl(
+        ws.canonical("requests_api.jsonl"),
+    )} == {
+        ("GET", "http://kobold.htb:3552/version"),
+        ("POST", "http://kobold.htb:3552/users"),
+    }
+    [observation] = tools.read_jsonl(ws.canonical("software_observations.jsonl"))
+    assert observation["product"] == "Arcane API"
+    assert observation["confidence"] == "high"
+    assert observation["corroborated_by"] == ["http://kobold.htb:3552/version"]
+
+    inventory = tasks._app_software(act, ws)
+    arcane = next(record for record in inventory if record["product"] == "Arcane API")
+    assert arcane["version"] == "1.13.0"
+    assert arcane["component_id"] == "product:arcane-api"
+    assert arcane["canonical_product"] == "arcane-api"
+    assert arcane["observed_products"] == ["Arcane API"]
+    assert arcane["queryable"] is True
+    assert arcane["sources"] == ["openapi.info"]
+    assert arcane["where"] == ["kobold.htb"]
 
 
 # --- shape mining from the downloaded corpus (jsluice records + HTML forms → catalog requests) ---
@@ -1984,6 +2139,91 @@ def test_collect_software_dedups_and_attributes_sources():
     assert by_prod["Bootstrap"]["sources"] == ["corpus"]
 
 
+def test_collect_software_dedups_product_case_across_tech_and_server():
+    software = tasks.collect_software(
+        tech=["Nginx:1.24.0"], server="nginx/1.24.0", services=[], corpus_texts=[],
+        app_hosts=["kobold.htb"],
+    )
+
+    assert len(software) == 1
+    assert software[0]["product"] == "Nginx"
+    assert software[0]["observed_products"] == ["Nginx", "nginx"]
+    assert software[0]["component_id"] == "product:nginx"
+    assert software[0]["canonical_version"] == "1.24.0"
+    assert software[0]["queryable"] is True
+    assert software[0]["sources"] == ["server", "tech"]
+    assert software[0]["where"] == ["kobold.htb"]
+
+
+def test_manifest_software_observation_collects_scoped_package_without_fuzzy_query():
+    observations = tasks.manifest_software_observations(
+        json.dumps({"name": "@modelcontextprotocol/inspector", "version": "0.14.0"}),
+        "https://mcp.kobold.htb/package.json",
+    )
+
+    assert observations == [{
+        "product": "@modelcontextprotocol/inspector",
+        "observed_products": ["@modelcontextprotocol/inspector"],
+        "canonical_product": "modelcontextprotocol-inspector",
+        "version": "0.14.0", "canonical_version": "0.14.0",
+        "component_id": "purl:pkg:npm/%40modelcontextprotocol/inspector",
+        "source": "manifest:package.json", "evidence_url": "https://mcp.kobold.htb/package.json",
+        "where": ["mcp.kobold.htb"], "confidence": "high", "ecosystem": "npm",
+        "package": "@modelcontextprotocol/inspector",
+        "purl": "pkg:npm/%40modelcontextprotocol/inspector", "queryable": False,
+    }]
+    # The canonical inventory retains raw ecosystem identities but does not send them to the fuzzy
+    # search_vulns title matcher until an exact PURL advisory resolver is available.
+    [component] = tasks.collect_software(
+        tech=[], server="", services=[], corpus_texts=[], app_hosts=["mcp.kobold.htb"],
+        observations=observations,
+    )
+    assert component["component_id"] == "purl:pkg:npm/%40modelcontextprotocol/inspector"
+    assert component["queryable"] is False
+
+
+def test_bundle_software_observation_detects_mcp_metadata_and_scoped_reference():
+    observations = tasks.bundle_software_observations(
+        'MCP Inspector v0.14.0; const p="@modelcontextprotocol/inspector@0.14.0";',
+        "https://mcp.kobold.htb/assets/app.mjs",
+    )
+
+    assert len(observations) == 1
+    assert observations[0]["product"] == "MCP Inspector"
+    assert observations[0]["observed_products"] == [
+        "@modelcontextprotocol/inspector", "MCP Inspector",
+    ]
+    assert observations[0]["component_id"] == "purl:pkg:npm/%40modelcontextprotocol/inspector"
+    assert observations[0]["queryable"] is False
+    assert tasks.bundle_software_observations(
+        "random-widget-1.2.3", "https://mcp.kobold.htb/assets/app.js",
+    ) == []
+
+
+def test_corpus_software_observations_reads_response_store_and_dedups(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("software-corpus", root=tmp_path).ensure()
+    ws = act.app("mcp").ensure()
+    stored = ws.responses / "response.txt"
+    stored.parent.mkdir(parents=True)
+    stored.write_text(
+        'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n'
+        '{"name":"@modelcontextprotocol/inspector","version":"0.14.0"}',
+        encoding="utf-8",
+    )
+    tools.write_lines(ws.responses / "index.txt", [
+        f"{stored} https://mcp.kobold.htb/package.json (200 OK)",
+    ])
+
+    assert tasks._write_corpus_software_observations(ws) == 1
+    [observation] = tools.read_jsonl(ws.canonical("software_observations_corpus.jsonl"))
+    assert observation["package"] == "@modelcontextprotocol/inspector"
+    assert observation["version"] == "0.14.0"
+    assert observation["evidence_urls"] == ["https://mcp.kobold.htb/package.json"]
+
+
 def test_map_hosts_to_ips_parses_dnsx_resp_format():
     # dnsx -a -resp writes '<host> [A] [<ip>]' — the record type and IP are separate bracketed tokens,
     # so the '[A]' column must never be mistaken for an IP (the _app_service_banners bug).
@@ -2074,12 +2314,138 @@ def test_parse_search_vulns_extracts_finding_fields():
     assert r["exploited"] is False
     assert r["product"] == "vsftpd"
     assert r["cpe"].startswith("cpe:2.3:a:vsftpd")
+    assert r["poc"] == []
+    assert r["poc_available"] is False
 
 
 def test_parse_search_vulns_exploited_when_kev_or_exploits():
-    out = json.dumps({"q": {"product_ids": {"cpe": []}, "vulns": {"CVE-2000-0001": {
-        "id": "CVE-2000-0001", "cisa_kev": True, "exploits": [], "severity": {}}}}})
-    assert tasks.parse_search_vulns(out, "p", "1.0")[0]["exploited"] is True   # KEV ⇒ exploited
+    out = json.dumps({"q": {"product_ids": {"cpe": []}, "vulns": {"GHSA-test": {
+        "id": "GHSA-test", "kev": ["2026-01-01"], "exploits": ["https://x/poc"],
+        "aliases": {"CVE-2000-0001": "https://nvd/CVE-2000-0001"}, "severity": {}}}}})
+    [record] = tasks.parse_search_vulns(out, "p", "1.0")
+    assert record["cve"] == "CVE-2000-0001"
+    assert record["advisory_id"] == "GHSA-test"
+    assert record["kev"] is True
+    assert record["exploited"] is True
+    assert record["poc"] == ["https://x/poc"]
+
+
+def test_product_and_component_identity_are_canonical_without_mutating_display_value():
+    assert tasks.normalize_product_key(
+        "  \uff2e\uff47\uff49\uff4e\uff58.HTTP_Server  ",
+    ) == "nginx-http-server"
+    assert tasks.canonical_component_id("Nginx") == "product:nginx"
+    assert tasks.canonical_component_id(
+        "anything", cpe="cpe:2.3:a:nginx:nginx:1.24.0:*:*:*:*:*:*:*",
+    ) == "cpe:2.3:a:nginx:nginx"
+    assert tasks.canonical_component_id(
+        "MCP Inspector", ecosystem="npm", package="@modelcontextprotocol/inspector",
+    ) == "purl:pkg:npm/%40modelcontextprotocol/inspector"
+
+
+def test_cve_occurrence_dedup_joins_cve_ghsa_and_product_aliases_via_cpe():
+    ghsa = "GHSA-2345-2345-2345"
+    cpe = "cpe:2.3:a:arcane:arcane:1.13.0:*:*:*:*:*:*:*"
+    records = [{
+        "app_id": "arcane", "cve": "CVE-2026-12345", "aliases": {ghsa: "https://ghsa"},
+        "product": "Arcane API", "version": "1.13.0", "cpe": cpe,
+        "sources": ["openapi.info"], "hosts": ["arcane.test"],
+    }, {
+        "app_id": "arcane", "cve": ghsa, "product": "arcane-api", "version": "1.13.0",
+        "cpe": cpe, "sources": ["tech"], "hosts": ["10.0.0.8"],
+    }]
+
+    [occurrence] = tasks.dedup_cve_occurrences(records)
+
+    assert occurrence["cve"] == "CVE-2026-12345"
+    assert occurrence["vulnerability_id"] == "cve:CVE-2026-12345"
+    assert occurrence["advisory_ids"] == ["CVE-2026-12345", ghsa]
+    assert occurrence["component_id"] == "cpe:2.3:a:arcane:arcane"
+    assert occurrence["observed_products"] == ["Arcane API", "arcane-api"]
+    assert occurrence["sources"] == ["openapi.info", "tech"]
+    assert occurrence["hosts"] == ["10.0.0.8", "arcane.test"]
+
+
+def test_cve_report_dedup_keeps_distinct_affected_components_under_one_cve():
+    records = [{
+        "app_id": "app", "cve": "CVE-2026-12345", "product": "Arcane API", "version": "1.13.0",
+        "cpe": "cpe:2.3:a:arcane:arcane:1.13.0:*:*:*:*:*:*:*", "hosts": ["arcane.test"],
+    }, {
+        "app_id": "app", "cve": "cve-2026-12345", "product": "Arcane Agent", "version": "0.9.0",
+        "cpe": "cpe:2.3:a:arcane:agent:0.9.0:*:*:*:*:*:*:*", "hosts": ["agent.test"],
+    }]
+
+    [finding] = tasks.dedup_cve_findings(records)
+
+    assert finding["vulnerability_id"] == "cve:CVE-2026-12345"
+    assert finding["component_count"] == 2
+    assert finding["products"] == ["Arcane Agent", "Arcane API"]
+    assert {(item["component_id"], item["version"]) for item in finding["affected_components"]} == {
+        ("cpe:2.3:a:arcane:agent", "0.9.0"),
+        ("cpe:2.3:a:arcane:arcane", "1.13.0"),
+    }
+
+
+def test_cve_report_reaggregation_preserves_component_probe_evidence():
+    surface = tasks.dedup_cve_findings([{
+        "app_id": "app", "cve": "CVE-2026-12345", "product": "Arcane API",
+        "version": "1.13.0", "cpe": "cpe:2.3:a:arcane:arcane:1.13.0:*:*:*:*:*:*:*",
+        "verification": "llm-planned-safe-http", "verification_confidence": "high",
+        "probe": {"method": "GET", "path": "/api/version"},
+        "probe_result": {"status_code": 200, "matched": True},
+    }])
+    deep = {
+        "app_id": "app", "cve": "cve-2026-12345", "product": "Arcane Agent",
+        "version": "0.9.0", "cpe": "cpe:2.3:a:arcane:agent:0.9.0:*:*:*:*:*:*:*",
+    }
+
+    [finding] = tasks.dedup_cve_findings([*surface, deep])
+
+    assert finding["component_count"] == 2
+    arcane = next(
+        item for item in finding["affected_components"]
+        if item["component_id"] == "cpe:2.3:a:arcane:arcane"
+    )
+    assert arcane["verification"] == "llm-planned-safe-http"
+    assert arcane["probe_result"] == {"status_code": 200, "matched": True}
+
+
+def test_run_cve_queries_only_queryable_inventory_and_tracks_canonical_seen(
+    monkeypatch, tmp_path,
+):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("canonical-cve", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
+    queried: list[tuple[str, str]] = []
+
+    def fake_query(product: str, version: str) -> list[dict]:
+        queried.append((product, version))
+        return [{"cve": "CVE-2026-12345", "product": product, "version": version}]
+
+    monkeypatch.setattr(tasks.shutil, "which", lambda _binary: "/bin/search_vulns")
+    monkeypatch.setattr(tasks, "_search_vulns_query", fake_query)
+    seen = ws.raw("cve") / "seen.txt"
+    inventory = [{
+        "product": "Nginx", "observed_products": ["Nginx", "nginx"],
+        "version": "1.24.0", "canonical_version": "1.24.0",
+        "component_id": "product:nginx", "queryable": True,
+        "sources": ["server", "tech"], "where": ["app.test"],
+    }, {
+        "product": "MCP Inspector", "observed_products": ["MCP Inspector"],
+        "version": "0.14.0", "canonical_version": "0.14.0",
+        "component_id": "purl:pkg:npm/%40modelcontextprotocol/inspector", "queryable": False,
+        "sources": ["manifest:package.json"], "where": ["mcp.test"],
+    }]
+
+    tasks._run_cve(ws, inventory, out_name="cve.jsonl", seen_path=seen, label="app")
+
+    assert queried == [("Nginx", "1.24.0")]
+    assert tools.read_lines(seen) == ["product:nginx\t1.24.0"]
+    [finding] = tools.read_jsonl(ws.findings / "cve.jsonl")
+    assert finding["cve"] == "CVE-2026-12345"
+    assert finding["affected_components"][0]["component_id"] == "product:nginx"
 
 
 def test_cve_sort_key_prioritizes_exploited_then_cvss():
@@ -2158,6 +2524,38 @@ def test_consolidate_lifts_per_app_findings_by_type(tmp_path):
     # an empty category writes no file (no clutter)
     assert not (act.findings / "tilde_enum.jsonl").exists()
     assert not (act.findings / "default_creds.jsonl").exists()
+
+
+def test_consolidate_semantically_dedups_cves_and_cloud_assets(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("dedup", root=tmp_path).ensure()
+    a1, a2 = act.app("app-1").ensure(), act.app("app-2").ensure()
+    tools.write_jsonl(a1.findings / "cve.jsonl", [
+        {"cve": "CVE-2026-1", "product": "Nginx", "version": "1.24.0",
+         "sources": ["tech"], "hosts": ["kobold.htb"], "exploited": False},
+        {"cve": "CVE-2026-1", "product": "nginx", "version": "1.24.0",
+         "sources": ["server"], "hosts": ["10.0.0.5"], "exploited": True},
+    ])
+    bucket = {
+        "type": "cloud-bucket-public", "severity": "high", "provider": "gcs",
+        "bucket": "kobold", "url": "https://storage.googleapis.com/kobold",
+    }
+    tools.write_jsonl(a1.findings / "cloud_assets.jsonl", [{**bucket, "source": "candidate"}])
+    tools.write_jsonl(a2.findings / "cloud_assets.jsonl", [{**bucket, "source": "passive"}])
+
+    counts = tasks.consolidate(act)
+
+    assert counts == {"cloud_assets": 1, "cve": 1}
+    [cve] = tools.read_jsonl(act.findings / "cve.jsonl")
+    assert cve["sources"] == ["server", "tech"]
+    assert cve["hosts"] == ["10.0.0.5", "kobold.htb"]
+    assert cve["exploited"] is True
+    [cloud] = tools.read_jsonl(act.findings / "cloud_assets.jsonl")
+    assert cloud["source"] == "passive"
+    assert cloud["app_id"] == "app-1"
+    assert cloud["app_ids"] == ["app-1", "app-2"]
 
 
 def test_consolidate_no_findings_returns_empty(tmp_path):
@@ -2323,6 +2721,44 @@ def test_cross_group_surface_excludes_own_group(tmp_path):
     tools.write_lines(b.canonical("endpoints_js.txt"), ["https://api.company.com/self"])
     # only B exists; its own artifacts must not be harvested
     assert tasks._cross_group_surface(act, b) == []
+
+
+def test_cross_group_surface_rebases_complete_authority_and_drops_static_assets(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("xref-ports", root=tmp_path).ensure()
+    http_app = act.app("kobold-http").ensure()
+    https_app = act.app("kobold-https").ensure()
+    tools.write_lines(http_app.hosts, ["http://kobold.htb:3552"])
+    tools.write_lines(https_app.hosts, ["https://kobold.htb"])
+    tools.write_jsonl(http_app.canonical("requests_crawl.jsonl"), [
+        {"method": "POST", "url": "http://kobold.htb:3552/api/run", "headers": {},
+         "body": "job=1", "params": [{"name": "job", "loc": "body"}],
+         "raw": "POST /api/run HTTP/1.1\r\nHost: kobold.htb:3552\r\n\r\njob=1",
+         "sources": ["katana"]},
+    ])
+    tools.write_lines(http_app.canonical("endpoints_js.txt"), [
+        "http://kobold.htb:3552/_app/chunk.js",
+        "http://kobold.htb:3552/_app/styles.css",
+        "http://kobold.htb:3552/_app/logo.png",
+        "http://kobold.htb:3552/download/chunk.js?v=1",
+    ])
+    tools.write_lines(https_app.canonical("endpoints_js.txt"), ["https://kobold.htb/admin"])
+
+    to_https = tasks._cross_group_surface(act, https_app)
+    urls = {record["url"] for record in to_https}
+    assert "https://kobold.htb/api/run" in urls
+    assert "https://kobold.htb/_app/chunk.js" in urls
+    assert "https://kobold.htb/_app/styles.css" in urls
+    assert "https://kobold.htb/_app/logo.png" not in urls
+    assert "https://kobold.htb/download/chunk.js?v=1" in urls
+    post = next(record for record in to_https if record["url"].endswith("/api/run"))
+    assert "Host: kobold.htb\r\n" in post["raw"]
+    assert "kobold.htb:3552" not in post["raw"]
+
+    to_http = tasks._cross_group_surface(act, http_app)
+    assert {record["url"] for record in to_http} == {"http://kobold.htb:3552/admin"}
 
 
 def test_request_catalog_full_routes_cross_group(tmp_path):

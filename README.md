@@ -152,8 +152,8 @@ explicitly. `--ai` is equivalent to `--set ai.enabled=on`, while a preset can en
 
 | Variable | Values / default | What it does |
 |----------|------------------|--------------|
-| `PTFLOW_AI` | truthy to enable · default off | Enables contextual wordlists, secret-lead triage, cross-finding hypotheses, and `report-ai.md` in `external` and `webscan`. |
-| `PTFLOW_AI_PROVIDER` | `ollama` (default) · `openrouter` · `huggingface` · `openai-compatible` · legacy `openai` / `claude-code` | Selects the runtime backend. Named providers supply their standard endpoint. |
+| `PTFLOW_AI` | truthy to enable · default off | Enables contextual wordlists, policy-gated CVE PoC interpretation, secret-lead triage, cross-finding hypotheses, and `report-ai.md` in `external` and `webscan`. |
+| `PTFLOW_AI_PROVIDER` | `ollama` (default, local) · `ollama-cloud` · `openrouter` · `huggingface` · `openai-compatible` · legacy `openai` / `claude-code` | Selects the runtime backend. Named providers supply their standard endpoint. |
 | `PTFLOW_AI_MODEL` | required | Provider-specific model ID, kept explicit for reproducibility. |
 | `PTFLOW_AI_BASE_URL` | provider default | Overrides the endpoint; required for `openai-compatible`. |
 | `PTFLOW_AI_CACHE` | `on` | Reuses validated outputs from `<activity>/ai/cache/` for identical prompts/configuration. |
@@ -164,16 +164,16 @@ explicitly. `--ai` is equivalent to `--set ai.enabled=on`, while a preset can en
 | `PTFLOW_AI_MAX_COST` | `0` (disabled) | Run-wide cost ceiling when the provider exposes cost metadata. |
 | `PTFLOW_AI_REMOTE_SECRETS` | `redacted` | Hosted-provider secret policy: `off`, `redacted`, or explicit `full`. |
 
-Each stage (`wordlist`, `secret_triage`, `triage`, `report`) can override `enabled`, `provider`,
+Each stage (`wordlist`, `cve_poc`, `secret_triage`, `triage`, `report`) can override `enabled`, `provider`,
 `model`, `base_url`, and `max_output_tokens` under `[ai.stages.<name>]`; see the hybrid
 [`mixed.toml`](configs/ai/mixed.toml) setup. Provider usage is recorded without prompts or outputs in
 `<activity>/ai/usage.jsonl`.
 
 Credentials stay in standard environment variables and are never stored in the TOML snapshot:
-`OPENROUTER_API_KEY` for OpenRouter, `HF_TOKEN` for Hugging Face, and `OPENAI_API_KEY` for a generic
-compatible endpoint. Hosted providers receive assessment evidence, but secret values are redacted by
-default, including when consolidated secret findings feed later triage/report stages. Confirm the
-engagement's data-handling rules or use local Ollama.
+`OLLAMA_API_KEY` for Ollama Cloud, `OPENROUTER_API_KEY` for OpenRouter, `HF_TOKEN` for Hugging Face,
+and `OPENAI_API_KEY` for a generic compatible endpoint. Hosted providers receive assessment evidence,
+but secret values are redacted by default, including when consolidated secret findings feed later
+triage/report stages. Confirm the engagement's data-handling rules or use local Ollama.
 
 ### Tool & path overrides
 
