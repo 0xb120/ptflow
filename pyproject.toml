@@ -13,6 +13,12 @@ ptflow = "ptflow.cli:main"
 
 [project.optional-dependencies]
 ai = [
+    "openai>=2.44.0",
+]
+ai-claude = [
+    "claude-agent-sdk>=0.2.110",
+]
+ai-all = [
     "claude-agent-sdk>=0.2.110",
     "openai>=2.44.0",
 ]

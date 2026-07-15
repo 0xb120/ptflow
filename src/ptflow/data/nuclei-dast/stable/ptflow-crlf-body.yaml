@@ -1,0 +1,39 @@
+id: ptflow-crlf-body
+
+info:
+  name: CRLF Response Header Injection via Request Body Parameter
+  author: ptflow
+  severity: medium
+  description: Detects response-header injection from a body value using an exact PTFlow marker.
+  metadata:
+    max-request: 2
+    verified: true
+  tags: ptflow,dast,crlf,stable,fuzzing-req-body
+
+http:
+  -
+    pre-condition:
+      - type: dsl
+        dsl:
+          - 'method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE"'
+
+    payloads:
+      crlf:
+        low:
+          - '%0d%0aX-PTFlow-CRLF:%20detected-7f31'
+        medium:
+          - '%250d%250aX-PTFlow-CRLF:%20detected-7f31'
+
+    fuzzing:
+      - part: body
+        mode: single
+        type: postfix
+        fuzz:
+          - '{{crlf}}'
+
+    stop-at-first-match: true
+    matchers:
+      - type: regex
+        part: header
+        regex:
+          - '(?mi)^X-PTFlow-CRLF:\s*detected-7f31\s*$'

@@ -89,6 +89,17 @@ def test_external_structural_nodes_and_fixpoint():
     assert "responses/discovered/round*/" in out
     assert "scans/&lt;app_id&gt;/" in out          # pivot heading (html-escaped)
     assert "findings/hypotheses.jsonl" in out      # fan-in
+    assert "report-surface.json" in out            # global phase-2 checkpoint
+
+
+def test_surface_checkpoint_sits_between_phase2_and_phase3():
+    for name in ("external", "webscan"):
+        pipeline, spec = load_pipeline(name), _spec(name)
+        graph = mermaidmap.mermaid_graph(pipeline.stages, spec, rich=False)
+        assert 'subgraph CP2["CHECKPOINT · DOPO FASE 2"]' in graph
+        assert "P2 ==> CP2" in graph
+        assert "CP2 ==> BAR3" in graph
+        assert "surface_checkpoint" in graph
 
 
 def test_internal_map_reflects_subnet_pivot():

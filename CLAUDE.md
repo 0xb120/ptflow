@@ -20,7 +20,7 @@ that fan out under Prefect.
 > hook the orchestrator calls like `preflight`): it lifts every app group's per-app findings into the
 > activity-level `<activity>/findings/<type>.jsonl`, one file per finding TYPE (`cve`/`dast` fold
 > their surface+deep passes). The old agent stage (`core/agent.py`, `HypothesisProvider`) still runs
-> as a **dormant** `StubProvider` fan-in beside it by default — its real (Claude-backed) implementation
+> as a **dormant** `StubProvider` fan-in beside it by default — its real (LLM-backed) implementation
 > was parked; the opt-in `--ai` layer now provides it (`ai_triage`), so don't treat the seam as
 > permanently inert, and leave the seam in place.
 
@@ -58,8 +58,8 @@ uv run pytest tests/core/test_scope.py::test_classify  # one test
 
 ### Run config (operator knobs)
 
-The **operator-facing** knobs (the ~14 `PTFLOW_*` env vars: `profile`, `oast`, `net_limit`, `http_header`,
-`recrawl`, `deep_dive`, tool paths, wordlist dir/roles, interactsh server/token, `ai`/`ai.model`/
+The **operator-facing** knobs (the `PTFLOW_*` env vars: `profile`, `oast`, `net_limit`, `http_header`,
+`recrawl`, `deep_dive`, tool paths, wordlist dir/roles, interactsh server/token, `ai.enabled`/`ai.model`/
 `ai.base_url`/`ai.provider`) can be set in an
 optional TOML file (`--config ptflow.toml`; see `ptflow.toml.example` for the annotated template) instead of
 scattered env vars. Resolution is `core/runconfig.py` (pure `resolve()` + thin `apply()`/`snapshot()`),
@@ -171,7 +171,7 @@ Two mechanisms keep docs current; both are best-effort and never block work:
    `scans/<app_id>/` dirs and returns the list of `app_id`s;
 3. **per-app loops** run in order (see below);
 4. the **agent** stage runs once as a fan-in (the dormant `StubProvider` by default; the real
-   Claude-backed provider, `ai_triage`, when `--ai`).
+   LLM-backed provider, `ai_triage`, when AI is enabled).
 
 **Spanning stages** (`spanning=True`, activity-scope) don't block the breadth→cluster barrier:
 they're launched once their breadth `needs` are done and awaited only at the fan-in, so they run
@@ -203,6 +203,12 @@ orchestrator (`per_app_loops()` in `core/orchestrator.py`):
 earlier loop's on-disk artifacts directly (they're guaranteed present by the barrier), so a
 new loop is added without touching any earlier loop's DAG. The global barrier is also where a
 future activity-scope aggregation (e.g. a cross-app wordlist corpus) would slot in.
+
+An activity-scope `Stage(after_phase=N)` is a first-class **checkpoint** at that seam: it runs only
+after every app group completed loop N, is awaited before loop N+1, and receives normal Prefect state,
+coverage telemetry and step toggles. Checkpoints are deliberately regenerated on `--resume`: a failed
+phase stage may have succeeded on the continuation, invalidating the prior snapshot. `external` and `webscan` use
+`surface_checkpoint` after phase 2 to publish the early deterministic surface report.
 
 Concurrency: `ThreadPoolTaskRunner(max_workers=N)` caps total in-flight stages **across all
 apps**. Intra-app parallelism therefore competes with fan-out width — only parallelize slow,
@@ -274,7 +280,11 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                                          #   cve/dast fold surface+deep). nuclei_scope.jsonl is the whole-scope nuclei finding.
   findings/secrets_triage.jsonl          # CONSOLIDATE output — ai_secret_triage verdicts lifted by app_id (--ai; empty/absent when AI is off)
   findings/hypotheses.jsonl              # agent fan-in output (StubProvider by default; --ai revives it as ai_triage, correlating consolidated findings)
-  report.md                              # --ai terminal narrative report (ai_report hook): consolidated findings + hypotheses → prose (absent when AI is off)
+  report.md  report.json                 # deterministic OFFLINE report: severity-normalized, deduped findings + evidence/PoC source paths
+  checkpoints/surface/findings/          # phase-2 snapshot: cve/dast/xss/sqli surface + takeover
+  report-surface.md  report-surface.json # early deterministic report, before guessing/deep DAST
+  coverage.json                          # per-run/stage coverage: status, deps, observed I/O, commands, caps/drops, requirements, limits
+  report-ai.md                           # --ai terminal narrative report (separate; never overwrites deterministic report)
   screenshots/screenshot/screenshot.html # UNIFIED gallery — one batched httpx run, 1 host/group (+ eyewitness/report.html)
   poc/  tmp/  logs/
   wl_global/                             # shared/global INPUT wordlists (SecLists & co.)
@@ -374,8 +384,10 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     so the ~15-min full scan no longer serializes in front of all web work. Plus `nuclei_scope` —
     another **spanning** whole-scope full-template nuclei scan (one process, one global `-rl` over
     deduped subdomains + webapps) launched after `httpx`, running ∥ everything, joined at the fan-in
-    (`findings/nuclei_scope.jsonl`). It runs `nuclei -ut` (update templates) first, then scans with
-    `-duc`. Per-app would multiply traffic on shared backends, so it's whole-scope, not per-app.
+    (`findings/nuclei_scope.jsonl`). Template updates are explicit/out-of-band (`nuclei -ut` before the
+    activity), so the spanning process cannot mutate the official pack while parallel DAST passes hash
+    and load it. It scans with `-duc`. Per-app would multiply traffic on shared backends, so it's
+    whole-scope, not per-app.
   - **Post-cluster spanning**: `screenshot` (`cluster_scope`) — ONE batched httpx `-ss -svrc` run over
     a single best-host candidate per group → the unified gallery `screenshots/screenshot/screenshot.html`
     (+ OPTIONAL one EyeWitness run → `report.html` + default-cred leads). Reconciled per group by URL.
@@ -406,6 +418,11 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     "CVE lookup" below. `xss` (dalfox) ∥ `sqli` (sqlmap) also run here (← `xref_catalog`) — **dedicated
     scanners** over the same surface set → `findings/xss.jsonl` / `findings/sqli.jsonl`. See "Dedicated
     vuln scanners" below.
+  - **Surface checkpoint** (`after_phase=2`, activity-scope, offline): after the global phase-2 barrier,
+    `surface_checkpoint` consolidates only the mature phase-1/2 findings (CVE/DAST/XSS/SQLi surface +
+    takeover) into `checkpoints/surface/findings/<type>.jsonl` and publishes `report-surface.md` /
+    `report-surface.json`. It excludes phase-3/4 outputs and spanning stages that have not joined yet;
+    the terminal report remains authoritative and later folds surface + deep findings.
   - **Loop 3 — guessing / surface expansion** (`phase=3`): `wordlist` (offline seed from JS/body/seed)
     → `tech_enum` (surface-generating per-stack scanners) → `content_discovery` — feroxbuster forced
     browsing run as a bounded **fixpoint** (fuzz → download → mine → fuzz the new token delta), which
@@ -740,9 +757,14 @@ endpoint). Verified: ginandjuice echoes `?category=` into a `Set-Cookie` header 
 flagged `category` on all 50 query endpoints → now one record. Endpoint-specific params are untouched.
 
 **DAST runs in two passes** (shared `_run_dast`), both **`nuclei -dast -im jsonl`** fuzzing
-query/path/header/cookie/**body** per template `part`, `-fa low` for live-infra politeness, best-effort
-(skip if nuclei or the dast templates dir — `PTFLOW_NUCLEI_DAST_TEMPLATES`, default `~/nuclei-templates/dast`
-— is absent), capped at `DAST_MAX_REQUESTS` (reconftw DEEP_LIMIT analog):
+query/path/header/cookie/**body** per template `part`, best-effort and capped at `DAST_MAX_REQUESTS`
+(reconftw DEEP_LIMIT analog). Template selection is a structured **multi-pack, all-template** layer:
+default packs are ProjectDiscovery `~/nuclei-templates/dast` plus bundled `@ptflow/stable`;
+`dast.packs` adds/replaces local official/custom/engagement packs without accepting raw shell flags.
+`PTFLOW_NUCLEI_DAST_TEMPLATES` remains the legacy single-pack fallback. Both passes execute every
+template in every enabled pack without tag/ID filters, with global `dast.aggression` (default `high`)
+and `dast.fuzz_param_frequency` (default `10000`). Nuclei OAST templates are active too;
+`PTFLOW_OAST` remains the separate opt-in gate for Dalfox blind-XSS.
 - **`dast`** (phase 2) over the explorable-surface set (`_surface_request_set` = `requests.jsonl` **∪**
   the cross-group sidecar `requests_xref.jsonl`) with its **observed** params → `findings/dast.jsonl`
   (input `raw/dast/input.jsonl`). The fast low-hanging-fruit pass.
@@ -760,14 +782,24 @@ otherwise count as N findings for ONE issue. Per-pass dedup suffices: `dast_full
 `request_key`-disjoint delta, so the same injection point can't recur across the two passes. Non-fuzzing
 records key on `(template-id, matched-at)` so unrelated hits never merge.
 
+Before scanning, nuclei `-tl` resolves the complete enabled-pack list once per process. Each pass persists an
+exact manifest (`raw/dast/template-selection.json` / `template-selection-full.json`) with pack paths,
+content hashes, configured/effective revisions, global execution settings, and template IDs. Findings
+carry `ptflow_dast.{pack,pack_revision,selection}` with `selection="all"`.
+`ptflow dast validate [--config ...]` strictly validates all enabled packs and rejects duplicate IDs;
+`ptflow dast list` lists the complete selection. Bundled custom templates live under
+`src/ptflow/data/nuclei-dast/stable`, one file per `query`/`body`/`header`/`cookie` part; the in-band
+rules are covered by a live positive/negative Nuclei corpus in `tests/dast/test_custom_templates.py`.
+
 Whole-scope full-template nuclei stays `nuclei_scope` (breadth, ∥ everything); these are the per-app
 fuzzing passes. Per-app findings → `consolidate` (terminal fan-in) lifts them. arjun/x8/api_spec provenance in
 their `raw/` dirs.
 
-**Auth passthrough** (`PTFLOW_HTTP_HEADER`, `_header_flags`/`_auth_headers`) threads operator session
-headers/cookies into katana/httpx/nuclei (`-H`), arjun (`--headers`), x8 (`-H`), dalfox (`-H`) and
-sqlmap (`--headers`) so the crawl/fetch/fuzz/DAST reach the **authenticated** surface (where most
-POST/JSON lives).
+**Auth passthrough is webscan-only.** `PTFLOW_HTTP_HEADER` is ignored while `external` runs, so broad
+discovery never sprays a session cookie across unrelated assets. In `webscan`, `_auth_headers` /
+`_header_flags` thread operator session headers/cookies into the web scanners (katana/httpx/nuclei,
+feroxbuster/crawley, arjun/x8, dalfox/sqlmap, wpprobe) so crawl/fetch/fuzz/DAST reach the
+**authenticated** surface (where most POST/JSON lives).
 
 ### Dedicated vuln scanners — dalfox (XSS) ∥ sqlmap (SQLi), surface + delta
 
@@ -863,8 +895,8 @@ idempotent (overwrites each run / `--resume`). Sources (`_CONSOLIDATE_SOURCES` +
 
 An empty TYPE writes no file (no clutter). The whole-scope `findings/nuclei_scope.jsonl` is already an
 activity-level finding and is left untouched. The agent seam (`findings/hypotheses.jsonl`) runs
-separately and is kept in place — dormant (`StubProvider`) by default, Claude-backed (`ai_triage`)
-under `--ai`. A `consolidate` failure is isolated (logged + counted), never aborting the run.
+separately and is kept in place — dormant (`StubProvider`) by default, LLM-backed (`ai_triage`)
+when AI is enabled. A `consolidate` failure is isolated (logged + counted), never aborting the run.
 
 ## Adding a pipeline (checklist)
 
@@ -921,8 +953,10 @@ flow changed:
   external tasks). Other tools (subfinder, dnsx, naabu, tlsx, mapcidr, shuffledns, katana, nerva,
   assetfinder, gau, urlfinder, subjack, …) are in `~/go/bin`; feroxbuster in `~/.local/bin`.
 - Trusted resolvers: `/opt/resolvers/resolvers-trusted.txt`.
-- **DAST (`dast` step)** uses `nuclei -dast` with the fuzzing templates at `~/nuclei-templates/dast`
-  (override `PTFLOW_NUCLEI_DAST_TEMPLATES`); the step skips best-effort if the dir or nuclei is absent.
+- **DAST (`dast`/`dast_full`)** uses structured local packs and always runs every template in every
+  enabled pack (see `ptflow.toml.example`). Default = official `~/nuclei-templates/dast` + bundled
+  PTFlow stable pack; the old `PTFLOW_NUCLEI_DAST_TEMPLATES` path remains a fallback. Validate/list
+  the complete selection with `ptflow dast`.
 - **Dedicated scanners (`xss`/`sqli`/`xss_full`/`sqli_full`)** use **dalfox** (`~/go/bin/dalfox`) and
   **sqlmap** (`/opt/sqlmap-dev/sqlmap.py`, override `PTFLOW_SQLMAP`, run via `sys.executable` — it's a
   python script, not a PATH binary). Both make target requests; best-effort (skip if absent). No DB to
@@ -940,9 +974,9 @@ flow changed:
   Chocapikk/wpprobe) against its LOCAL Wordfence DB. **Build/refresh out-of-band:** `wpprobe update-db`
   (and `wpprobe update` for the binary) — never during a run. Runs ONLY on WordPress app groups,
   best-effort (skips if absent). Makes target requests (stealthy REST enumeration, `--rate-limit`).
-- **Auth passthrough** — set `PTFLOW_HTTP_HEADER` to one or more `Name: value` session headers/cookies
-  (separated by newlines or `;;`) to reach the authenticated surface; threaded into katana/httpx/nuclei
-  (`-H`), arjun (`--headers`), x8 (`-H`). Set it *before* launching (like `PTFLOW_PROFILE`).
+- **Auth passthrough (`webscan` only)** — set `PTFLOW_HTTP_HEADER` to one or more `Name: value`
+  session headers/cookies (separated by newlines or `;;`) to reach the authenticated surface. Ignored
+  by `external`; in `webscan`, threaded into the web scanning tools. Set it *before* launching.
 - **EyeWitness (optional, `screenshot` step)** — a Selenium app, **installed** at `/opt/EyeWitness`
   with its own venv (`/opt/EyeWitness/.venv`, selenium ≥4.45 → Selenium Manager auto-provisions
   chromedriver; runs `--headless=new`, no Xvfb/sudo needed). `_eyewitness_cmd` resolves it
@@ -961,22 +995,30 @@ flow changed:
   (50 vs 150) and feroxbuster `-t`/`-L`, for a domestic line. Aggregate load ≈ concurrency × rate,
   so the per-tool rate is the real lever (a `net` concurrency cap alone won't tame the single
   full-port/nuclei stages). The active profile is logged at run start (preflight).
-- **AI layer (opt-in, `--ai` / `PTFLOW_AI=on`)** — adds four best-effort LLM stages via a
-  **provider-agnostic** `core/ai/` seam (`LLMClient` Protocol + `make_client()`). Two backends,
-  selected by **`PTFLOW_AI_PROVIDER`**: **`claude-code`** (default) drives the Claude Code Agent
-  SDK on the operator's own subscription — auth via `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`)
-  or `ANTHROPIC_API_KEY` — and **requires the `claude` CLI on PATH**; **`openai`** talks to any
-  OpenAI-compatible endpoint (Ollama local/cloud, OpenRouter, …) via `PTFLOW_AI_BASE_URL` +
-  **`PTFLOW_AI_MODEL` (required for this provider)** + `OPENAI_API_KEY`. Structured output is
-  **hybrid**: native schema support first, falling back to prompt+validate+retry for models (e.g.
-  local Ollama) that don't support one. `claude-agent-sdk` + `openai` are the OPTIONAL `ai` extra,
-  imported lazily. Stages: `ai_wordlist` (phase 2 → `wl_custom/ai_seed.txt`, folded by
+- **AI layer (opt-in, `--ai` / `PTFLOW_AI=on` / `[ai].enabled=true`)** — adds four best-effort LLM
+  functions via a **provider-agnostic** `core/ai/` seam (`LLMClient` Protocol + `make_client()`).
+  **`PTFLOW_AI_PROVIDER`** selects `ollama` (default, local endpoint
+  `http://127.0.0.1:11434/v1`), `openrouter`, `huggingface`, or an arbitrary
+  `openai-compatible` endpoint. All use the `openai` SDK from the optional `ai` extra; named hosted
+  providers read `OPENROUTER_API_KEY` / `HF_TOKEN`, while `PTFLOW_AI_MODEL` is always explicit.
+  `claude-code` remains a legacy opt-in backend isolated in `ai-claude`; it is no longer installed or
+  selected by default. Structured output is **hybrid**: native schema support first, falling back to
+  prompt+validate+retry. Every call returns `LLMResult`; managed clients add per-activity cache,
+  usage telemetry (`ai/usage.jsonl`), run budgets, timeout/retry and bounded concurrency. Provider,
+  model, endpoint, enablement and output cap can be overridden for each of `wordlist`,
+  `secret_triage`, `triage`, and `report`; `configs/ai/mixed.toml` demonstrates hybrid routing.
+  Triage/report consume normalized stable finding IDs and discard unsupported references. Hosted
+  secret handling defaults to redacted (`ai.remote_secrets=off|redacted|full`) across both secret
+  triage and downstream prompts. Ready configurations live in `configs/ai/`. Stages: `ai_wordlist` (phase 2 →
+  `wl_custom/ai_seed.txt`, folded by
   `build_content_wordlist`), `ai_secret_triage` (phase 4 → sidecar `findings/secrets_triage.jsonl`),
   `ai_triage` (revives the agent seam → `findings/hypotheses.jsonl`, correlating consolidated findings),
-  `ai_report` (terminal `report()` hook → `report.md`). All `net=False`, additive, failure-isolated;
-  with AI off, `ExternalPipeline.stages` is byte-identical to the deterministic default. Roadmap:
-  `ai_mine_bodies`, `ai_cve_rank`, `ai_param_values` (see
-  `docs/superpowers/specs/2026-07-04-ai-layer-design.md`).
+  `ai_report` (terminal `report()` hook → `report-ai.md`). Per-app AI stages are marked `net=False`
+  because they make no target traffic; hosted providers still make outbound API calls. All are
+  additive and failure-isolated. Remote providers receive redacted assessment evidence by default,
+  so their use remains RoE/data-handling sensitive. `external` and `webscan` share all four AI
+  functions; with AI off, both pipelines' stage lists remain identical to their deterministic
+  defaults. The active roadmap is in `docs/next-steps.md`.
 - **Authorized test scope only:** `https://ginandjuice.shop/` (PortSwigger demo), `scanme.nmap.org`
   (Nmap-sanctioned).
 
@@ -984,6 +1026,15 @@ flow changed:
 
 The architecture sections above say *what* the external pipeline does; this records *why* — and the
 alternatives deliberately rejected — so they aren't re-litigated. Newest first.
+
+- **The early surface report is a first-class global checkpoint, not a terminal hook or a per-app
+  report.** `Stage(after_phase=2)` is scheduled only after every app finishes loop 2 and is awaited before
+  loop 3, so the snapshot is race-free across groups. It writes to an isolated checkpoint namespace
+  rather than activity `findings/`, preventing partial phase-2 consolidation from contaminating the
+  final fan-in. Whole-scope spanning outputs are intentionally absent because they may still be running.
+  A rerun replaces every checkpoint JSONL before rendering, so an empty category cannot survive as stale
+  early evidence. The same stage is present in `external` and `webscan`; `internal` has no four-phase web
+  depth loop and therefore no surface checkpoint.
 
 - **A per-scope authorization gate (`scope_gate`) enforces the RoE boundary at the discovery→active-scan
   seam — an offline stage between `resolve` and `portscan`.** External discovery *harvests names it never

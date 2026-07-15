@@ -1507,8 +1507,14 @@ dependencies = [
 
 [package.optional-dependencies]
 ai = [
+    { name = "openai" },
+]
+ai-all = [
     { name = "claude-agent-sdk" },
     { name = "openai" },
+]
+ai-claude = [
+    { name = "claude-agent-sdk" },
 ]
 
 [package.dev-dependencies]
@@ -1529,12 +1535,14 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-agent-sdk", marker = "extra == 'ai'", specifier = ">=0.2.110" },
+    { name = "claude-agent-sdk", marker = "extra == 'ai-all'", specifier = ">=0.2.110" },
+    { name = "claude-agent-sdk", marker = "extra == 'ai-claude'", specifier = ">=0.2.110" },
     { name = "fastapi", specifier = "<0.137" },
     { name = "openai", marker = "extra == 'ai'", specifier = ">=2.44.0" },
+    { name = "openai", marker = "extra == 'ai-all'", specifier = ">=2.44.0" },
     { name = "prefect", specifier = ">=3.0" },
 ]
-provides-extras = ["ai"]
+provides-extras = ["ai", "ai-claude", "ai-all"]
 
 [package.metadata.requires-dev]
 dev = [

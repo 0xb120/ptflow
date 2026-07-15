@@ -16,6 +16,7 @@ def test_stage_defaults():
     assert s.per_app is False
     assert s.phase == 1  # first per-app loop by default
     assert s.spanning is False
+    assert s.after_phase is None
 
 
 def test_load_pipeline_unknown_raises():
@@ -31,6 +32,14 @@ def test_stage_band_classifies():
     assert stage_band(Stage("b", lambda *_: None, spanning=True)) == "spanning"
     assert stage_band(Stage("c", lambda *_: None, cluster_scope=True)) == "post-cluster"
     assert stage_band(Stage("d", lambda *_: None, per_app=True, phase=2)) == "loop:2"
+    assert stage_band(Stage("e", lambda *_: None, after_phase=2)) == "checkpoint:2"
+
+
+def test_checkpoint_stage_rejects_incompatible_shapes():
+    with pytest.raises(ValueError, match="activity-scope"):
+        Stage("bad", lambda *_: None, per_app=True, after_phase=2)
+    with pytest.raises(ValueError, match=">= 1"):
+        Stage("bad", lambda *_: None, after_phase=0)
 
 
 def test_enabled_stages_filters():

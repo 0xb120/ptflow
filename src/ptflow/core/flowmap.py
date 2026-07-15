@@ -1,7 +1,7 @@
 """Generic pipeline flow-map renderer → a self-contained HTML map of a Pipeline's DAG.
 
 The STRUCTURE (bands, phases, parallelism, barriers) is DERIVED from the Stage objects
-(`name`/`needs`/`phase`/`per_app`/`spanning`) via longest-path layering — stages at the same
+(`name`/`needs`/`phase`/`per_app`/`spanning`/`after_phase`) via longest-path layering — stages at the same
 dependency depth within a scope run in parallel and render side by side. Per-step prose, commands
 and outputs come from a caller-supplied `StepMeta` table (see `pipelines/external/flowmeta.py`).
 
@@ -30,6 +30,7 @@ _PHASE_TONES = ("#7bd88f", "#ff4d9d", "#f5a3c7", "#8fd0ff", "#f0b429")  # phase 
 _TONE_BREADTH = "#4fd6c8"
 _TONE_SPAN = "#f0b429"
 _TONE_PIVOT = "#cdd8e8"
+_TONE_CHECKPOINT = "#e6c247"
 _TONE_FANIN = "#8b8fa3"
 
 
@@ -76,6 +77,13 @@ def _legend_loops(stages: Sequence[Stage]) -> str:
         for p in phases
         for tone in (_phase_tone(p),)
     )
+
+
+def _legend_checkpoints(stages: Sequence[Stage]) -> str:
+    if not any(stage.after_phase is not None for stage in stages):
+        return ""
+    return ('\n<span class="k"><span class="swatch" style="color:#e6c247;background:#e6c247">'
+            "</span>checkpoint</span>")
 
 
 def _layer(subset: list[Stage]) -> list[list[Stage]]:
@@ -147,7 +155,9 @@ def render(stages: Sequence[Stage], spec: MapSpec, *, generator: str = "ptflow.c
     `generator` is the module label shown in the footer (the entrypoint that wrote the file)."""
     stages = list(stages)
     idx_of = {s.name: f"{i:02d}" for i, s in enumerate(stages)}
-    activity = [s for s in stages if not s.per_app and not s.spanning and not s.cluster_scope]
+    activity = [s for s in stages
+                if not s.per_app and not s.spanning and not s.cluster_scope
+                and s.after_phase is None]
     spanning = [s for s in stages if s.spanning]
     cluster_scope = [s for s in stages if s.cluster_scope]
     phases = sorted({s.phase for s in stages if s.per_app})
@@ -181,6 +191,13 @@ def render(stages: Sequence[Stage], spec: MapSpec, *, generator: str = "ptflow.c
         parts.append(_band(f"{pos + 2:02d}", f"loop {phase} · {label}",
                            f"per-app · phase {phase}", _phase_tone(phase),
                            _levels(subset, idx_of, spec.steps)))
+        checkpoints = [s for s in stages if s.after_phase == phase]
+        if checkpoints:
+            parts.append(_band(
+                "", f"checkpoint · fase {phase}",
+                "activity-scope · dopo la barriera globale · awaited prima del loop successivo",
+                _TONE_CHECKPOINT, _levels(checkpoints, idx_of, spec.steps),
+            ))
 
     if spec.fanin is not None:
         heading, meta = spec.fanin
@@ -194,6 +211,7 @@ def render(stages: Sequence[Stage], spec: MapSpec, *, generator: str = "ptflow.c
         eyebrow=_esc(spec.title),
         thesis=_esc(spec.thesis),
         legend_loops=_legend_loops(stages),
+        legend_checkpoints=_legend_checkpoints(stages),
         body="".join(parts),
         generator=_esc(generator),
     )
@@ -269,7 +287,7 @@ _DOC = """<!doctype html>
 <span class="k"><span class="swatch" style="color:#4fd6c8;background:#4fd6c8"></span>breadth</span>
 <span class="k"><span class="swatch" style="color:#f0b429;background:#f0b429"></span>spanning / post-cluster</span>
 <span class="k"><span class="swatch" style="color:#cdd8e8;background:#cdd8e8"></span>pivot</span>
-{legend_loops}
+{legend_loops}{legend_checkpoints}
 <span class="k"><span class="swatch" style="color:#8b8fa3;background:#8b8fa3"></span>fan-in</span>
 <span class="k"><span class="sym">∥</span> parallelo</span>
 <span class="k"><span class="sym">▼</span> needs</span>

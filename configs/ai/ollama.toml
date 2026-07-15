@@ -1,0 +1,18 @@
+# Local/private setup. Install the AI extra, then run:
+#   ollama pull gpt-oss:20b
+#   ollama serve
+#   uv run ptflow run external <activity> <scope> --config configs/ai/ollama.toml
+
+[ai]
+enabled = true
+provider = "ollama"
+model = "gpt-oss:20b"
+base_url = "http://127.0.0.1:11434/v1"
+cache = true
+concurrency = 2
+timeout_seconds = 180
+max_retries = 2
+max_calls = 50
+max_input_tokens = 250000
+max_output_tokens = 30000
+remote_secrets = "redacted"

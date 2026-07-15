@@ -1,0 +1,42 @@
+id: ptflow-open-redirect-query
+
+info:
+  name: Open Redirect via Query Parameter
+  author: ptflow
+  severity: medium
+  description: Detects a redirect controlled by a query value using an exact reserved marker host.
+  metadata:
+    max-request: 1
+    verified: true
+  tags: ptflow,dast,redirect,stable,fuzzing-req-query
+
+http:
+  -
+    pre-condition:
+      - type: dsl
+        dsl:
+          - 'method != "OPTIONS"'
+
+    fuzzing:
+      - part: query
+        mode: single
+        type: replace
+        keys-regex:
+          - '(?i)^(?:url|uri|next|continue|return|return_?to|return_?url|redirect|redirect_?url|redirect_?uri|redir|dest|destination|callback|goto|target|to|x-redirect-url)$'
+        fuzz:
+          - 'https://ptflow-dast.invalid/redirect-marker'
+
+    stop-at-first-match: true
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 301
+          - 302
+          - 303
+          - 307
+          - 308
+      - type: regex
+        part: header
+        regex:
+          - '(?mi)^Location:\s*https://ptflow-dast\.invalid/redirect-marker(?:[/?#].*)?\s*$'

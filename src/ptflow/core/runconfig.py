@@ -12,6 +12,7 @@ single consumption point — no constant is re-plumbed. ``snapshot()`` records t
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from collections.abc import Collection, Iterable, Mapping
@@ -24,14 +25,22 @@ log = get_logger()
 
 _HTTP_HEADER_SEP = ";;"          # PTFLOW_HTTP_HEADER multi-value separator (env reader also accepts \n)
 _TRUE = {"1", "on", "true", "yes"}
+_AI_PROVIDERS = (
+    "ollama", "openrouter", "huggingface", "openai-compatible", "openai", "claude-code",
+)
+_AI_STAGE_NAMES = ("wordlist", "secret_triage", "triage", "report")
 _ENUMS = {
     "PTFLOW_PROFILE": ("wide", "home"),
     "PTFLOW_RECRAWL": ("off", "preview", "on"),
-    "PTFLOW_AI_PROVIDER": ("claude-code", "openai"),
+    "PTFLOW_AI_PROVIDER": _AI_PROVIDERS,
+    "PTFLOW_AI_REMOTE_SECRETS": ("off", "redacted", "full"),
+    "PTFLOW_DAST_AGGRESSION": ("low", "medium", "high"),
 }
+_KEY_ALIASES = {"ai": "ai.enabled"}  # legacy `ai=on`; canonical table-safe key is ai.enabled
 _ROLES_PREFIX = "wordlists.roles."   # dynamic: wordlists.roles.<role> → PTFLOW_WL_<ROLE>
 _STEPS_PREFIX = "steps."   # dynamic: steps.<pipeline>.<step> → per-step on/off (filters pipeline.stages)
 _STEPS_KEY_SEGMENTS = 3   # steps.<pipeline>.<step> — fewer segments is a malformed (unrecognized) key
+_ATOMIC_TABLES: frozenset[str] = frozenset()
 
 
 class Knob(NamedTuple):
@@ -40,7 +49,7 @@ class Knob(NamedTuple):
 
     path: str
     env: str
-    kind: str          # str | bool | int | list | path
+    kind: str          # str | bool | int | list | path | json
     secret: bool = False
 
 
@@ -53,10 +62,33 @@ _KNOBS: tuple[Knob, ...] = (
     Knob("oast", "PTFLOW_OAST", "bool"),
     Knob("recrawl", "PTFLOW_RECRAWL", "str"),
     Knob("deep_dive", "PTFLOW_DEEP_DIVE", "bool"),
-    Knob("ai", "PTFLOW_AI", "bool"),
+    Knob("ai.enabled", "PTFLOW_AI", "bool"),
     Knob("ai.model", "PTFLOW_AI_MODEL", "str"),
     Knob("ai.base_url", "PTFLOW_AI_BASE_URL", "str"),
     Knob("ai.provider", "PTFLOW_AI_PROVIDER", "str"),
+    Knob("ai.cache", "PTFLOW_AI_CACHE", "bool"),
+    Knob("ai.concurrency", "PTFLOW_AI_CONCURRENCY", "int"),
+    Knob("ai.timeout_seconds", "PTFLOW_AI_TIMEOUT_SECONDS", "int"),
+    Knob("ai.max_retries", "PTFLOW_AI_MAX_RETRIES", "int"),
+    Knob("ai.max_calls", "PTFLOW_AI_MAX_CALLS", "int"),
+    Knob("ai.max_input_tokens", "PTFLOW_AI_MAX_INPUT_TOKENS", "int"),
+    Knob("ai.max_output_tokens", "PTFLOW_AI_MAX_OUTPUT_TOKENS", "int"),
+    Knob("ai.max_cost", "PTFLOW_AI_MAX_COST", "str"),
+    Knob("ai.remote_secrets", "PTFLOW_AI_REMOTE_SECRETS", "str"),
+    *(Knob(f"ai.stages.{stage}.enabled", f"PTFLOW_AI_STAGE_{stage.upper()}_ENABLED", "bool")
+      for stage in _AI_STAGE_NAMES),
+    *(Knob(f"ai.stages.{stage}.provider", f"PTFLOW_AI_STAGE_{stage.upper()}_PROVIDER", "str")
+      for stage in _AI_STAGE_NAMES),
+    *(Knob(f"ai.stages.{stage}.model", f"PTFLOW_AI_STAGE_{stage.upper()}_MODEL", "str")
+      for stage in _AI_STAGE_NAMES),
+    *(Knob(f"ai.stages.{stage}.base_url", f"PTFLOW_AI_STAGE_{stage.upper()}_BASE_URL", "str")
+      for stage in _AI_STAGE_NAMES),
+    *(Knob(f"ai.stages.{stage}.max_output_tokens",
+           f"PTFLOW_AI_STAGE_{stage.upper()}_MAX_OUTPUT_TOKENS", "int")
+      for stage in _AI_STAGE_NAMES),
+    Knob("dast.aggression", "PTFLOW_DAST_AGGRESSION", "str"),
+    Knob("dast.fuzz_param_frequency", "PTFLOW_DAST_FUZZ_PARAM_FREQUENCY", "int"),
+    Knob("dast.packs", "PTFLOW_DAST_PACKS", "json"),
     Knob("tools.sqlmap", "PTFLOW_SQLMAP", "path"),
     Knob("tools.search_vulns", "PTFLOW_SEARCH_VULNS", "path"),
     Knob("tools.nuclei_dast_templates", "PTFLOW_NUCLEI_DAST_TEMPLATES", "path"),
@@ -104,7 +136,7 @@ def _flatten(cfg: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k, v in cfg.items():
         key = f"{prefix}{k}"
-        if isinstance(v, dict):
+        if isinstance(v, dict) and key not in _ATOMIC_TABLES:
             out.update(_flatten(v, f"{key}."))
         else:
             out[key] = v
@@ -119,6 +151,15 @@ def _coerce(kind: str, value: Any) -> str:
     if kind == "list":
         items = value if isinstance(value, list) else [value]
         return _HTTP_HEADER_SEP.join(str(x) for x in items)
+    if kind == "json":
+        if isinstance(value, str):
+            try:
+                json.loads(value)
+            except json.JSONDecodeError as exc:
+                msg = f"invalid JSON config value: {exc}"
+                raise ConfigError(msg) from exc
+            return value
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
     if kind == "path":
         return str(Path(str(value)).expanduser())
     return str(value)
@@ -132,15 +173,23 @@ def _parse_overrides(sets: Iterable[str] | None) -> dict[str, str]:
             msg = f"--set expects KEY=VALUE, got: {item!r}"
             raise ConfigError(msg)
         key, val = item.split("=", 1)
-        out[key.strip()] = val
+        normalized = key.strip()
+        out[_KEY_ALIASES.get(normalized, normalized)] = val
     return out
 
 
 def _validate(env: str, value: str) -> None:
-    allowed = _ENUMS.get(env)
+    allowed = _AI_PROVIDERS if env.startswith("PTFLOW_AI_STAGE_") and env.endswith("_PROVIDER") \
+        else _ENUMS.get(env)
     if allowed and value not in allowed:
         msg = f"invalid {env}={value!r} — expected one of {', '.join(allowed)}"
         raise ConfigError(msg)
+    if env == "PTFLOW_DAST_PACKS":
+        try:
+            json.loads(value)
+        except json.JSONDecodeError as exc:
+            msg = f"invalid {env}: {exc}"
+            raise ConfigError(msg) from exc
 
 
 def _pick(knob: Knob, overrides: dict[str, str], env: Mapping[str, str],
@@ -160,7 +209,7 @@ def _is_recognized_key(key: str) -> bool:
     """A config/override key the resolver knows about — a declared knob, a wordlist-role pin, or a
     FULLY-FORMED per-step toggle (`steps.<pipeline>.<step>`). A malformed `steps.` key (missing the
     pipeline or step segment) is deliberately NOT recognized, so resolve() warns it as a likely typo."""
-    if key in _BY_PATH or key.startswith(_ROLES_PREFIX):
+    if key in _BY_PATH or key in _KEY_ALIASES or key.startswith(_ROLES_PREFIX):
         return True
     if key.startswith(_STEPS_PREFIX):
         return len(key.split(".")) >= _STEPS_KEY_SEGMENTS
@@ -172,7 +221,7 @@ def resolve(config: Mapping[str, Any], env: Mapping[str, str],
     """Effective knob values (precedence --set > env > config), coerced to the env string form and
     validated (enums; unknown keys warned as likely typos). Pure — env and overrides are passed in."""
     overrides = _parse_overrides(sets)
-    flat = _flatten(config)
+    flat = {_KEY_ALIASES.get(k, k): v for k, v in _flatten(config).items()}
     for source, keys in (("config", flat), ("--set", overrides)):
         for key in keys:
             if not _is_recognized_key(key):

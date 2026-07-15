@@ -16,6 +16,7 @@ def test_activity_layout(tmp_path):
         == tmp_path / "acme" / "asset_discovery" / "raw" / "discover"
     )
     assert act.findings == tmp_path / "acme" / "findings"
+    assert act.checkpoints == tmp_path / "acme" / "checkpoints"
 
 
 def test_app_workspace_paths(tmp_path):
@@ -36,7 +37,10 @@ def test_state_paths(tmp_path):
 
 def test_ensure_creates_standard_dirs(tmp_path):
     act = Activity.named("acme", root=tmp_path).ensure()
-    for d in (act.scope_dir, act.asset_discovery, act.findings, act.poc, act.tmp, act.wl_global, act.logs):
+    for d in (
+        act.scope_dir, act.asset_discovery, act.findings, act.checkpoints, act.poc, act.tmp,
+        act.wl_global, act.logs,
+    ):
         assert d.is_dir()
 
 

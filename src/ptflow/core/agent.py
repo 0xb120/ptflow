@@ -2,13 +2,14 @@
 
 Input: the CONSOLIDATED activity findings (`<activity>/findings/<type>.jsonl`, written by the
 pipeline's `consolidate` terminal step, which runs first) plus any per-app `services.jsonl`. Output: a
-consolidated `findings/hypotheses.jsonl` at the activity root. The real Claude-backed provider drops in
+consolidated `findings/hypotheses.jsonl` at the activity root. The real LLM-backed provider drops in
 behind `HypothesisProvider` when the run is `--ai` (see pipelines/external/ai.py); otherwise the
 dormant `StubProvider` runs.
 """
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -26,12 +27,20 @@ class HypothesisDraft:
     rationale: str | None = None
     technique: str | None = None
     confidence: str | None = None
+    confidence_score: float | None = None
+    severity: str | None = None
+    finding_ids: list[str] | None = None
+    prerequisites: list[str] | None = None
+    validation_steps: list[str] | None = None
+    expected_evidence: list[str] | None = None
+    false_positive_conditions: list[str] | None = None
 
 
 class HypothesisProvider(Protocol):
     name: str
 
-    def propose(self, records: Sequence[dict]) -> list[HypothesisDraft]: ...
+    def propose(self, records: Sequence[dict], *, activity: Activity | None = None) \
+            -> list[HypothesisDraft]: ...
 
 
 def _subject(rec: dict) -> str | None:
@@ -45,7 +54,9 @@ class StubProvider:
 
     name = "stub"
 
-    def propose(self, records: Sequence[dict]) -> list[HypothesisDraft]:
+    def propose(
+        self, records: Sequence[dict], *, activity: Activity | None = None,  # noqa: ARG002
+    ) -> list[HypothesisDraft]:
         drafts: list[HypothesisDraft] = []
         for r in records:
             subj = _subject(r)
@@ -81,7 +92,12 @@ def propose_hypotheses(activity: Activity, provider: HypothesisProvider | None =
     """Gather the consolidated findings, ask the provider, write findings/hypotheses.jsonl. Returns the
     number of hypotheses. Never reads its own output (hypotheses.jsonl is excluded)."""
     prov = provider or StubProvider()
-    drafts = prov.propose(gather_records(activity))
+    propose = prov.propose
+    # The activity-aware form lets managed AI clients write run-scoped cache/usage artifacts. Keep
+    # accepting the original one-argument provider seam for third-party pipelines and tests.
+    parameters = inspect.signature(propose).parameters
+    drafts = (propose(gather_records(activity), activity=activity)
+              if "activity" in parameters else propose(gather_records(activity)))
     records = [
         {
             "title": d.title,
@@ -89,6 +105,13 @@ def propose_hypotheses(activity: Activity, provider: HypothesisProvider | None =
             "rationale": d.rationale,
             "technique": d.technique,
             "confidence": d.confidence,
+            "confidence_score": d.confidence_score,
+            "severity": d.severity,
+            "finding_ids": d.finding_ids or [],
+            "prerequisites": d.prerequisites or [],
+            "validation_steps": d.validation_steps or [],
+            "expected_evidence": d.expected_evidence or [],
+            "false_positive_conditions": d.false_positive_conditions or [],
             "source": prov.name,
         }
         for d in drafts

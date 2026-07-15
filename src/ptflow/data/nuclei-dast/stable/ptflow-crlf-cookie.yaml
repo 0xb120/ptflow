@@ -1,0 +1,39 @@
+id: ptflow-crlf-cookie
+
+info:
+  name: CRLF Response Header Injection via Cookie
+  author: ptflow
+  severity: medium
+  description: Detects response-header injection from a cookie value using an exact PTFlow marker.
+  metadata:
+    max-request: 2
+    verified: true
+  tags: ptflow,dast,crlf,stable,fuzzing-req-cookie
+
+http:
+  -
+    pre-condition:
+      - type: dsl
+        dsl:
+          - 'method != "OPTIONS"'
+
+    payloads:
+      crlf:
+        low:
+          - '%0d%0aX-PTFlow-CRLF:%20detected-7f31'
+        medium:
+          - '%250d%250aX-PTFlow-CRLF:%20detected-7f31'
+
+    fuzzing:
+      - part: cookie
+        mode: single
+        type: postfix
+        fuzz:
+          - '{{crlf}}'
+
+    stop-at-first-match: true
+    matchers:
+      - type: regex
+        part: header
+        regex:
+          - '(?mi)^X-PTFlow-CRLF:\s*detected-7f31\s*$'

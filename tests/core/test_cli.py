@@ -26,3 +26,18 @@ def test_render_steps_verbose_shows_needs_and_scope():
     assert "needs=discover" in out
     assert "per_app" in out
     assert "activity" in out
+
+
+def test_render_steps_places_checkpoint_after_its_loop():
+    from types import SimpleNamespace
+
+    from ptflow.core.stage import Stage
+
+    pipeline = SimpleNamespace(name="p", stages=[
+        Stage("loop2", lambda *_: None, per_app=True, phase=2),
+        Stage("checkpoint", lambda *_: None, after_phase=2, net=False),
+        Stage("loop3", lambda *_: None, per_app=True, phase=3),
+    ])
+    out = render_steps(pipeline, frozenset(), verbose=True)
+    assert out.index("loop:2") < out.index("checkpoint:2") < out.index("loop:3")
+    assert "after_phase=2" in out

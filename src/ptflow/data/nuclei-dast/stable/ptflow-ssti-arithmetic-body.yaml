@@ -1,0 +1,39 @@
+id: ptflow-ssti-arithmetic-body
+
+info:
+  name: SSTI Arithmetic Evaluation via Request Body Parameter
+  author: ptflow
+  severity: high
+  description: Detects server-side template evaluation from a body value using an exact arithmetic result.
+  metadata:
+    max-request: 3
+    verified: true
+  tags: ptflow,dast,ssti,stable,fuzzing-req-body
+
+http:
+  -
+    pre-condition:
+      - type: dsl
+        dsl:
+          - 'method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE"'
+
+    payloads:
+      expression:
+        low:
+          - '{{1337*7331}}'
+          - '<%= 1337*7331 %>'
+          - '#{1337*7331}'
+
+    fuzzing:
+      - part: body
+        mode: single
+        type: replace
+        fuzz:
+          - '{{expression}}'
+
+    stop-at-first-match: true
+    matchers:
+      - type: word
+        part: body
+        words:
+          - '9801547'

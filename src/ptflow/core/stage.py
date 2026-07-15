@@ -43,6 +43,11 @@ class Stage:
     `activity.list_apps()`), ∥ the per-app loops, joined at the terminal fan-in. Unlike `spanning`
     (launched after breadth), it's launched after clustering — e.g. a single batched screenshot run
     over one candidate per group, producing one unified gallery.
+
+    `after_phase` marks an activity-scope CHECKPOINT that runs after the global barrier at the end of
+    that per-app phase and before the following phase starts. It is the aggregation seam for an early
+    report/snapshot over every app group; unlike `spanning`, it is awaited immediately. Checkpoints are
+    mutually exclusive with `per_app`, `spanning`, and `cluster_scope`.
     """
 
     name: str
@@ -52,20 +57,34 @@ class Stage:
     phase: int = 1
     spanning: bool = False
     cluster_scope: bool = False
+    after_phase: int | None = None
     net: bool = True
     """Whether the stage does network I/O. Network stages are tagged ``net`` and counted against the
     global network-concurrency cap (``_NET_SLOTS``); set ``net=False`` for purely offline stages
     (wordlist tokenisation, response-store mining, wordlist provisioning) so they neither claim a
     network slot nor get the ``net`` tag."""
 
+    def __post_init__(self) -> None:
+        if self.after_phase is None:
+            return
+        if self.after_phase < 1:
+            msg = "after_phase must be >= 1"
+            raise ValueError(msg)
+        if self.per_app or self.spanning or self.cluster_scope:
+            msg = "after_phase checkpoints must be activity-scope and non-spanning"
+            raise ValueError(msg)
+
 
 def stage_band(stage: Stage) -> str:
     """The stage's execution band (pure) — the SINGLE source for both the Prefect UI tags and the
-    `ptflow steps` view, so the two can't diverge. breadth | spanning | post-cluster | loop:<phase>."""
+    `ptflow steps` view, so the two can't diverge. breadth | spanning | post-cluster |
+    loop:<phase> | checkpoint:<phase>."""
     if stage.spanning:
         return "spanning"
     if stage.cluster_scope:
         return "post-cluster"
+    if stage.after_phase is not None:
+        return f"checkpoint:{stage.after_phase}"
     if stage.per_app:
         return f"loop:{stage.phase}"
     return "breadth"

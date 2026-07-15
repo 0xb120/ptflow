@@ -1,3 +1,5 @@
+import importlib
+
 from ptflow.pipelines import load_pipeline
 from ptflow.pipelines.webscan.pipeline import PIPELINE
 
@@ -28,7 +30,8 @@ def test_webscan_keeps_the_depth_loops():
 def test_webscan_breadth_is_just_ingest():
     # the only non-per-app, non-spanning stages are the minimal breadth: provision_wl + ingest
     breadth = [s.name for s in PIPELINE.stages
-               if not s.per_app and not s.spanning and not s.cluster_scope]
+               if not s.per_app and not s.spanning and not s.cluster_scope
+               and s.after_phase is None]
     assert breadth == ["provision_wl", "ingest"]
 
 
@@ -47,12 +50,14 @@ def test_webscan_phases_preserved():
     assert by_name["dast"].phase == 2
     assert by_name["content_discovery"].phase == 3
     assert by_name["param_fuzz"].phase == 4
+    assert by_name["surface_checkpoint"].after_phase == 2
 
 
 def test_webscan_has_composition_hooks():
     assert callable(PIPELINE.cluster)
     assert callable(PIPELINE.consolidate)
     assert callable(PIPELINE.provider)
+    assert callable(PIPELINE.report)
 
 
 def test_webscan_requirements_narrow_core_to_depth_tools():
@@ -67,3 +72,70 @@ def test_webscan_requirements_narrow_core_to_depth_tools():
     assert by["subfinder"].kind == "optional"
     # same coverage as external — reclassified, nothing dropped
     assert {r.name for r in reqs} == {r.name for r in external.requirements()}
+
+
+def _reload_pipeline():
+    from ptflow.pipelines.webscan import pipeline
+
+    return importlib.reload(pipeline)
+
+
+def test_webscan_ai_stages_absent_when_off(monkeypatch):
+    monkeypatch.delenv("PTFLOW_AI", raising=False)
+    pipeline = _reload_pipeline()
+
+    names = {stage.name for stage in pipeline.PIPELINE.stages}
+
+    assert "ai_wordlist" not in names
+    assert "ai_secret_triage" not in names
+
+
+def test_webscan_ai_stages_reuse_external_ai_when_on(monkeypatch):
+    from ptflow.pipelines.external import ai
+
+    monkeypatch.setenv("PTFLOW_AI", "on")
+    pipeline = _reload_pipeline()
+
+    by_name = {stage.name: stage for stage in pipeline.PIPELINE.stages}
+
+    assert by_name["ai_wordlist"].run is ai.ai_wordlist
+    assert by_name["ai_wordlist"].phase == 2
+    assert by_name["ai_wordlist"].net is False
+    assert by_name["ai_secret_triage"].run is ai.ai_secret_triage
+    assert by_name["ai_secret_triage"].phase == 4
+    assert by_name["ai_secret_triage"].net is False
+    assert isinstance(pipeline.PIPELINE.provider(), ai.LLMHypothesisProvider)
+    assert {"ai_wordlist", "ai_secret_triage"} <= pipeline.PIPELINE.flowmap_spec().steps.keys()
+
+    monkeypatch.delenv("PTFLOW_AI", raising=False)
+    _reload_pipeline()
+
+
+def test_webscan_ai_stage_toggle_is_honoured(monkeypatch):
+    monkeypatch.setenv("PTFLOW_AI", "on")
+    monkeypatch.setenv("PTFLOW_AI_STAGE_WORDLIST_ENABLED", "off")
+    monkeypatch.setenv("PTFLOW_AI_STAGE_SECRET_TRIAGE_ENABLED", "on")
+    pipeline = _reload_pipeline()
+
+    names = {stage.name for stage in pipeline.PIPELINE.stages}
+
+    assert "ai_wordlist" not in names
+    assert "ai_secret_triage" in names
+
+    monkeypatch.delenv("PTFLOW_AI", raising=False)
+    monkeypatch.delenv("PTFLOW_AI_STAGE_WORDLIST_ENABLED", raising=False)
+    monkeypatch.delenv("PTFLOW_AI_STAGE_SECRET_TRIAGE_ENABLED", raising=False)
+    _reload_pipeline()
+
+
+def test_webscan_report_delegates_to_external_ai(monkeypatch):
+    from ptflow.pipelines.external import ai
+
+    pipeline = _reload_pipeline()
+    activity = object()
+    called = []
+    monkeypatch.setattr(ai, "report", called.append)
+
+    pipeline.PIPELINE.report(activity)
+
+    assert called == [activity]

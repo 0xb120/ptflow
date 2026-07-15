@@ -79,10 +79,12 @@ def test_stage_tags_by_band():
     span = Stage("b", lambda *_: None, spanning=True)
     clus = Stage("c", lambda *_: None, cluster_scope=True)
     loop2 = Stage("d", lambda *_: None, per_app=True, phase=2)
+    checkpoint2 = Stage("e", lambda *_: None, after_phase=2, net=False)
     assert orchestrator._stage_tags(base) == ["net", "breadth"]      # UI band tags for the run graph
     assert orchestrator._stage_tags(span) == ["net", "spanning"]
     assert orchestrator._stage_tags(clus) == ["net", "post-cluster"]
     assert orchestrator._stage_tags(loop2) == ["net", "loop:2"]
+    assert orchestrator._stage_tags(checkpoint2) == ["checkpoint:2"]
 
 
 def test_marker_path(tmp_path):
@@ -109,10 +111,45 @@ def test_per_app_loops_groups_by_phase_in_order():
         Stage("a", lambda *_: None, per_app=True, phase=1),
         Stage("b", lambda *_: None, needs=("a",), per_app=True, phase=1),
         Stage("c", lambda *_: None, per_app=True, phase=2),
+        Stage("checkpoint", lambda *_: None, after_phase=2),
     ]
     loops = orchestrator.per_app_loops(stages)
     assert [phase for phase, _ in loops] == [1, 2]
     assert [[s.name for s in ss] for _, ss in loops] == [["a", "b"], ["c"]]
+    assert [s.name for s in orchestrator.phase_checkpoints(stages, 2)] == ["checkpoint"]
+
+
+def test_run_loops_awaits_checkpoint_before_next_phase(monkeypatch):
+    events: list[str] = []
+    stages = [
+        Stage("p1", lambda *_: None, per_app=True, phase=1),
+        Stage("p2", lambda *_: None, per_app=True, phase=2),
+        Stage("checkpoint", lambda *_: None, after_phase=2),
+        Stage("p3", lambda *_: None, per_app=True, phase=3),
+    ]
+
+    class _Future:
+        def __init__(self, label):
+            self.label = label
+
+        def result(self):
+            events.append(f"await:{self.label}")
+
+    def _submit(items, _pipeline, _activity, _root, app_id, _run_id, *, resume):
+        label = ",".join(stage.name for stage in items)
+        scope = app_id or "activity"
+        events.append(f"submit:{label}:{scope}:resume={resume}")
+        return {stage.name: _Future(f"{stage.name}:{scope}") for stage in items}
+
+    monkeypatch.setattr(orchestrator, "_submit_dag", _submit)
+    failures: list[str] = []
+    orchestrator._run_loops(
+        stages, ["app"], "pipeline", "activity", None, failures, None, resume=True,
+    )
+
+    assert failures == []
+    assert events.index("await:p2:app") < events.index("submit:checkpoint:activity:resume=False")
+    assert events.index("await:checkpoint:activity") < events.index("submit:p3:app:resume=True")
 
 
 def test_terminal_fanin_isolates_agent_and_calls_report(tmp_path):
@@ -142,6 +179,8 @@ def test_terminal_fanin_isolates_agent_and_calls_report(tmp_path):
     orchestrator._terminal_fanin(P(), act, failures)
     assert "agent" in failures          # agent failure isolated, not raised
     assert called["report"] is True     # report hook still ran
+    assert (act.base / "report.md").exists()  # deterministic report is independent of the AI hook
+    assert (act.base / "report.json").exists()
 
 
 def test_enabled_stages_topo_tolerates_removed_dep():

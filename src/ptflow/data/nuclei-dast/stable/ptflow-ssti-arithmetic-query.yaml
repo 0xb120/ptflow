@@ -1,0 +1,39 @@
+id: ptflow-ssti-arithmetic-query
+
+info:
+  name: SSTI Arithmetic Evaluation via Query Parameter
+  author: ptflow
+  severity: high
+  description: Detects server-side template evaluation from a query value using an exact arithmetic result.
+  metadata:
+    max-request: 3
+    verified: true
+  tags: ptflow,dast,ssti,stable,fuzzing-req-query
+
+http:
+  -
+    pre-condition:
+      - type: dsl
+        dsl:
+          - 'method != "OPTIONS"'
+
+    payloads:
+      expression:
+        low:
+          - '{{1337*7331}}'
+          - '<%= 1337*7331 %>'
+          - '#{1337*7331}'
+
+    fuzzing:
+      - part: query
+        mode: single
+        type: replace
+        fuzz:
+          - '{{expression}}'
+
+    stop-at-first-match: true
+    matchers:
+      - type: word
+        part: body
+        words:
+          - '9801547'

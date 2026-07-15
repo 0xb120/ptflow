@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from ptflow.core.agent import HypothesisProvider, StubProvider
+from ptflow.core.ai.client import stage_enabled
 from ptflow.core.stage import Stage
 from ptflow.pipelines.external import ai, tasks
 
@@ -17,12 +18,7 @@ if TYPE_CHECKING:
 
 
 _AI = os.getenv("PTFLOW_AI", "").strip().lower() in {"1", "on", "true", "yes"}
-_AI_STAGES: tuple[Stage, ...] = (
-    # PHASE 2 (net=False) — contextual content-discovery seed, folded by build_content_wordlist.
-    Stage("ai_wordlist", ai.ai_wordlist, per_app=True, phase=2, net=False),
-    # PHASE 4 (net=False) — classify secret-scanner leads → findings/secrets_triage.jsonl.
-    Stage("ai_secret_triage", ai.ai_secret_triage, per_app=True, phase=4, net=False),
-)
+_AI_STAGES = ai.per_app_stages()
 
 
 class ExternalPipeline:
@@ -81,6 +77,9 @@ class ExternalPipeline:
         # + corpus libs) — OFFLINE correlation (net=False, no target traffic), runs ∥ dast (same phase,
         # no needs). Records the covered (product,version) set so the phase-4 pass reports only the delta.
         Stage("cve_lookup", tasks.cve_lookup, per_app=True, phase=2, net=False),
+        # Global barrier checkpoint: snapshot every mature surface finding and publish the early
+        # deterministic report before the expensive guessing/deep loops start.
+        Stage("surface_checkpoint", tasks.surface_checkpoint, after_phase=2, net=False),
         # ── per-app PHASE 3 — guessing / surface expansion ──────────────────────────────────────────
         # build the fuzzing seed offline (JS/body/seed parsing), run the per-stack surface scanners, then
         # the content-discovery fixpoint; recrawl re-seeds katana on new-territory entry points it found.
@@ -124,10 +123,7 @@ class ExternalPipeline:
         return tasks.consolidate(activity)
 
     def provider(self) -> HypothesisProvider:
-        from ptflow.core.ai.client import make_client  # noqa: PLC0415
-
-        client = make_client()
-        return ai.ClaudeHypothesisProvider(client) if client is not None else StubProvider()
+        return ai.LLMHypothesisProvider() if _AI and stage_enabled("triage") else StubProvider()
 
     def report(self, activity: Activity) -> None:
         """Optional AI report hook (duck-typed, called by the orchestrator terminal fan-in). No-op

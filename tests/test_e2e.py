@@ -1,3 +1,4 @@
+import json
 import os
 
 from ptflow.cli import _apply_ai_flag, main
@@ -45,6 +46,15 @@ def test_orchestrate_end_to_end(tmp_path):
     hyp = tools.read_jsonl(base / "findings" / "hypotheses.jsonl")
     assert len(hyp) >= 1
     assert all(h["source"] == "stub" for h in hyp)
+
+    # deterministic terminal deliverables + execution coverage
+    report = json.loads((base / "report.json").read_text())
+    assert report["summary"]["total"] == 4
+    assert (base / "report.md").exists()
+    coverage = json.loads((base / "coverage.json").read_text())
+    assert coverage["status"] == "completed"
+    assert any(s["stage"] == "deterministic_report" and s["status"] == "success"
+               for s in coverage["stages"])
 
     # standard activity dirs
     for sub in ("poc", "tmp", "wl_global", "logs"):
@@ -111,7 +121,7 @@ def test_apply_ai_flag_does_not_override_explicit_set():
 
 
 def test_apply_ai_flag_appends_when_absent():
-    assert _apply_ai_flag([], ai=True) == ["ai=on"]
+    assert _apply_ai_flag([], ai=True) == ["ai.enabled=on"]
     assert _apply_ai_flag(["profile=home"], ai=False) == ["profile=home"]
 
 

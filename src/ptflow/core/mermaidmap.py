@@ -4,7 +4,7 @@ Companion to `flowmap.py` (the detailed band "spec sheet"). Same inputs — the 
 a `MapSpec` — but a different output: a topological **flowchart** (Mermaid) you can pan/zoom/scroll,
 with one node per step showing the commands it runs. The graph STRUCTURE (bands, phases, barriers,
 spanning lane, parallelism) is DERIVED FROM the Stage attributes (`needs`/`phase`/`per_app`/
-`spanning`/`cluster_scope`/`net`), so a change to a step's commands or to the execution order
+`spanning`/`cluster_scope`/`after_phase`/`net`), so a change to a step's commands or to the execution order
 regenerates the map (the same hook that keeps the `docs/<name>-pipeline-*` views in sync).
 
 Output is DETERMINISTIC (no timestamps). The HTML embeds Mermaid from a CDN and renders client-side;
@@ -31,6 +31,7 @@ _STYLE_BREADTH = ("#0d2f54", "#4f9be6", "#dbe9fb")
 _STYLE_SPAN = ("#2e2147", "#a98ee0", "#ece4fb")
 _STYLE_PIVOT = ("#073b42", "#34d3e6", "#d6fbff")
 _STYLE_BAR = ("#3a424c", "#8a96a3", "#eef2f6")
+_STYLE_CHECKPOINT = ("#3a2f06", "#e6c247", "#f8edc2")
 _STYLE_FANIN = ("#10331c", "#54d07a", "#dcf6e3")
 _PHASE_STYLES = (
     ("#10331c", "#4cc46b", "#dcf6e3"),   # phase 1 · green
@@ -139,6 +140,22 @@ def _phase_blocks(
             out += [n + " --> " + s.name for n in s.needs if n in sub_names]
         out.append(prev + " ==> " + bid)
         prev = bid
+        checkpoints = [s for s in stages if s.after_phase == ph]
+        if checkpoints:
+            checkpoint_names = {s.name for s in checkpoints}
+            checkpoint_id = f"CP{ph}"
+            out.append(f'subgraph {checkpoint_id}["CHECKPOINT · DOPO FASE {ph}"]')
+            out.append("direction TB")
+            out += [_rect(s.name, _node_label(s, spec.steps, rich=rich)) for s in checkpoints]
+            out.append("end")
+            for stage in checkpoints:
+                out += [
+                    dependency + " --> " + stage.name
+                    for dependency in stage.needs
+                    if dependency in checkpoint_names
+                ]
+            out.append(prev + " ==> " + checkpoint_id)
+            prev = checkpoint_id
     return out
 
 
@@ -151,17 +168,22 @@ def _cdef(name: str, style: tuple[str, str, str], *, bold: bool = False) -> str:
 def _class_blocks(stages: Sequence[Stage], spec: MapSpec) -> list[str]:
     """The Mermaid `classDef`/`class` lines that color nodes by band/phase (derived from `stages`).
     All classDefs are emitted unconditionally (an unused one is harmless), keeping branching low."""
-    activity = [s for s in stages if not s.per_app and not s.spanning and not s.cluster_scope]
+    activity = [s for s in stages
+                if not s.per_app and not s.spanning and not s.cluster_scope
+                and s.after_phase is None]
     span = [s for s in stages if s.spanning or s.cluster_scope]
+    checkpoints = [s for s in stages if s.after_phase is not None]
     phases = sorted({s.phase for s in stages if s.per_app})
 
     out = [
         _cdef("breadth", _STYLE_BREADTH), _cdef("span", _STYLE_SPAN), _cdef("pivot", _STYLE_PIVOT),
         _cdef("bar", _STYLE_BAR, bold=True), _cdef("fanin", _STYLE_FANIN, bold=True),
     ]
+    if checkpoints:
+        out.append(_cdef("checkpoint", _STYLE_CHECKPOINT, bold=True))
     out += [_cdef(f"phase{ph}", _phase_style(ph)) for ph in phases]
 
-    groups = [(activity, "breadth"), (span, "span")]
+    groups = [(activity, "breadth"), (span, "span"), (checkpoints, "checkpoint")]
     groups += [([s for s in stages if s.per_app and s.phase == ph], f"phase{ph}") for ph in phases]
     out += [f"class {','.join(s.name for s in g)} {cls}" for g, cls in groups if g]
 
@@ -178,7 +200,9 @@ def _class_blocks(stages: Sequence[Stage], spec: MapSpec) -> list[str]:
 def mermaid_graph(stages: Sequence[Stage], spec: MapSpec, *, rich: bool = True) -> str:
     """Build the Mermaid `flowchart TD` definition for `stages` using `spec`. Pure + deterministic."""
     stages = list(stages)
-    activity = [s for s in stages if not s.per_app and not s.spanning and not s.cluster_scope]
+    activity = [s for s in stages
+                if not s.per_app and not s.spanning and not s.cluster_scope
+                and s.after_phase is None]
     spanning = [s for s in stages if s.spanning]
     cluster_scope = [s for s in stages if s.cluster_scope]
     phases = sorted({s.phase for s in stages if s.per_app})
@@ -201,7 +225,12 @@ def mermaid_graph(stages: Sequence[Stage], spec: MapSpec, *, rich: bool = True) 
             lines.append("CLUSTER -.->|∥ loop| " + s.name)
 
     lines += _phase_blocks(stages, spec, phases, start, rich=rich)
-    last = f"P{phases[-1]}" if phases else start
+    last_phase = phases[-1] if phases else None
+    last = (
+        f"CP{last_phase}"
+        if last_phase is not None and any(s.after_phase == last_phase for s in stages)
+        else f"P{last_phase}" if last_phase is not None else start
+    )
 
     have_fanin = spec.fanin is not None
     if have_fanin:
@@ -224,6 +253,12 @@ def render_html(stages: Sequence[Stage], spec: MapSpec, *, generator: str = _GEN
     return (
         _HTML.replace("__TITLE__", _mesc(spec.title))
         .replace("__GENERATOR__", _mesc(generator))
+        .replace(
+            "__CHECKPOINT_LEGEND__",
+            ('\n    <span class="k"><span class="sw" style="background:#e6c247"></span>'
+             "checkpoint</span>")
+            if any(stage.after_phase is not None for stage in stages) else "",
+        )
         .replace("__MERMAID_GRAPH_JSON__", json.dumps(graph))
     )
 
@@ -316,7 +351,7 @@ _HTML = """<!doctype html>
     <span class="k"><span class="sw" style="background:var(--p1)"></span>fase 1</span>
     <span class="k"><span class="sw" style="background:var(--p2)"></span>fase 2</span>
     <span class="k"><span class="sw" style="background:var(--p3)"></span>fase 3</span>
-    <span class="k"><span class="sw" style="background:var(--p4)"></span>fase 4</span>
+    <span class="k"><span class="sw" style="background:var(--p4)"></span>fase 4</span>__CHECKPOINT_LEGEND__
     <span class="k"><span class="sw" style="background:var(--bar)"></span>barriera</span>
   </div>
 </header>

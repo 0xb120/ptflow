@@ -1,0 +1,17 @@
+# Hosted setup. Export OPENROUTER_API_KEY before running; never put the key in this file.
+# Override the model without editing: --set ai.model=<openrouter-model-id>
+
+[ai]
+enabled = true
+provider = "openrouter"
+model = "openai/gpt-oss-20b"
+base_url = "https://openrouter.ai/api/v1"
+cache = true
+concurrency = 2
+timeout_seconds = 180
+max_retries = 2
+max_calls = 50
+max_input_tokens = 250000
+max_output_tokens = 30000
+max_cost = "5.00"
+remote_secrets = "redacted"

@@ -16,6 +16,7 @@ from ptflow.core.log import setup_logging
 if TYPE_CHECKING:
     from collections.abc import Collection
 
+    from ptflow.core.dast import Selection as DastSelection
     from ptflow.core.stage import Pipeline
 
 # NB: orchestrator/pipelines are imported INSIDE main() — their constants read PTFLOW_* at import, so the
@@ -41,12 +42,14 @@ def _serve() -> int:
 _BAND_ORDER = ("breadth", "spanning", "post-cluster")
 
 
-def _band_sort_key(band: str) -> tuple[int, int]:
-    """Order bands breadth → spanning → post-cluster → loop:1 → loop:2 … (pure)."""
+def _band_sort_key(band: str) -> tuple[int, int, int]:
+    """Order fixed bands, then each loop followed by its checkpoint (pure)."""
     if band in _BAND_ORDER:
-        return (_BAND_ORDER.index(band), 0)
-    phase = int(band.split(":", 1)[1]) if band.startswith("loop:") else 0
-    return (len(_BAND_ORDER), phase)
+        return (_BAND_ORDER.index(band), 0, 0)
+    kind, _, raw_phase = band.partition(":")
+    phase = int(raw_phase) if raw_phase.isdigit() else 0
+    after_loop = 1 if kind == "checkpoint" else 0
+    return (len(_BAND_ORDER), phase, after_loop)
 
 
 def render_steps(pipeline: Pipeline, disabled: Collection[str], *, verbose: bool = False) -> str:
@@ -69,7 +72,8 @@ def render_steps(pipeline: Pipeline, disabled: Collection[str], *, verbose: bool
         if verbose:
             for s in members:
                 mark = "○" if s.name in disabled_set else "●"
-                bits = [f"phase={s.phase}", "per_app" if s.per_app else "activity",
+                phase = f"after_phase={s.after_phase}" if s.after_phase is not None else f"phase={s.phase}"
+                bits = [phase, "per_app" if s.per_app else "activity",
                         "net" if s.net else "offline"]
                 if s.needs:
                     bits.append("needs=" + ",".join(s.needs))
@@ -115,8 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     run.add_argument(
         "--ai", action="store_true",
-        help="enable the optional AI layer (triage/report/secret-triage/wordlist); requires the "
-             "'ai' extra + ANTHROPIC_API_KEY. Equivalent to --set ai=on.",
+        help="enable the optional AI layer (triage/report/secret-triage/wordlist); install the "
+             "'ai' extra and configure [ai]. Equivalent to --set ai.enabled=on.",
     )
 
     sub.add_parser("serve", help="start the Prefect server + UI for observability (foreground)")
@@ -146,6 +150,17 @@ def main(argv: list[str] | None = None) -> int:
         help="also show each step's phase / scope / net / needs",
     )
 
+    dast = sub.add_parser("dast", help="inspect and validate nuclei DAST packs")
+    dast_sub = dast.add_subparsers(dest="dast_cmd", required=True)
+    dast_validate = dast_sub.add_parser("validate", help="validate every enabled local DAST pack")
+    dast_list = dast_sub.add_parser("list", help="list every template in enabled packs")
+    for command in (dast_validate, dast_list):
+        command.add_argument("--config", default=None, metavar="PATH", help="TOML run config")
+        command.add_argument(
+            "--set", action="append", default=None, metavar="KEY=VALUE", dest="overrides",
+            help="override one DAST config knob",
+        )
+
     args = parser.parse_args(argv)
 
     if args.cmd == "serve":
@@ -159,6 +174,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "steps":
         return _steps(args)
+
+    if args.cmd == "dast":
+        return _dast(args)
 
     return 1
 
@@ -203,12 +221,84 @@ def _steps(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_dast_selection(selection: DastSelection) -> None:
+    """Render the complete configured selection and nuclei engine-preview omissions."""
+    print(  # noqa: T201
+        "all enabled-pack templates: "
+        f"{len(selection.templates) + len(selection.unresolved_paths)} template(s)",
+    )
+    for template in selection.templates:
+        print(f"  {template.template_id:<42} {template.pack}")  # noqa: T201
+    for template in selection.engine_omitted:
+        print(  # noqa: T201
+            f"  warning: nuclei -tl omitted {template.template_id} ({template.path})",
+            file=sys.stderr,
+        )
+    for path in selection.unresolved_paths:
+        print(f"  {'<unresolved>':<42} {path}")  # noqa: T201
+
+
+def _dast(args: argparse.Namespace) -> int:
+    """Validate DAST packs or render nuclei's exact all-template selection."""
+    from ptflow.core import dast as dastconfig  # noqa: PLC0415
+
+    setup_logging(verbose=False)
+    try:
+        config = runconfig.load_config(args.config)
+        resolved = runconfig.resolve(config, os.environ, args.overrides)
+        runconfig.apply(resolved)
+        settings = dastconfig.settings_from_env(
+            legacy_path=os.environ.get("PTFLOW_NUCLEI_DAST_TEMPLATES"),
+        )
+    except (runconfig.ConfigError, dastconfig.DastConfigError) as exc:
+        print(f"config error: {exc}", file=sys.stderr)  # noqa: T201
+        return 2
+
+    missing = [pack for pack in settings.packs if pack.enabled and not pack.path.is_dir()]
+    if missing:
+        for pack in missing:
+            print(f"missing DAST pack '{pack.name}': {pack.path}", file=sys.stderr)  # noqa: T201
+        return 2
+    if shutil.which("nuclei") is None:
+        print("nuclei is not installed", file=sys.stderr)  # noqa: T201
+        return 2
+
+    from ptflow.core import tools  # noqa: PLC0415
+
+    try:
+        dastconfig.catalog(settings.packs)  # duplicate IDs and malformed top-level IDs
+        if args.dast_cmd == "validate":
+            cmd = (
+                "nuclei", "-dast", "-validate", "-duc", "-nc",
+                *dastconfig.template_args(settings.packs),
+            )
+            tools.run(cmd, check=True, stream_stderr=True)
+            manifests = dastconfig.pack_manifests(settings.packs)
+            total = sum(pack["template_count"] for pack in manifests)
+            print(f"validated {total} template(s) across {len(manifests)} pack(s)")  # noqa: T201
+            for pack in manifests:
+                print(  # noqa: T201
+                    f"  {pack['name']}: {pack['template_count']} · {pack['effective_revision']}",
+                )
+            return 0
+
+        selection = dastconfig.list_selection(
+            settings,
+            run=lambda command: tools.run(command, check=True),
+        )
+    except (dastconfig.DastConfigError, subprocess.CalledProcessError) as exc:
+        print(f"DAST validation failed: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+
+    _print_dast_selection(selection)
+    return 0
+
+
 def _apply_ai_flag(overrides: list[str], *, ai: bool) -> list[str]:
-    """Append ``ai=on`` for the ``--ai`` convenience flag — but only when the user did not already
-    pass an explicit ``ai=`` via ``--set``. ``--set`` must win over the flag (documented precedence:
-    ``--set`` > env > config; ``--ai`` is sugar for ``--set ai=on``, not a higher-precedence override)."""
-    if ai and not any(o.split("=", 1)[0].strip() == "ai" for o in overrides):
-        return [*overrides, "ai=on"]
+    """Append canonical ``ai.enabled=on`` unless an explicit legacy/canonical override exists."""
+    ai_keys = {"ai", "ai.enabled"}
+    if ai and not any(o.split("=", 1)[0].strip() in ai_keys for o in overrides):
+        return [*overrides, "ai.enabled=on"]
     return overrides
 
 

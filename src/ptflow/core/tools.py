@@ -15,6 +15,7 @@ import time
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
+from ptflow.core import telemetry
 from ptflow.core.log import get_logger
 
 Command = Sequence[str]
@@ -134,8 +135,19 @@ class ToolNotFoundError(RuntimeError):
 def require(*tools: str) -> None:
     missing = [t for t in tools if shutil.which(t) is None]
     if missing:
+        telemetry.record_missing_tools(missing)
         msg = f"missing required tool(s): {', '.join(missing)}"
         raise ToolNotFoundError(msg)
+
+
+def _tool_name(cmd: Command) -> str:
+    """Non-sensitive command identity for coverage telemetry (never records argv/header values)."""
+    if not cmd:
+        return "unknown"
+    first = Path(cmd[0]).name
+    if first.startswith("python") and len(cmd) > 1 and str(cmd[1]).endswith(".py"):
+        return Path(cmd[1]).stem
+    return first
 
 
 @contextlib.contextmanager
@@ -185,28 +197,41 @@ def run(  # noqa: PLR0913
     headless chromium from `httpx -ss`/EyeWitness); safe because start_new_session gives
     the child its own group (pgid == pid)."""
     cmd_str = shlex.join(list(cmd))
+    tool = _tool_name(cmd)
+    started = time.monotonic()
     if _aborting.is_set():  # run is tearing down → don't launch new network work
         msg = f"aborted before spawning: {cmd_str}"
         raise AbortedError(msg)
     log.debug("$ %s", cmd_str)
     with _stdin_channel(stdin, stdin_tty=stdin_tty) as (stdin_arg, input_data):
-        proc = subprocess.Popen(
-            list(cmd),
-            stdin=stdin_arg,
-            stdout=subprocess.PIPE,
-            stderr=None if stream_stderr else subprocess.DEVNULL,
-            text=True,
-            errors="replace",  # a stray non-UTF-8 byte (e.g. a Windows-1252 quote in urlfinder/gau
-                               # OSINT output) → U+FFFD, never a UnicodeDecodeError that kills the stage
-            cwd=cwd,
-            start_new_session=True,  # own process group → killpg reaches grandchildren
-        )
+        try:
+            proc = subprocess.Popen(
+                list(cmd),
+                stdin=stdin_arg,
+                stdout=subprocess.PIPE,
+                stderr=None if stream_stderr else subprocess.DEVNULL,
+                text=True,
+                errors="replace",  # a stray non-UTF-8 byte (e.g. a Windows-1252 quote in urlfinder/gau
+                                   # OSINT output) → U+FFFD, never a UnicodeDecodeError that kills the stage
+                cwd=cwd,
+                start_new_session=True,  # own process group → killpg reaches grandchildren
+            )
+        except OSError:
+            telemetry.record_command(
+                tool=tool, status="missing" if shutil.which(cmd[0]) is None else "error",
+                return_code=None, duration=time.monotonic() - started, timeout=timeout,
+            )
+            raise
         _register(proc)
         try:
             out, _ = proc.communicate(input=input_data, timeout=timeout)
         except subprocess.TimeoutExpired:
             _kill_group(proc, signal.SIGKILL)
             proc.communicate()  # reap the killed group
+            telemetry.record_command(
+                tool=tool, status="timeout", return_code=None,
+                duration=time.monotonic() - started, timeout=timeout,
+            )
             raise
         finally:
             _unregister(proc)
@@ -214,6 +239,10 @@ def run(  # noqa: PLR0913
                 with contextlib.suppress(ProcessLookupError, OSError):
                     os.killpg(proc.pid, signal.SIGKILL)
     rc = proc.returncode
+    telemetry.record_command(
+        tool=tool, status="success" if rc == 0 else "nonzero", return_code=rc,
+        duration=time.monotonic() - started, timeout=timeout,
+    )
     if check and rc != 0:
         raise subprocess.CalledProcessError(rc, list(cmd), output=out)
     if rc != 0:
@@ -230,6 +259,7 @@ def pipe(stages: Sequence[Command], *, stdin: str | None = None) -> str:
         msg = "aborted before spawning pipe"
         raise AbortedError(msg)
     log.debug("$ %s", " | ".join(shlex.join(list(s)) for s in stages))
+    started = time.monotonic()
     procs: list[subprocess.Popen[bytes]] = []
     first = subprocess.Popen(
         list(stages[0]),
@@ -267,6 +297,14 @@ def pipe(stages: Sequence[Command], *, stdin: str | None = None) -> str:
     finally:
         for p in procs:
             _unregister(p)
+    return_codes = [p.returncode for p in procs]
+    telemetry.record_command(
+        tool="|".join(_tool_name(stage) for stage in stages),
+        status="success" if all(rc == 0 for rc in return_codes) else "nonzero",
+        return_code=next((rc for rc in return_codes if rc != 0), 0),
+        duration=time.monotonic() - started,
+        pipeline_length=len(stages),
+    )
     return out.decode(errors="replace")
 
 
@@ -283,14 +321,18 @@ def dedupe(lines: Iterable[str]) -> list[str]:
 
 def read_lines(path: Path) -> list[str]:
     if not path.exists():
+        telemetry.record_read(path, kind="lines", count=0, present=False)
         return []
-    return [ln.strip() for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+    lines = [ln.strip() for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+    telemetry.record_read(path, kind="lines", count=len(lines))
+    return lines
 
 
 def write_lines(path: Path, lines: Iterable[str]) -> int:
     deduped = dedupe(lines)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(deduped) + ("\n" if deduped else ""), encoding="utf-8")
+    telemetry.record_write(path, kind="lines", count=len(deduped))
     return len(deduped)
 
 
@@ -300,6 +342,7 @@ def read_jsonl(path: Path) -> list[dict]:
     stray non-JSON line (a banner/progress note) must not crash the consuming stage — mirrors the
     stdout JSONL parser used elsewhere. A skipped line is logged at DEBUG."""
     if not path.exists():
+        telemetry.record_read(path, kind="jsonl", count=0, present=False)
         return []
     out: list[dict] = []
     skipped = 0
@@ -312,6 +355,8 @@ def read_jsonl(path: Path) -> list[dict]:
             skipped += 1
     if skipped:
         log.debug("read_jsonl: skipped %d unparseable line(s) in %s", skipped, path)
+        telemetry.record_drop("malformed_jsonl", skipped)
+    telemetry.record_read(path, kind="jsonl", count=len(out))
     return out
 
 
@@ -320,4 +365,13 @@ def write_jsonl(path: Path, records: Iterable[dict]) -> int:
     recs = list(records)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in recs), encoding="utf-8")
+    telemetry.record_write(path, kind="jsonl", count=len(recs))
     return len(recs)
+
+
+def write_text(path: Path, text: str) -> int:
+    """Write UTF-8 text and expose byte/character volume to the active stage trace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    telemetry.record_write(path, kind="text", count=len(text))
+    return len(text)

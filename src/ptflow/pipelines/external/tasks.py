@@ -31,7 +31,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urljoin, urlsplit, urlunsplit
 
-from ptflow.core import scope, tools, workspace
+from ptflow.core import dast as dastconfig
+from ptflow.core import reporting, scope, telemetry, tools, workspace
 from ptflow.core.log import get_logger, is_verbose
 from ptflow.core.requirements import Requirement, check
 from ptflow.pipelines.external import wordlists
@@ -221,9 +222,8 @@ PARAM_GLOBAL_MIN_HITS = 5   # …but only above this many hits, so a tiny tested
 # per-app DAST (PHASE 2 surface + PHASE 4 deep) — nuclei -dast over the request catalog (full requests
 # → fuzz query/path/header/cookie/body, not just GET query). Phase 2 hits the explorable surface
 # (requests.jsonl); phase 4 hits the guessed delta + discovered params. Whole-scope full-template nuclei
-# is nuclei_scope (breadth). Best-effort (skips if nuclei / dast templates absent).
+# is nuclei_scope (breadth). Best-effort (skips if nuclei / every enabled DAST pack is absent).
 DAST_MAX_REQUESTS = 1500   # cap requests fed to nuclei per app (reconftw DEEP_LIMIT2 analog); logged
-DAST_AGGRESSION = "low"    # nuclei -fa (low|medium|high): payload count per fuzz point — low = polite
 
 # API spec discovery (PHASE 1) — probe for OpenAPI/Swagger JSON specs + GraphQL endpoints, expand the
 # spec into full request records (method/body/params) → requests_api.jsonl, folded into the catalog.
@@ -347,10 +347,39 @@ ARJUN = str(_ARJUN_BIN) if _ARJUN_BIN.exists() else "arjun"
 _X8_BIN = Path.home() / ".cargo" / "bin" / "x8"
 X8 = str(_X8_BIN) if _X8_BIN.exists() else "x8"
 
-# nuclei DAST fuzzing templates (per-app `dast` step). Default to the standard nuclei-templates dast/
-# dir; override with PTFLOW_NUCLEI_DAST_TEMPLATES. The step skips (best-effort) if the dir is absent.
+# Legacy nuclei DAST single-pack path. Structured PTFLOW_DAST_PACKS takes precedence; when absent, the
+# resolver combines this official directory with the bundled PTFlow pack; every template runs.
 _NUCLEI_DAST_TEMPLATES = Path.home() / "nuclei-templates" / "dast"
 NUCLEI_DAST_TEMPLATES = os.environ.get("PTFLOW_NUCLEI_DAST_TEMPLATES") or str(_NUCLEI_DAST_TEMPLATES)
+
+
+def _dast_settings() -> dastconfig.Settings:
+    """Effective structured DAST config; the old single-directory knob remains a fallback pack."""
+    return dastconfig.settings_from_env(legacy_path=NUCLEI_DAST_TEMPLATES)
+
+
+_DAST_SELECTION_CACHE: dict[tuple, dastconfig.Selection] = {}
+_DAST_SELECTION_LOCK = threading.Lock()
+
+
+def _dast_selection(settings: dastconfig.Settings) -> dastconfig.Selection:
+    """Resolve the immutable all-template pack selection once per process."""
+    key = (settings.packs, settings.aggression, settings.fuzz_param_frequency)
+    with _DAST_SELECTION_LOCK:
+        if cached := _DAST_SELECTION_CACHE.get(key):
+            return cached
+        selection = dastconfig.list_selection(
+            settings,
+            run=lambda cmd: tools.run(cmd, stream_stderr=is_verbose()),
+        )
+        if selection.engine_omitted:
+            log.warning(
+                "⚠ nuclei engine preview omitted %d configured DAST template(s): %s",
+                len(selection.engine_omitted),
+                ", ".join(item.template_id for item in selection.engine_omitted),
+            )
+        _DAST_SELECTION_CACHE[key] = selection
+        return selection
 
 # dedicated vuln scanners (PHASE 2 surface + PHASE 4 deep) — dalfox (XSS) ∥ sqlmap (SQLi) over the
 # request catalog's FULL requests (the `raw` field — Burp/ZAP format both tools ingest natively), ONE
@@ -408,19 +437,31 @@ CVE_FANOUT = 4          # concurrent search_vulns queries per app (offline → m
 _EYEWITNESS_DIR = Path("/opt/EyeWitness")
 
 
-# --- auth passthrough (env PTFLOW_HTTP_HEADER) — operator session headers/cookies so the crawl/fuzz/
-# DAST reach the AUTHENTICATED surface (most POST/JSON lives behind a login). One or more
-# "Name: value" headers, separated by newlines or ";;". Threaded into katana/httpx/arjun/x8/nuclei.
+_ACTIVE_PIPELINE_ENV = "PTFLOW_ACTIVE_PIPELINE"
+_AUTH_PIPELINES = frozenset({"webscan"})
+
+
+def _auth_enabled() -> bool:
+    """Auth passthrough is intentionally limited to the dedicated web scanning pipeline. The external
+    breadth pipeline can span unrelated assets, so session headers must not be sprayed there."""
+    return os.environ.get(_ACTIVE_PIPELINE_ENV, "").strip().lower() in _AUTH_PIPELINES
+
+
+# --- auth passthrough (env PTFLOW_HTTP_HEADER) — operator session headers/cookies so the webscan
+# crawl/fuzz/DAST reach the AUTHENTICATED surface (most POST/JSON lives behind a login). One or more
+# "Name: value" headers, separated by newlines or ";;". Ignored outside the dedicated scan pipeline.
 def _auth_headers() -> list[str]:
     """The operator's session headers/cookies (env PTFLOW_HTTP_HEADER), as a list of 'Name: value'
-    strings. Read each call (testable); empty when unset or malformed (a part without ':' is dropped)."""
+    strings. Read each call (testable); empty outside webscan, when unset, or when malformed."""
+    if not _auth_enabled():
+        return []
     raw = os.environ.get("PTFLOW_HTTP_HEADER", "")
     return [p.strip() for p in re.split(r";;|\n", raw) if p.strip() and ":" in p]
 
 
 def _header_flags(flag: str = "-H") -> list[str]:
     """[flag, header, flag, header, …] for the operator's session headers — appended to a tool's argv
-    so it reaches the authenticated surface. Empty when none set. katana/httpx/nuclei all take -H."""
+    so it reaches the authenticated surface. Empty when auth is disabled or none are set."""
     out: list[str] = []
     for h in _auth_headers():
         out += [flag, h]
@@ -433,7 +474,7 @@ _CORE_TOOLS = {
     "mapcidr": "mapcidr", "naabu": "naabu", "dnsx": "dnsx", "tlsx": "tlsx",
     "shuffledns": "shuffledns", "subfinder": "subfinder", "assetfinder": "assetfinder",
     "httpx": HTTPX, "katana": "katana", "gau": "gau", "urlfinder": "urlfinder",
-    "nuclei": "nuclei", "nerva": "nerva", "subjack": "subjack", "feroxbuster": FEROX,
+    "nerva": "nerva", "subjack": "subjack", "feroxbuster": FEROX,
 }
 _OPTIONAL_TOOLS = {
     "crawley": CRAWLEY, "jsluice": JSLUICE, "shortscan": SHORTSCAN, "shortutil": SHORTUTIL,
@@ -451,6 +492,9 @@ def requirements() -> list[Requirement]:
     datasets. Datasets are OPTIONAL: the pipeline degrades best-effort when one is absent (nuclei's dast
     step skips, resolvers falls back), so a missing dataset WARNS — only a missing CORE tool fails."""
     reqs = [Requirement(name, cmd, "core") for name, cmd in _CORE_TOOLS.items()]
+    reqs.append(Requirement(
+        "nuclei", "nuclei", "core", min_version="3.2.4", version_args=("-version",),
+        note="DAST pre-condition support requires nuclei >=3.2.4"))
     reqs += [
         Requirement(name, cmd, "optional")
         for name, cmd in _OPTIONAL_TOOLS.items()
@@ -467,9 +511,16 @@ def requirements() -> list[Requirement]:
         "eyewitness", str(_EYEWITNESS_DIR / "Python" / "EyeWitness.py"), "optional",
         note="optional screenshot step: clone EyeWitness + its .venv (selenium), or PTFLOW_EYEWITNESS"))
     # on-disk datasets (path-existence; all best-effort → optional, they never fail the gate)
-    reqs.append(Requirement(
-        "nuclei dast templates", NUCLEI_DAST_TEMPLATES, "optional", category="dataset",
-        note="fuzzing templates for the dast step: run `nuclei -ut` (updates ~/nuclei-templates)"))
+    try:
+        dast_packs = _dast_settings().packs
+    except dastconfig.DastConfigError as exc:
+        log.warning("⚠ invalid DAST configuration: %s", exc)
+        dast_packs = ()
+    for pack in dast_packs:
+        if pack.enabled:
+            reqs.append(Requirement(
+                f"nuclei dast pack:{pack.name}", str(pack.path), "optional", category="dataset",
+                note=f"{pack.source} fuzzing templates; validate with `ptflow dast validate`"))
     reqs.append(Requirement(
         "resolvers", RESOLVERS, "optional", category="dataset",
         note="trusted DNS resolvers: clone trickest/resolvers → /opt/resolvers"))
@@ -1083,8 +1134,11 @@ def select_new_urls(records: list[dict], seen: set[str], *, cap: int) -> list[st
         picked.add(url)
         out.append(url)
     if len(out) > cap:
+        telemetry.record_cap("content_round_urls", limit=cap, observed=len(out), selected=cap)
+        telemetry.record_drop("content_round_cap", len(out) - cap)
         log.warning("⚠ content fixpoint: capping round delta %d→%d new url(s)", len(out), cap)
         return out[:cap]
+    telemetry.record_cap("content_round_urls", limit=cap, observed=len(out), selected=len(out))
     return out
 
 
@@ -1695,8 +1749,7 @@ def _run(tool: str, cmd: list[str], *, stdin: str, dest: Path, label: str) -> st
     log.info("  → %s (%s) — %d input(s)", tool, label, len(_lines(stdin)))
     verbose = is_verbose()
     out = tools.run(cmd, stdin=stdin, stream_stderr=verbose)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(out, encoding="utf-8")
+    tools.write_text(dest, out)
     log.info("    %s (%s) → %d line(s) → %s", tool, label, len(_lines(out)), dest.name)
     if verbose and out.strip():
         log.debug("    stdout:\n%s", out.rstrip())
@@ -1829,6 +1882,7 @@ def scope_gate(activity: Activity) -> None:
                       [ln for ln in dim_lines
                        if scope.norm_host(ln.strip().partition(" ")[0]) in verdict.kept_names])
     tools.write_jsonl(canon("excluded_out_of_scope.jsonl"), list(verdict.dropped))
+    telemetry.record_drop("out_of_scope_assets", len(verdict.dropped))
 
     if not (allow.exact_hosts or allow.wildcard_apexes or allow.nets):
         log.warning("⚠ scope_gate: EMPTY allowlist (malformed/empty scope?) — all discovered assets dropped")
@@ -1898,7 +1952,7 @@ def httpx_fingerprint(activity: Activity) -> None:
         # response, so the fallback to https never fires and the real webapp stays invisible. -nf only
         # doubles a record when both schemes genuinely respond (a plain-http :8080 stays single).
         [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
-         "-favicon", "-location", "-fr", "-irh", "-nf", "-j"],
+         "-favicon", "-location", "-fr", "-irh", "-nf", *_header_flags("-H"), "-j"],
         stdin=httpx_input, dest=activity.asset_discovery_raw("httpx") / "fingerprint.jsonl",
         label="fingerprint",
     )
@@ -1906,6 +1960,7 @@ def httpx_fingerprint(activity: Activity) -> None:
     kept, dropped = split_cdn_ip_records(records, set(tools.read_lines(activity.scope_ip)))
     tools.write_jsonl(canon("httpx_full_metadata.jsonl"), kept)
     tools.write_jsonl(canon("excluded_cdn.jsonl"), dropped)
+    telemetry.record_drop("cdn_ip_targets", len(dropped))
     if dropped:
         log.info("  → scope: excluded %d raw-IP CDN/cloud target(s) (hostnames kept) → excluded_cdn.jsonl",
                  len(dropped))
@@ -1927,7 +1982,7 @@ def ingest_httpx(activity: Activity) -> None:
     out = _run(
         "httpx",
         [HTTPX, "-silent", "-nfs", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
-         "-favicon", "-location", "-fr", "-irh", "-j"],
+         "-favicon", "-location", "-fr", "-irh", *_header_flags("-H"), "-j"],
         stdin="\n".join(t.raw for t in targets),
         dest=activity.asset_discovery_raw("httpx") / "ingest.jsonl", label="ingest",
     )
@@ -1952,8 +2007,9 @@ def nuclei_scope(activity: Activity) -> None:
     ONE process over the deduped scope (subdomains + webapps) with a single global rate
     cap (-rl) — gentler and more efficient than per-app, which would multiply traffic on
     shared backends and reload templates per process. Runs ∥ clustering + the per-app
-    loops, joined at the fan-in. Subsumes the old per-tag takeover scan. Updates the
-    nuclei-templates first (`-ut`), then scans with -duc (no redundant check mid-run).
+    loops, joined at the fan-in. Subsumes the old per-tag takeover scan. Template updates are
+    deliberately out-of-band: mutating ~/nuclei-templates here would race the parallel DAST passes
+    and invalidate their recorded hashes/revisions.
     """
     canon = activity.asset_discovery_canonical
     targets = tools.dedupe([*tools.read_lines(canon("inscope_subdomains.txt")),
@@ -1961,11 +2017,10 @@ def nuclei_scope(activity: Activity) -> None:
     if not targets:
         log.debug("  · skip nuclei_scope (no targets)")
         return
-    log.info("  → nuclei -ut (update templates)")
-    tools.run(["nuclei", "-ut"], stream_stderr=is_verbose())
     _run("nuclei",
          ["nuclei", "-stats", "-nmhe", "-c", NUCLEI_CONC, "-bs", NUCLEI_BULK, "-rl", NUCLEI_RL,
-          "-timeout", NUCLEI_TIMEOUT, "-retries", NUCLEI_RETRIES, "-j", "-silent", "-duc"],
+          "-timeout", NUCLEI_TIMEOUT, "-retries", NUCLEI_RETRIES, "-j", "-silent", "-duc",
+          *_header_flags("-H")],
          stdin="\n".join(targets), dest=activity.findings / "nuclei_scope.jsonl", label="scope")
 
 
@@ -2239,7 +2294,8 @@ def screenshot_all(activity: Activity) -> None:
         [HTTPX, "-ss", "-system-chrome", "-no-screenshot-full-page", "-st", SCREENSHOT_TIMEOUT,
          "-silent", "-srd", str(store), "-svrc",
          # fingerprint each candidate too (EyeWitness-style), captured from the -j stream:
-         "-sc", "-cl", "-title", "-td", "-server", "-ip", "-favicon", "-location", "-irh", "-j"],
+         "-sc", "-cl", "-title", "-td", "-server", "-ip", "-favicon", "-location", "-irh",
+         *_header_flags("-H"), "-j"],
         stdin="\n".join(url_to_app), stream_stderr=is_verbose(),
         reap_group=True,  # sweep any system-chrome the screenshot left behind, even on clean exit
     )
@@ -2315,7 +2371,8 @@ def _run_crawley(hosts: list[str], app_id: str) -> list[str]:
     for host in hosts:
         out = tools.run(
             [CRAWLEY, "-headless", "-depth", CRAWLEY_DEPTH, "-workers", CRAWLEY_WORKERS,
-             "-all", "-js", "-robots", "crawl", "-delay", CRAWLEY_DELAY, "-silent", host],
+             "-all", "-js", "-robots", "crawl", "-delay", CRAWLEY_DELAY, "-silent",
+             *_header_flags("-header"), host],
             stream_stderr=is_verbose(),
         )
         urls += _lines(out)
@@ -2360,8 +2417,8 @@ def crawl(activity: Activity, app_id: str) -> None:
     if hosts:
         ws.responses.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        katana_fut = pool.submit(_run_katana, ws, hosts, app_id)
-        crawley_fut = pool.submit(_run_crawley, hosts, app_id)
+        katana_fut = telemetry.submit(pool, _run_katana, ws, hosts, app_id)
+        crawley_fut = telemetry.submit(pool, _run_crawley, hosts, app_id)
         katana_out, crawley_urls = katana_fut.result(), crawley_fut.result()
     katana_urls = parse_katana(katana_out)
     tools.write_lines(ws.canonical("endpoints_crawley.txt"), crawley_urls)
@@ -3030,10 +3087,10 @@ def _secret_fleet(ws: AppWorkspace, bodies: Path, js_files: list[str], app_id: s
     (verified) ∥ detect-secrets (entropy/hashes). Each is best-effort (skipped if its binary is absent)."""
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [
-            pool.submit(_run_jsluice_secrets, js_files),
-            pool.submit(_run_gitleaks, ws, bodies, app_id),
-            pool.submit(_run_trufflehog, bodies, app_id),
-            pool.submit(_run_detect_secrets, bodies, app_id),
+            telemetry.submit(pool, _run_jsluice_secrets, js_files),
+            telemetry.submit(pool, _run_gitleaks, ws, bodies, app_id),
+            telemetry.submit(pool, _run_trufflehog, bodies, app_id),
+            telemetry.submit(pool, _run_detect_secrets, bodies, app_id),
         ]
         return [rec for f in futures for rec in f.result()]
 
@@ -3218,7 +3275,7 @@ def _run_ferox(ws: AppWorkspace, hosts: list[str], words: list[str], round_idx: 
              app_id, label, len(hosts), n_wl, depth, tl)
     cmd = [FEROX, "--stdin", "--silent", "--json", "-o", str(out_file), "--no-state", "-k",
            "--smart", "-t", FEROX_THREADS, "-L", FEROX_SCAN_LIMIT, "--timeout", FEROX_TIMEOUT,
-           "--time-limit", tl, "-d", depth, "-w", str(wordlist), *ext_args]
+           "--time-limit", tl, "-d", depth, "-w", str(wordlist), *_header_flags("-H"), *ext_args]
     tools.run(cmd, stdin="\n".join(hosts), stream_stderr=is_verbose())
     raw = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
     recs = parse_ferox(raw)
@@ -3244,7 +3301,7 @@ def _download_and_mine(ws: AppWorkspace, urls: list[str], round_idx: int) -> lis
     app_id = ws.root.name
     store = ws.responses / "discovered" / f"round{round_idx}"
     store.mkdir(parents=True, exist_ok=True)
-    _run("httpx", [HTTPX, "-silent", "-srd", str(store), "-rl", OSINT_FETCH_RL],
+    _run("httpx", [HTTPX, "-silent", "-srd", str(store), "-rl", OSINT_FETCH_RL, *_header_flags("-H")],
          stdin="\n".join(urls), dest=ws.raw("httpx") / "discovered" / f"round{round_idx}.txt",
          label=f"{app_id} r{round_idx}")
     _, new_js = _extract_bodies(ws)
@@ -3472,8 +3529,11 @@ def select_param_endpoints(urls: Iterable[str], in_scope_hosts: set[str], *, cap
         seen.add(tpl)
         out.append(clean)
     if len(out) > cap:
+        telemetry.record_cap("param_query_endpoints", limit=cap, observed=len(out), selected=cap)
+        telemetry.record_drop("param_query_cap", len(out) - cap)
         log.warning("⚠ param_fuzz: capping endpoint set %d→%d", len(out), cap)
         return out[:cap]
+    telemetry.record_cap("param_query_endpoints", limit=cap, observed=len(out), selected=len(out))
     return out
 
 
@@ -3499,6 +3559,10 @@ def select_body_targets(catalog: Iterable[dict], in_scope: set[str], *, cap: int
                    if str(k).lower() == "content-type"), "")
         is_json = "json" in ct.lower() or any(p.get("loc") == "json" for p in r.get("params") or [])
         (js if is_json else body).append(url)
+    telemetry.record_cap("param_body_endpoints", limit=cap, observed=len(body), selected=min(len(body), cap))
+    telemetry.record_cap("param_json_endpoints", limit=cap, observed=len(js), selected=min(len(js), cap))
+    telemetry.record_drop("param_body_cap", max(0, len(body) - cap))
+    telemetry.record_drop("param_json_cap", max(0, len(js) - cap))
     return body[:cap], js[:cap]
 
 
@@ -3537,8 +3601,11 @@ def select_recrawl_seeds(discovered: Iterable[str], crawled: Iterable[str], in_s
         seeds.append(u)
     seeds.sort(key=lambda s: (s.count("/"), s))   # shallowest entry points first, deterministic
     if len(seeds) > cap:
+        telemetry.record_cap("recrawl_seeds", limit=cap, observed=len(seeds), selected=cap)
+        telemetry.record_drop("recrawl_seed_cap", len(seeds) - cap)
         log.warning("⚠ recrawl: capping new-territory seeds %d→%d", len(seeds), cap)
         return seeds[:cap]
+    telemetry.record_cap("recrawl_seeds", limit=cap, observed=len(seeds), selected=len(seeds))
     return seeds
 
 
@@ -3884,6 +3951,7 @@ def request_catalog(activity: Activity, app_id: str) -> None:
     are present. A bare URL list can only fuzz GET query — this catalog is what unlocks POST/JSON/body."""
     ws = activity.app(app_id)
     catalog, n_mined, n_dead = _assemble_catalog(activity, ws, include_guessed=False)
+    telemetry.record_drop("dead_catalog_requests", n_dead)
     n = tools.write_jsonl(ws.canonical("requests.jsonl"), catalog)
     methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
     log.info("  → request_catalog (%s) — %d surface request shape(s) [%s] (mined %d from corpus,"
@@ -3899,6 +3967,7 @@ def request_catalog_full(activity: Activity, app_id: str) -> None:
     artifacts across the barriers, so it sees the COMPLETE corpus. Feeds param_fuzz + dast_full."""
     ws = activity.app(app_id)
     catalog, n_mined, n_dead = _assemble_catalog(activity, ws, include_guessed=True)
+    telemetry.record_drop("dead_catalog_requests", n_dead)
     n = tools.write_jsonl(ws.canonical("requests_full.jsonl"), catalog)
     methods = ",".join(sorted({m for r in catalog if (m := r.get("method"))}))
     log.info("  → request_catalog_full (%s) — %d request shape(s) [%s] (mined %d from corpus,"
@@ -3915,6 +3984,7 @@ def xref_catalog(activity: Activity, app_id: str) -> None:
     Offline (net=False). A lone group has no peers → an empty sidecar (tolerant reads make it a no-op)."""
     ws = activity.app(app_id)
     catalog, n_dead = _finalize_catalog(ws, _cross_group_surface(activity, ws), [])
+    telemetry.record_drop("dead_catalog_requests", n_dead)
     n = tools.write_jsonl(ws.canonical("requests_xref.jsonl"), catalog)
     log.info("  → xref_catalog (%s) — %d cross-group request shape(s) (dropped %d dead/404)"
              " → requests_xref.jsonl", app_id, n, n_dead)
@@ -3963,9 +4033,13 @@ def param_fuzz(activity: Activity, app_id: str) -> None:
             tf = ws.raw("param_fuzz") / f"targets_{loc}.txt"
             tools.write_lines(tf, targets)
             if loc in _ARJUN_METHOD:
-                futs.append(pool.submit(_run_arjun, tf, ws.raw("arjun") / f"{loc}.json",
-                                        params_wl, app_id, loc=loc))
-            futs.append(pool.submit(_run_x8, tf, ws.raw("x8") / f"{loc}.json", params_wl, app_id, mode=loc))
+                futs.append(telemetry.submit(
+                    pool, _run_arjun, tf, ws.raw("arjun") / f"{loc}.json",
+                    params_wl, app_id, loc=loc,
+                ))
+            futs.append(telemetry.submit(
+                pool, _run_x8, tf, ws.raw("x8") / f"{loc}.json", params_wl, app_id, mode=loc,
+            ))
         for fut in futs:
             records += fut.result()
     merged = merge_params(records)
@@ -4020,9 +4094,12 @@ def dast_requests(catalog: Iterable[dict], params: Iterable[dict], *, cap: int) 
     params, deduped by shape (merge_requests) and capped (logged when it bites). Pure (logging only)."""
     merged = merge_requests([*catalog, *build_fuzz_requests(params)])
     if len(merged) > cap:
+        telemetry.record_cap("dast_requests", limit=cap, observed=len(merged), selected=cap)
+        telemetry.record_drop("dast_request_cap", len(merged) - cap)
         log.warning("⚠ dast: capping request set %d→%d (set PTFLOW_* / raise DAST_MAX_REQUESTS)",
                     len(merged), cap)
         return merged[:cap]
+    telemetry.record_cap("dast_requests", limit=cap, observed=len(merged), selected=len(merged))
     return merged
 
 
@@ -4052,35 +4129,77 @@ def dedup_dast_findings(records: Iterable[dict]) -> list[dict]:
     return out
 
 
-def _run_dast(ws: AppWorkspace, requests_: list[dict], *, input_name: str, out_name: str,
-              label: str) -> None:
+def _write_dast_selection(ws: AppWorkspace, name: str, manifest: Mapping[str, Any]) -> None:
+    """Persist the exact all-pack DAST template selection as run provenance."""
+    tools.write_text(ws.raw("dast") / name, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def _run_dast(  # noqa: PLR0913
+    ws: AppWorkspace,
+    requests_: list[dict],
+    *,
+    input_name: str,
+    out_name: str,
+    selection_name: str,
+    label: str,
+) -> None:
     """Run nuclei -dast over a prepared request set → findings/<out_name>. Shared by dast (phase-2
     surface) + dast_full (phase-4 guessed). nuclei -im jsonl builds each fuzzed request from `raw`, so
     it fuzzes query · path · header · cookie · BODY — not just the GET query a bare URL list allows.
-    Best-effort: skips if the nuclei binary or the dast templates (PTFLOW_NUCLEI_DAST_TEMPLATES) are
-    absent, or the request set is empty. Provenance input → raw/dast/<input_name>."""
+    Best-effort: skips if nuclei, every configured pack, the selected templates, or the request set is
+    absent. Provenance includes the input and exact all-pack template manifest in raw/dast/."""
     stage = out_name.removesuffix(".jsonl")
     if shutil.which("nuclei") is None:
         log.debug("  · skip %s (nuclei not installed) for %s", stage, label)
         return
-    if not Path(NUCLEI_DAST_TEMPLATES).is_dir():
-        log.info("  · skip %s (no dast templates at %s) for %s", stage, NUCLEI_DAST_TEMPLATES, label)
-        return
     if not requests_:
         log.debug("  · skip %s (no requests) for %s", stage, label)
+        return
+    try:
+        settings = _dast_settings()
+        missing = [pack.name for pack in settings.packs if pack.enabled and not pack.path.is_dir()]
+        if missing:
+            log.info("  · %s: unavailable DAST pack(s) ignored: %s", stage, ", ".join(missing))
+        selection = _dast_selection(settings)
+    except dastconfig.DastConfigError as exc:
+        _write_dast_selection(ws, selection_name, {
+            "schema_version": 1,
+            "status": "invalid",
+            "selection": "all",
+            "error": str(exc),
+        })
+        log.warning("⚠ skip %s for %s: invalid DAST configuration: %s", stage, label, exc)
+        return
+    manifest = selection.manifest()
+    _write_dast_selection(ws, selection_name, manifest)
+    if manifest["selected_count"] == 0:
+        log.info("  · skip %s (no templates available in enabled packs) for %s", stage, label)
         return
     input_file = ws.raw("dast") / input_name   # nuclei -l input (provenance, tool's own input)
     tools.write_jsonl(input_file, [{"request": {"endpoint": r["url"], "raw": r["raw"]}}
                                    for r in requests_])
-    log.info("  → %s (%s) — nuclei -dast over %d request(s) [-fa %s]", stage, label, len(requests_),
-             DAST_AGGRESSION)
-    cmd = ["nuclei", "-dast", "-im", "jsonl", "-l", str(input_file), "-t", NUCLEI_DAST_TEMPLATES,
-           "-fa", DAST_AGGRESSION, "-rl", NUCLEI_RL, "-c", NUCLEI_CONC, "-timeout", NUCLEI_TIMEOUT,
-           "-retries", NUCLEI_RETRIES, "-j", "-silent", "-duc", *_header_flags("-H")]
+    log.info(
+        "  → %s (%s) — nuclei -dast over %d request(s), %d template(s) "
+        "[all templates · -fa %s]",
+        stage, label, len(requests_), manifest["selected_count"], selection.aggression,
+    )
+    cmd = [
+        "nuclei", "-dast", "-im", "jsonl", "-l", str(input_file),
+        *selection.template_args,
+        "-fa", selection.aggression,
+        "-fuzz-param-frequency", str(selection.fuzz_param_frequency),
+        "-rl", NUCLEI_RL, "-c", NUCLEI_CONC, "-timeout", NUCLEI_TIMEOUT,
+        "-retries", NUCLEI_RETRIES, "-j", "-silent", "-duc", *_header_flags("-H"),
+    ]
+    if OAST_SERVER:
+        cmd.extend(("-iserver", OAST_SERVER))
+    if OAST_TOKEN:
+        cmd.extend(("-itoken", OAST_TOKEN))
     out = tools.run(cmd, stream_stderr=is_verbose())
     findings = _jsonl_str(out)
     deduped = dedup_dast_findings(findings)
-    n = tools.write_jsonl(ws.findings / out_name, deduped)
+    stamped = dastconfig.stamp_findings(deduped, selection)
+    n = tools.write_jsonl(ws.findings / out_name, stamped)
     extra = f" (deduped from {len(findings)})" if len(findings) != n else ""
     log.info("    %s (%s) → %d finding(s)%s → findings/%s", stage, label, n, extra, out_name)
 
@@ -4118,8 +4237,12 @@ def dast(activity: Activity, app_id: str) -> None:
     yet (that's guessing → phase 4). Output → findings/dast.jsonl. Reads requests.jsonl across the
     barrier (phase 1)."""
     ws = activity.app(app_id)
-    _run_dast(ws, _surface_request_set(ws, cap=DAST_MAX_REQUESTS),
-              input_name="input.jsonl", out_name="dast.jsonl", label=app_id)
+    _run_dast(
+        ws, _surface_request_set(ws, cap=DAST_MAX_REQUESTS),
+        input_name="input.jsonl", out_name="dast.jsonl",
+        selection_name="template-selection.json",
+        label=app_id,
+    )
 
 
 def dast_full(activity: Activity, app_id: str) -> None:
@@ -4130,8 +4253,12 @@ def dast_full(activity: Activity, app_id: str) -> None:
     crawl-surface endpoint. Output → findings/dast_full.jsonl. Needs request_catalog_full + param_fuzz.
     """
     ws = activity.app(app_id)
-    _run_dast(ws, _delta_request_set(ws, cap=DAST_MAX_REQUESTS),
-              input_name="input_full.jsonl", out_name="dast_full.jsonl", label=app_id)
+    _run_dast(
+        ws, _delta_request_set(ws, cap=DAST_MAX_REQUESTS),
+        input_name="input_full.jsonl", out_name="dast_full.jsonl",
+        selection_name="template-selection-full.json",
+        label=app_id,
+    )
 
 
 # --- dedicated vuln scanners (PHASE 2 surface + PHASE 4 deep) — dalfox (XSS) ∥ sqlmap (SQLi) ----------
@@ -4151,7 +4278,11 @@ def _has_params(r: dict) -> bool:
 def _vuln_candidates(requests_: Iterable[dict], *, cap: int) -> list[dict]:
     """The parameterized subset of a request set, capped — the scanner candidate list (no name-based
     routing: presence of a fuzzable param is the ONLY filter)."""
-    return [r for r in requests_ if _has_params(r)][:cap]
+    candidates = [r for r in requests_ if _has_params(r)]
+    telemetry.record_cap("vulnerability_requests", limit=cap, observed=len(candidates),
+                         selected=min(len(candidates), cap))
+    telemetry.record_drop("vulnerability_request_cap", max(0, len(candidates) - cap))
+    return candidates[:cap]
 
 
 def parse_dalfox(out: str) -> list[dict]:
@@ -4302,8 +4433,9 @@ def _run_dalfox(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
 
     findings: list[dict] = []
     with ThreadPoolExecutor(max_workers=VULN_FANOUT) as pool:
-        for res in pool.map(one, enumerate(requests_)):
-            findings += res
+        futures = [telemetry.submit(pool, one, item) for item in enumerate(requests_)]
+        for future in futures:
+            findings += future.result()
     blind = _oast_drain(oast, marker_map) if oast else []
     findings += blind
     n = tools.write_jsonl(ws.findings / out_name, findings)
@@ -4357,8 +4489,9 @@ def _run_sqlmap(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
 
     findings: list[dict] = []
     with ThreadPoolExecutor(max_workers=VULN_FANOUT) as pool:
-        for res in pool.map(one, enumerate(requests_)):
-            findings += res
+        futures = [telemetry.submit(pool, one, item) for item in enumerate(requests_)]
+        for future in futures:
+            findings += future.result()
     n = tools.write_jsonl(ws.findings / out_name, findings)
     log.info("    %s (%s) → %d finding(s) → findings/%s", stage, label, n, out_name)
 
@@ -4722,7 +4855,10 @@ def _run_cve(ws: AppWorkspace, software: list[dict], *, out_name: str,
     findings: list[dict] = []
     if software:
         with ThreadPoolExecutor(max_workers=CVE_FANOUT) as pool:
-            futs = [(s, pool.submit(_search_vulns_query, s["product"], s["version"])) for s in software]
+            futs = [
+                (s, telemetry.submit(pool, _search_vulns_query, s["product"], s["version"]))
+                for s in software
+            ]
             for s, fut in futs:
                 findings += [{**cve, "sources": s["sources"], "hosts": s["where"]} for cve in fut.result()]
     findings.sort(key=_cve_sort_key)
@@ -4862,6 +4998,66 @@ def cloud_assets(activity: Activity, app_id: str) -> None:
              app_id, len(url_meta), len(public), len(exists))
 
 
+# --- surface checkpoint (global barrier after phase 2) -------------------------------------------
+_SURFACE_CHECKPOINT_SOURCES: dict[str, tuple[str, ...]] = {
+    "cve.jsonl": ("findings/cve.jsonl",),
+    "dast.jsonl": ("findings/dast.jsonl",),
+    "xss.jsonl": ("findings/xss.jsonl",),
+    "sqli.jsonl": ("findings/sqli.jsonl",),
+}
+
+
+def surface_checkpoint(activity: Activity) -> None:
+    """Snapshot mature phase-1/2 findings and publish the deterministic early report.
+
+    The checkpoint runs after every app group completed phase 2. Its isolated directory deliberately
+    excludes phase-3/4 artifacts and activity-level spanning outputs, which have not joined yet. A
+    non-resume rerun replaces stale snapshot files; the terminal report remains authoritative.
+    """
+    apps = activity.list_apps()
+    findings = activity.checkpoints / "surface" / "findings"
+    findings.mkdir(parents=True, exist_ok=True)
+    for old in findings.glob("*.jsonl"):
+        old.unlink()
+
+    counts: dict[str, int] = {}
+    for out_name, sources in _SURFACE_CHECKPOINT_SOURCES.items():
+        records = [
+            {"app_id": ws.root.name, **record}
+            for ws in apps
+            for source in sources
+            for record in tools.read_jsonl(ws.root / source)
+        ]
+        if records:
+            counts[out_name.removesuffix(".jsonl")] = tools.write_jsonl(findings / out_name, records)
+
+    takeovers = [
+        {"app_id": ws.root.name, "type": "subdomain-takeover", "evidence": line,
+         "source": "subjack"}
+        for ws in apps
+        for line in tools.read_lines(ws.canonical("takeover.txt"))
+    ]
+    if takeovers:
+        counts["takeover"] = tools.write_jsonl(findings / "takeover.jsonl", takeovers)
+
+    report = reporting.write_report(
+        activity,
+        stem="report-surface",
+        findings_dir=findings,
+        heading="Surface assessment checkpoint",
+        intro=(
+            "This deterministic checkpoint was generated after every application group completed "
+            "surface DAST (phase 2), before guessing and deep DAST."
+        ),
+    )
+    log.info(
+        "  → surface checkpoint — %s · report-surface.md + report-surface.json (%d finding(s))",
+        ", ".join(f"{kind} {count}" for kind, count in sorted(counts.items())) or "no findings",
+        report["summary"]["total"],
+    )
+
+
+# --- consolidate (terminal fan-in) ---------------------------------------------------------------
 _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "cve.jsonl": ("findings/cve.jsonl", "findings/cve_full.jsonl"),
     "dast.jsonl": ("findings/dast.jsonl", "findings/dast_full.jsonl"),
@@ -4883,7 +5079,7 @@ def consolidate(activity: Activity) -> dict[str, int]:
     app_id for traceability. A scanner's surface+deep passes fold into one file (cve, dast); the
     subjack takeover lines become records too. Reads only on-disk artifacts; tolerant of a malformed
     line (read_jsonl skips it). Whole-scope nuclei_scope.jsonl is already an activity finding and is
-    left untouched; the agent seam (hypotheses.jsonl) runs separately — dormant by default, Claude-backed
+    left untouched; the agent seam (hypotheses.jsonl) runs separately — dormant by default, LLM-backed
     under --ai. Returns {type: count} for the NON-EMPTY categories (empty types write no file — no
     clutter). Idempotent: overwrites on every run / --resume."""
     apps = activity.list_apps()

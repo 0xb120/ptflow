@@ -1,0 +1,38 @@
+id: ptflow-blind-ssrf-cookie
+
+info:
+  name: Blind SSRF via Cookie
+  author: ptflow
+  severity: high
+  description: Detects an HTTP callback controlled by a cookie value and correlated through Interactsh.
+  metadata:
+    max-request: 1
+    verified: false
+  tags: ptflow,dast,ssrf,oast,stable,fuzzing-req-cookie
+
+http:
+  -
+    pre-condition:
+      - type: dsl
+        dsl:
+          - 'method != "OPTIONS"'
+
+    payloads:
+      callback:
+        - 'http://{{interactsh-url}}/ptflow-ssrf'
+
+    fuzzing:
+      - part: cookie
+        mode: single
+        type: replace
+        keys-regex:
+          - '(?i)^(?:url|uri|link|src|source|feed|host|domain|endpoint|callback|webhook|image|avatar|proxy|fetch|load|x-callback-url)$'
+        fuzz:
+          - '{{callback}}'
+
+    stop-at-first-match: true
+    matchers:
+      - type: word
+        part: interactsh_protocol
+        words:
+          - 'http'

@@ -16,14 +16,15 @@ profile = "wide"
 # the uplink and the target. Lower it (e.g. 4–6) to be gentler; default 4 with profile=home else 10.
 net_limit = 10
 
-# Operator session headers/cookies — threaded into katana/httpx/nuclei/arjun/x8/dalfox/sqlmap so
-# crawl/fuzz/DAST reach the AUTHENTICATED surface (where most POST/JSON lives). Put your login cookie or
-# a Bearer here. SECRET → redacted in the snapshot. List of "Name: value" strings.
+# Operator session headers/cookies — WEBSCAN ONLY. Threaded into the web scanning tools so crawl/fuzz/DAST
+# reach the AUTHENTICATED surface (where most POST/JSON lives). Ignored by external to avoid spraying auth
+# across broad discovery. Put your login cookie or a Bearer here. SECRET → redacted in the snapshot.
+# List of "Name: value" strings.
 http_header = ["Cookie: session=PUT-YOURS-HERE"]
 
-# Blind-XSS via OAST (interactsh) during the dalfox passes. Opt-in: OFF by default because it adds the
-# interactsh-client dependency (>=1.3) and routes callbacks through ProjectDiscovery's PUBLIC oast
-# servers (a RoE/privacy consideration). Catches only SYNCHRONOUS callbacks within the run.
+# OAST gate for Dalfox blind-XSS. Nuclei DAST executes every enabled-pack template, including OAST;
+# configure interactsh.server below when callbacks must not use ProjectDiscovery's public servers.
+# Dalfox additionally needs interactsh-client >=1.3.
 oast = false
 
 # Recrawl behavior (phase 3) when fuzzing opens never-crawled territory:
@@ -36,12 +37,49 @@ recrawl = "on"
 # hosts. OFF by default — costs HOURS/host. Turn on only for a deep assessment.
 deep_dive = false
 
+# ── Optional LLM layer ──────────────────────────────────────────────────────
+# Named providers supply their standard base URL. Model is always explicit for reproducibility.
+# Remote providers receive assessment evidence. Secret values are redacted by default; still confirm
+# the engagement's data-handling rules. Ready-to-run presets: configs/ai/*.toml.
+[ai]
+enabled = false
+provider = "ollama"          # ollama | openrouter | huggingface | openai-compatible | claude-code
+model = "gpt-oss:20b"        # Must exist locally for Ollama; use the provider's model ID remotely.
+# base_url = "http://127.0.0.1:11434/v1" # Optional for named providers; required for openai-compatible.
+cache = true
+concurrency = 2
+timeout_seconds = 180
+max_retries = 2
+max_calls = 50
+max_input_tokens = 250000
+max_output_tokens = 30000
+max_cost = "0"               # Disabled at 0; enforced when the provider reports cost.
+remote_secrets = "redacted"  # off | redacted | full
+
+# Optional stage routing; omitted fields inherit [ai]. See configs/ai/mixed.toml for a complete hybrid.
+# [ai.stages.report]
+# provider = "openrouter"
+# model = "openai/gpt-oss-20b"
+# max_output_tokens = 12000
+
+# ── Nuclei DAST packs ───────────────────────────────────────────────────────
+# Every template in every enabled local pack runs in BOTH DAST passes. There are no tag/ID policies.
+# Pin external sources with revision for reproducible evidence.
+[dast]
+aggression = "high"          # Include low/medium/high payload groups from every selected template.
+fuzz_param_frequency = 10000 # Avoid suppressing repeated parameter names across the request corpus.
+packs = [
+  { name = "official", path = "~/nuclei-templates/dast", source = "projectdiscovery" }, # Add a pinned release/commit as revision when managed externally.
+  { name = "ptflow-stable", path = "@ptflow/stable", source = "ptflow", revision = "bundled" },
+  { name = "engagement", path = "./rules/nuclei-dast", source = "engagement", enabled = false },
+]
+
 # ── External tool path overrides ────────────────────────────────────────────
 # Only if a binary isn't in its default location; the relevant stage skips best-effort if it's absent.
 [tools]
 sqlmap = "/opt/sqlmap-dev/sqlmap.py"               # SQLi scanner (run via sys.executable). Path to sqlmap.py.
 search_vulns = "~/.local/bin/search_vulns"         # OFFLINE CVE correlation over enumerated software (local DB).
-nuclei_dast_templates = "~/nuclei-templates/dast"  # nuclei -dast fuzzing templates dir; dast/dast_full skip if missing.
+# nuclei_dast_templates = "~/nuclei-templates/dast" # Legacy single-pack fallback when dast.packs is absent.
 eyewitness = ""                                    # EyeWitness override (empty = auto-resolved / /opt/EyeWitness).
 
 # ── Global wordlists ────────────────────────────────────────────────────────

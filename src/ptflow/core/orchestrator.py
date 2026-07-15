@@ -22,7 +22,7 @@ from prefect import flow, task
 from prefect.settings import PREFECT_API_URL, PREFECT_LOGGING_EXTRA_LOGGERS, temporary_settings
 from prefect.task_runners import ThreadPoolTaskRunner
 
-from ptflow.core import tools
+from ptflow.core import reporting, telemetry, tools
 from ptflow.core.agent import propose_hypotheses
 from ptflow.core.config import CONFIG
 from ptflow.core.log import add_file_handler, get_logger
@@ -87,6 +87,11 @@ def per_app_loops(stages: list[Stage]) -> list[tuple[int, list[Stage]]]:
     ]
 
 
+def phase_checkpoints(stages: list[Stage], phase: int) -> list[Stage]:
+    """Activity-scope checkpoints scheduled after `phase`, in declaration order."""
+    return [stage for stage in stages if stage.after_phase == phase]
+
+
 def _pool_size(stages: Sequence[Stage], fanout: int) -> int:
     """Flow pool size = fan-out cap + one slot per spanning/cluster_scope stage. Those background
     stages (whole-scope nuclei, full-port scan, batched screenshot) then run ∥ the per-app loops
@@ -122,6 +127,7 @@ def _submit_dag(  # noqa: PLR0913
     activity_name: str,
     root: str | None,
     app_id: str | None,
+    run_id: str | None,
     *,
     resume: bool,
 ) -> dict[str, PrefectFuture]:
@@ -137,7 +143,8 @@ def _submit_dag(  # noqa: PLR0913
         label = f"{stage.name}[{app_id}]" if app_id else stage.name
         task = _run_stage.with_options(name=stage.name, task_run_name=label, tags=_stage_tags(stage))
         futs[stage.name] = task.submit(  # ty: ignore[no-matching-overload]
-            pipeline_name, activity_name, root, stage.name, app_id, resume=resume, wait_for=deps
+            pipeline_name, activity_name, root, stage.name, app_id, run_id,
+            resume=resume, wait_for=deps,
         )
     return futs
 
@@ -167,32 +174,41 @@ def _run_stage(  # noqa: PLR0913
     root: str | None,
     stage_name: str,
     app_id: str | None,
+    run_id: str | None,
     *,
     resume: bool,
 ) -> str:
     pipeline = load_pipeline(pipeline_name)
     activity = Activity.named(activity_name, Path(root) if root else None)
     marker = _marker(activity, stage_name, app_id)
+    stage = next(s for s in pipeline.stages if s.name == stage_name)
     if resume and marker.exists():  # already finished cleanly in a prior run → skip
         log.info("  ↺ skip %s%s (done)", stage_name, f" [{app_id}]" if app_id else "")
+        telemetry.write_skipped(
+            activity, run_id, stage=stage.name, app_id=app_id, band=stage_band(stage),
+            needs=stage.needs, net=stage.net, reason="resume-skipped",
+        )
         return stage_name
-    stage = next(s for s in pipeline.stages if s.name == stage_name)
-    # Acquire slots in a FIXED order (net → fanout) so multi-slot stages can't deadlock:
-    #   _NET_SLOTS — global network-concurrency cap (per-app + spanning), bounds the uplink load;
-    #   _FANOUT_SLOTS — per-app fan-out cap (the pool is larger, sized to also fit the spanning
-    #   stages, so spanning runs ∥ the loops instead of starving them).
-    with contextlib.ExitStack() as slots:
-        if stage.net:
-            slots.enter_context(_NET_SLOTS)
-        if app_id is not None:
-            slots.enter_context(_FANOUT_SLOTS)
-        log.info("  ▶ %s%s", stage_name, f" [{app_id}]" if app_id else "")
-        if app_id is None:
-            stage.run(activity)
-        else:
-            stage.run(activity, app_id)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text("", encoding="utf-8")  # mark done only AFTER success → failed stages re-run
+
+    def _execute() -> None:
+        # Acquire slots in a FIXED order (net → fanout) so multi-slot stages can't deadlock.
+        with contextlib.ExitStack() as slots:
+            if stage.net:
+                slots.enter_context(_NET_SLOTS)
+            if app_id is not None:
+                slots.enter_context(_FANOUT_SLOTS)
+            log.info("  ▶ %s%s", stage_name, f" [{app_id}]" if app_id else "")
+            if app_id is None:
+                stage.run(activity)
+            else:
+                stage.run(activity, app_id)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("", encoding="utf-8")  # only AFTER success → failed stages re-run
+
+    telemetry.trace_call(
+        activity, run_id, stage=stage.name, app_id=app_id, band=stage_band(stage),
+        needs=stage.needs, net=stage.net, call=_execute,
+    )
     return stage_name
 
 
@@ -203,6 +219,7 @@ def _run_loops(  # noqa: PLR0913
     activity_name: str,
     root: str | None,
     failures: list[str],
+    run_id: str | None,
     *,
     resume: bool,
 ) -> None:
@@ -212,47 +229,82 @@ def _run_loops(  # noqa: PLR0913
         log.info("▶ per-app loop %d: %s", phase, ", ".join(s.name for s in loop_stages))
         pending: list[tuple[str, PrefectFuture]] = []
         for app_id in app_ids:
-            submitted = _submit_dag(loop_stages, pipeline_name, activity_name, root, app_id, resume=resume)
+            submitted = _submit_dag(
+                loop_stages, pipeline_name, activity_name, root, app_id, run_id, resume=resume,
+            )
             pending += [(f"{name}[{app_id}]", fut) for name, fut in submitted.items()]
         for label, fut in pending:
             _await(fut, label, failures)
+        checkpoints = phase_checkpoints(stages, phase)
+        if checkpoints:
+            log.info("▶ checkpoint after loop %d: %s", phase,
+                     ", ".join(stage.name for stage in checkpoints))
+            # Checkpoints are cheap derived snapshots and MUST be regenerated on resume: a failed
+            # phase stage may have succeeded on this continuation, making the prior snapshot stale.
+            submitted = _submit_dag(
+                checkpoints, pipeline_name, activity_name, root, None, run_id, resume=False,
+            )
+            for name, fut in submitted.items():
+                _await(fut, name, failures)
 
 
-def _terminal_fanin(pipeline: Pipeline, activity: Activity, failures: list[str]) -> None:
-    """Deterministic terminal fan-in, run after every loop + spanning join: (1) `consolidate` — an
+def _terminal_fanin(
+    pipeline: Pipeline, activity: Activity, failures: list[str], run_id: str | None = None,
+) -> None:
+    """Terminal fan-in, run after every loop + spanning join: (1) `consolidate` — an
     OPTIONAL pipeline hook (like preflight) that lifts per-app findings into <activity>/findings/<type>
-    .jsonl, failure-isolated so it can't sink the run; (2) the agent seam (`propose_hypotheses`),
-    failure-isolated — a Claude-backed provider can raise, and must not abort the run — followed by an
-    OPTIONAL `report(activity)` pipeline hook (duck-typed like consolidate), also failure-isolated."""
+    .jsonl; (2) the deterministic offline report; (3) the agent seam (`propose_hypotheses`); and (4)
+    the optional AI `report(activity)` hook. Every terminal step is failure-isolated."""
     do_consolidate = getattr(pipeline, "consolidate", None)
     if callable(do_consolidate):
         log.info("▶ consolidate")
         try:
-            do_consolidate(activity)
+            telemetry.trace_call(
+                activity, run_id, stage="consolidate", app_id=None, band="terminal",
+                call=lambda: do_consolidate(activity),
+            )
         except Exception:  # terminal aggregation must not abort the whole run
             log.exception("⚠ consolidate failed")
             failures.append("consolidate")
+    log.info("▶ deterministic report")
+    try:
+        report = telemetry.trace_call(
+            activity, run_id, stage="deterministic_report", app_id=None, band="terminal",
+            call=lambda: reporting.write_report(activity),
+        )
+        log.info("  → report.md + report.json (%d finding(s))", report["summary"]["total"])
+    except Exception:  # reporting remains failure-isolated like the rest of the terminal fan-in
+        log.exception("⚠ deterministic report failed")
+        failures.append("deterministic_report")
     log.info("▶ agent")
     try:
-        n = propose_hypotheses(activity, pipeline.provider())
+        n = telemetry.trace_call(
+            activity, run_id, stage="agent", app_id=None, band="terminal",
+            call=lambda: propose_hypotheses(activity, pipeline.provider()),
+        )
         log.info("  → %d hypothesis(es)", n)
-    except Exception:  # a Claude-backed provider can raise; must not abort the run
+    except Exception:  # an LLM-backed provider can raise; must not abort the run
         log.exception("⚠ agent failed")
         failures.append("agent")
     do_report = getattr(pipeline, "report", None)  # optional AI report hook (duck-typed like consolidate)
     if callable(do_report):
         log.info("▶ report")
         try:
-            do_report(activity)
+            telemetry.trace_call(
+                activity, run_id, stage="ai_report", app_id=None, band="terminal",
+                call=lambda: do_report(activity),
+            )
         except Exception:  # terminal reporting must not abort the whole run
             log.exception("⚠ report failed")
             failures.append("report")
 
 
 @flow(task_runner=ThreadPoolTaskRunner(max_workers=CONFIG.fanout.max_workers))  # ty: ignore[no-matching-overload]
-def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *,
-             resume: bool, disabled: tuple[str, ...] = ()) -> int:
-    """Drive the full DAG. Returns the number of stage failures (0 = clean).
+def _run_dag(  # noqa: PLR0913
+    pipeline_name: str, activity_name: str, root: str | None, *,
+    resume: bool, disabled: tuple[str, ...] = (), run_id: str | None = None,
+) -> tuple[str, ...]:
+    """Drive the full DAG. Returns the failed stage labels (empty = clean).
 
     The whole body runs under a `finally` that calls tools.terminate_all(): on any abort
     (an error, or Ctrl-C) it kills the still-running scans — and their grandchildren — so the
@@ -261,18 +313,22 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *,
     With `resume`, stages with a completion marker are skipped (only failed/incomplete ones rerun).
     """
     tools.clear_abort()  # fresh run (a prior aborted run in this process must not poison this one)
+    os.environ["PTFLOW_ACTIVE_PIPELINE"] = pipeline_name
     pipeline = load_pipeline(pipeline_name)
     activity = Activity.named(activity_name, Path(root) if root else None)
     stages = _filter_disabled(pipeline, set(disabled))
     activity_stages = [s for s in stages
-                       if not s.per_app and not s.spanning and not s.cluster_scope]
+                       if not s.per_app and not s.spanning and not s.cluster_scope
+                       and s.after_phase is None]
     spanning_stages = [s for s in stages if s.spanning]
     cluster_scope_stages = [s for s in stages if s.cluster_scope]
     failures: list[str] = []
     try:
         # 1. activity-scope (breadth) DAG — barrier before cluster
         log.info("▶ activity stages")
-        for name, fut in _submit_dag(activity_stages, pipeline_name, activity_name, root, None, resume=resume).items():
+        for name, fut in _submit_dag(
+            activity_stages, pipeline_name, activity_name, root, None, run_id, resume=resume,
+        ).items():
             _await(fut, name, failures)
 
         # 1b. spanning stages — breadth deps are done; launch now and await only at the
@@ -280,11 +336,16 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *,
         spanning: dict[str, PrefectFuture] = {}
         if spanning_stages:
             log.info("▶ spanning (∥): %s", ", ".join(s.name for s in spanning_stages))
-            spanning = _submit_dag(spanning_stages, pipeline_name, activity_name, root, None, resume=resume)
+            spanning = _submit_dag(
+                spanning_stages, pipeline_name, activity_name, root, None, run_id, resume=resume,
+            )
 
         # 2. cluster — fan-out pivot
         log.info("▶ cluster")
-        app_ids = pipeline.cluster(activity)
+        app_ids = telemetry.trace_call(
+            activity, run_id, stage="cluster", app_id=None, band="cluster",
+            call=lambda: pipeline.cluster(activity),
+        )
         log.info("  → %d application group(s)", len(app_ids))
 
         # 2b. post-cluster spanning — launched now that the groups exist; runs ∥ the per-app loops and
@@ -292,18 +353,20 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *,
         cluster_spanning: dict[str, PrefectFuture] = {}
         if cluster_scope_stages and app_ids:
             log.info("▶ post-cluster spanning (∥): %s", ", ".join(s.name for s in cluster_scope_stages))
-            cluster_spanning = _submit_dag(cluster_scope_stages, pipeline_name, activity_name, root, None, resume=resume)
+            cluster_spanning = _submit_dag(
+                cluster_scope_stages, pipeline_name, activity_name, root, None, run_id, resume=resume,
+            )
 
         # 3. per-app loops — each phase is a loop: fan-out across groups + intra-app
         #    parallelism (capped by max_workers), with a global barrier between loops.
         if app_ids:
             _run_loops(stages, app_ids,
-                       pipeline_name, activity_name, root, failures, resume=resume)
+                       pipeline_name, activity_name, root, failures, run_id, resume=resume)
 
         # 4. join the spanning + post-cluster-spanning stages (ran ∥ everything above), then fan-in
         for label, fut in {**spanning, **cluster_spanning}.items():
             _await(fut, label, failures)
-        _terminal_fanin(pipeline, activity, failures)
+        _terminal_fanin(pipeline, activity, failures, run_id)
     except KeyboardInterrupt:  # Ctrl-C/SIGINT: stop the draining workers from spawning new tools
         tools.signal_abort()   # (feroxbuster r+1, downloads, trufflehog…) → network goes quiet fast
         raise
@@ -317,7 +380,7 @@ def _run_dag(pipeline_name: str, activity_name: str, root: str | None, *,
                     len(failures), ", ".join(failures), activity.base)
     else:
         log.info("✓ done → %s", activity.base)
-    return len(failures)
+    return tuple(failures)
 
 
 def _resume_ok(activity: Activity, scope_text: str, *, resume: bool) -> bool:
@@ -371,6 +434,7 @@ def orchestrate(  # noqa: PLR0913
     scope_text = Path(scope_file).read_text(encoding="utf-8", errors="replace")
     activity.scope.write_text(scope_text, encoding="utf-8")
     activity.scope_init.write_text(scope_text, encoding="utf-8")
+    resume_requested = resume
     resume = _resume_ok(activity, scope_text, resume=resume)
     if observe and not _server_reachable(observe):
         log.warning("⚠ observe: Prefect server unreachable at %s — falling back to ephemeral "
@@ -382,27 +446,52 @@ def orchestrate(  # noqa: PLR0913
     if callable(preflight):
         preflight()
     log.info("  → concurrency: fan-out %d · network cap %d", CONFIG.fanout.max_workers, _NET_LIMIT)
+    disabled = tuple(sorted(disabled_steps))
+    run_trace = telemetry.begin_run(
+        activity, pipeline, scope_text=scope_text, resume_requested=resume_requested,
+        resume_effective=resume, disabled=disabled, fanout=CONFIG.fanout.max_workers,
+        net_limit=_NET_LIMIT,
+    )
     # name the flow run after the activity (UI), and size the pool to fan-out + spanning headroom so
     # the spanning stages run ∥ the loops instead of starving them (_FANOUT_SLOTS holds the fan-out cap)
     pool = ThreadPoolTaskRunner(max_workers=_pool_size(pipeline.stages, CONFIG.fanout.max_workers))
     run = _run_dag.with_options(flow_run_name=f"{pipeline.name}:{activity_name}", task_runner=pool)
-    disabled = tuple(sorted(disabled_steps))
-    def _go() -> int:
+
+    def _go() -> tuple[str, ...]:
         if observe:
             # redirect this run to the persistent server + let it capture the `ptflow` logger, scoped to
             # the run (no global profile/env mutation). temporary_settings overrides at runtime.
             with temporary_settings({PREFECT_API_URL: observe, PREFECT_LOGGING_EXTRA_LOGGERS: ["ptflow"]}):
-                return run(pipeline.name, activity_name, root, resume=resume, disabled=disabled)
-        return run(pipeline.name, activity_name, root, resume=resume, disabled=disabled)
+                return run(
+                    pipeline.name, activity_name, root, resume=resume, disabled=disabled,
+                    run_id=run_trace.run_id,
+                )
+        return run(
+            pipeline.name, activity_name, root, resume=resume, disabled=disabled,
+            run_id=run_trace.run_id,
+        )
 
     try:
-        failures = _go()
+        failure_labels = _go()
     except (KeyboardInterrupt, Exception) as exc:
         # a Ctrl-C (or the Prefect ConnectError cascade after the ephemeral server dies with it) →
         # clean exit, not a traceback. tools.is_aborting() was set by _run_dag's KeyboardInterrupt
         # handler; a genuine error (not aborting) is re-raised so it still surfaces.
         if isinstance(exc, KeyboardInterrupt) or tools.is_aborting():
+            telemetry.finalize_run(
+                activity, run_trace, pipeline.stages, status="interrupted",
+                failures=("interrupted",), disabled=disabled,
+            )
             log.warning("⚠ interrupted — partial results in %s; rerun with --resume", activity.base)
             return activity.base, -1  # sentinel: interrupted (CLI → exit 130)
+        telemetry.finalize_run(
+            activity, run_trace, pipeline.stages, status="failed",
+            failures=(type(exc).__name__,), disabled=disabled,
+        )
         raise
-    return activity.base, failures
+    telemetry.finalize_run(
+        activity, run_trace, pipeline.stages,
+        status="completed" if not failure_labels else "completed-with-failures",
+        failures=failure_labels, disabled=disabled,
+    )
+    return activity.base, len(failure_labels)

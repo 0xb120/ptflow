@@ -16,6 +16,11 @@ Activity workspace layout (parent dir = activity name):
           responses/                  #   downloaded HTML/JS corpus (katana -srd) — mined offline
           raw/<tool>/
       findings/                       # agent output (hypotheses.jsonl)
+      report.md  report.json          # deterministic human + machine-readable terminal report
+      checkpoints/surface/findings/   # immutable-ish early snapshot after surface DAST
+      report-surface.md/.json          # early deterministic checkpoint report
+      coverage.json                   # run/stage coverage manifest
+      report-ai.md                    # optional AI narrative (never replaces report.md)
       poc/   tmp/   logs/
       wl_global/                      # shared/global INPUT wordlists (SecLists & co.)
 """
@@ -167,6 +172,11 @@ class Activity:
         return self.base / "findings"
 
     @property
+    def checkpoints(self) -> Path:
+        """Activity-scope intermediate snapshots produced at global phase barriers."""
+        return self.base / "checkpoints"
+
+    @property
     def poc(self) -> Path:
         return self.base / "poc"
 
@@ -203,6 +213,7 @@ class Activity:
             self.scope_dir,
             self.asset_discovery,
             self.findings,
+            self.checkpoints,
             self.poc,
             self.tmp,
             self.wl_global,

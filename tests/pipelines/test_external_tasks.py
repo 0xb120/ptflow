@@ -117,6 +117,7 @@ def test_requirements_manifest_covers_tool_dicts_and_datasets():
         assert by_name[name].kind == "optional"
     # interactsh-client carries the documented >=1.3 version floor
     assert by_name["interactsh-client"].min_version == "1.3"
+    assert by_name["nuclei"].min_version == "3.2.4"
     # datasets are represented as category=="dataset" (path-existence checks), e.g. the resolvers file
     datasets = {r.name for r in reqs if r.category == "dataset"}
     assert "resolvers" in datasets
@@ -202,15 +203,18 @@ def test_pipeline_object_shape():
 
     assert PIPELINE.name == "external"
     activity = [s.name for s in PIPELINE.stages
-                if not s.per_app and not s.spanning and not s.cluster_scope]
+                if not s.per_app and not s.spanning and not s.cluster_scope
+                and s.after_phase is None]
     spanning = [s.name for s in PIPELINE.stages if s.spanning]
     cluster_scope = [s.name for s in PIPELINE.stages if s.cluster_scope]
+    checkpoints = [s.name for s in PIPELINE.stages if s.after_phase is not None]
     app = [s.name for s in PIPELINE.stages if s.per_app]
     # full-port scan + nerva are now SPANNING (off the breadth critical path); httpx needs only
     # the fast top-1k web set, so the breadth chain stops at httpx.
     assert activity == ["provision_wl", "expand", "resolve", "scope_gate", "portscan", "httpx"]
     assert spanning == ["portscan_full", "nerva", "nuclei_scope"]
     assert cluster_scope == ["screenshot"]  # batched screenshot, post-cluster ∥ the loops
+    assert checkpoints == ["surface_checkpoint"]
     assert app == [
         "passive_probe", "crawl", "crawl_headless", "subenum", "takeover",
         "fetch_delta", "api_spec", "mine_responses", "request_catalog",
@@ -237,6 +241,8 @@ def test_pipeline_object_shape():
     # screenshot is a post-cluster spanning step (cluster_scope), NOT a per-app loop-1 step
     assert by_name["screenshot"].cluster_scope is True
     assert by_name["screenshot"].per_app is False
+    assert by_name["surface_checkpoint"].after_phase == 2
+    assert by_name["surface_checkpoint"].net is False
 
 
 def test_pipeline_phase_wiring():
@@ -1200,11 +1206,141 @@ def test_merge_requests_upgrades_blank_param_value_with_observed():
 
 def test_auth_headers_parses_env(monkeypatch):
     monkeypatch.setenv("PTFLOW_HTTP_HEADER", "Cookie: s=1;;Authorization: Bearer x\nBad")
+    monkeypatch.setenv("PTFLOW_ACTIVE_PIPELINE", "webscan")
     assert tasks._auth_headers() == ["Cookie: s=1", "Authorization: Bearer x"]    # 'Bad' (no ':') dropped
     assert tasks._header_flags("-H") == ["-H", "Cookie: s=1", "-H", "Authorization: Bearer x"]
     monkeypatch.delenv("PTFLOW_HTTP_HEADER")
     assert tasks._auth_headers() == []
     assert tasks._header_flags() == []
+
+
+def test_auth_headers_are_webscan_only(monkeypatch):
+    monkeypatch.setenv("PTFLOW_HTTP_HEADER", "Cookie: s=1")
+    monkeypatch.delenv("PTFLOW_ACTIVE_PIPELINE", raising=False)
+    assert tasks._auth_headers() == []
+    monkeypatch.setenv("PTFLOW_ACTIVE_PIPELINE", "external")
+    assert tasks._auth_headers() == []
+    monkeypatch.setenv("PTFLOW_ACTIVE_PIPELINE", "webscan")
+    assert tasks._auth_headers() == ["Cookie: s=1"]
+
+
+def _has_header_flags(cmd: list[str], flag: str) -> bool:
+    want = [flag, "Cookie: s=1", flag, "Authorization: Bearer x"]
+    return any(cmd[i:i + len(want)] == want for i in range(len(cmd) - len(want) + 1))
+
+
+def test_auth_headers_reach_remaining_http_target_tools(monkeypatch, tmp_path):
+    from ptflow.core.paths import Activity
+
+    monkeypatch.setenv("PTFLOW_HTTP_HEADER", "Cookie: s=1;;Authorization: Bearer x")
+    monkeypatch.setenv("PTFLOW_ACTIVE_PIPELINE", "webscan")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        if cmd and cmd[0] == tasks.HTTPX and "-j" in cmd:
+            return json.dumps({"url": "https://a.test", "host": "a.test", "status_code": 200}) + "\n"
+        return ""
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    monkeypatch.setattr(tasks, "_eyewitness_batch", lambda *_args, **_kwargs: None)
+
+    act = Activity.named("auth-httpx", root=tmp_path).ensure()
+    act.asset_discovery_canonical("inscope_subdomains.txt").write_text("a.test\n", encoding="utf-8")
+    tasks.httpx_fingerprint(act)
+
+    ingest = Activity.named("auth-ingest", root=tmp_path).ensure()
+    ingest.scope_init.write_text("https://a.test\n", encoding="utf-8")
+    tasks.ingest_httpx(ingest)
+
+    nuclei = Activity.named("auth-nuclei", root=tmp_path).ensure()
+    nuclei.asset_discovery_canonical("unique_webapps.txt").write_text("https://a.test\n", encoding="utf-8")
+    tasks.nuclei_scope(nuclei)
+
+    screenshot = Activity.named("auth-screenshot", root=tmp_path).ensure()
+    ws = screenshot.app("app").ensure()
+    ws.hosts.write_text("https://a.test\n", encoding="utf-8")
+    tasks.screenshot_all(screenshot)
+
+    download = Activity.named("auth-download", root=tmp_path).ensure().app("app").ensure()
+    tasks._download_and_mine(download, ["https://a.test/admin"], 0)
+
+    fingerprint_cmd = next(c for c in calls if c and c[0] == tasks.HTTPX and "-nf" in c)
+    ingest_cmd = next(c for c in calls if c and c[0] == tasks.HTTPX and "-nfs" in c)
+    nuclei_cmd = next(c for c in calls if c and c[0] == "nuclei" and "-stats" in c)
+    assert not any(c[:2] == ["nuclei", "-ut"] for c in calls)  # updates are explicit/out-of-band
+    screenshot_cmd = next(c for c in calls if c and c[0] == tasks.HTTPX and "-ss" in c)
+    download_cmd = next(c for c in calls if c and c[0] == tasks.HTTPX
+                        and any("discovered" in str(part) for part in c))
+    for cmd in (fingerprint_cmd, ingest_cmd, nuclei_cmd, screenshot_cmd, download_cmd):
+        assert _has_header_flags(cmd, "-H")
+
+
+def test_auth_headers_reach_feroxbuster_and_crawley(monkeypatch, tmp_path):
+    from ptflow.core import workspace
+    from ptflow.core.paths import AppWorkspace
+
+    monkeypatch.setenv("PTFLOW_HTTP_HEADER", "Cookie: s=1;;Authorization: Bearer x")
+    monkeypatch.setenv("PTFLOW_ACTIVE_PIPELINE", "webscan")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return ""
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    ws = AppWorkspace(tmp_path / "app").ensure()
+    workspace.write_meta(ws.meta, {"tech": []})
+
+    tasks._run_ferox(ws, ["https://a.test"], ["admin"], 0, remaining=60)
+    tasks._run_crawley(["https://a.test"], "app")
+
+    ferox_cmd = next(c for c in calls if c and c[0] == tasks.FEROX)
+    crawley_cmd = next(c for c in calls if c and c[0] == tasks.CRAWLEY)
+    assert _has_header_flags(ferox_cmd, "-H")
+    assert _has_header_flags(crawley_cmd, "-header")
+
+
+def test_auth_headers_not_sent_to_cloud_bucket_probes(monkeypatch, tmp_path):
+    monkeypatch.setenv("PTFLOW_HTTP_HEADER", "Cookie: s=1;;Authorization: Bearer x")
+    monkeypatch.setenv("PTFLOW_ACTIVE_PIPELINE", "webscan")
+    monkeypatch.setattr(tasks.shutil, "which", lambda _cmd: "/bin/tool")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return ""
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    tasks._httpx_match(["https://bucket.s3.amazonaws.com"], ["-mc", "403"], tmp_path / "cloud.txt")
+
+    assert calls
+    assert "-H" not in calls[0]
+    assert "Cookie: s=1" not in calls[0]
+    assert "Authorization: Bearer x" not in calls[0]
+
+
+def test_external_pipeline_does_not_send_auth_headers(monkeypatch, tmp_path):
+    from ptflow.core.paths import Activity
+
+    monkeypatch.setenv("PTFLOW_HTTP_HEADER", "Cookie: s=1;;Authorization: Bearer x")
+    monkeypatch.setenv("PTFLOW_ACTIVE_PIPELINE", "external")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return json.dumps({"url": "https://a.test", "host": "a.test", "status_code": 200}) + "\n"
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    act = Activity.named("auth-external", root=tmp_path).ensure()
+    act.asset_discovery_canonical("inscope_subdomains.txt").write_text("a.test\n", encoding="utf-8")
+
+    tasks.httpx_fingerprint(act)
+
+    cmd = next(c for c in calls if c and c[0] == tasks.HTTPX and "-nf" in c)
+    assert "-H" not in cmd
+    assert "Cookie: s=1" not in cmd
+    assert "Authorization: Bearer x" not in cmd
 
 
 def test_url_to_get_request_shape():
@@ -1415,6 +1551,59 @@ def test_dedup_dast_findings_collapses_same_injection_point():
     assert keys[0] == ("cookie-injection", "https://a/x?category=cookie_injection")  # first wins
     assert ("cookie-injection", "https://a/y?category=cookie_injection") in keys     # distinct path
     assert sum(1 for r in out if r["template-id"] == "tech-detect") == 1             # non-fuzz deduped
+
+
+def test_run_dast_uses_all_templates_and_writes_provenance(tmp_path, monkeypatch):
+    from ptflow.core.paths import AppWorkspace
+
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    template = pack / "custom.yaml"
+    template.write_text(
+        "id: custom-dast\n\ninfo:\n  name: Custom\n  author: test\n  severity: medium\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PTFLOW_DAST_PACKS", json.dumps([
+        {"name": "engagement", "path": str(pack), "revision": "rev-1"},
+    ]))
+    monkeypatch.setenv("PTFLOW_DAST_AGGRESSION", "medium")
+    monkeypatch.setenv("PTFLOW_DAST_FUZZ_PARAM_FREQUENCY", "23")
+    monkeypatch.setattr(tasks.shutil, "which", lambda _name: "/usr/bin/nuclei")
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(list(command))
+        if "-tl" in command:
+            return f"{template}\n"
+        return json.dumps({
+            "template-id": "custom-dast",
+            "matched-at": "https://a.test/?q=hit",
+            "is_fuzzing_result": True,
+            "fuzzing_position": "query",
+            "fuzzing_method": "GET",
+        }) + "\n"
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    ws = AppWorkspace(tmp_path / "app").ensure()
+    request = {
+        "url": "https://a.test/?q=1",
+        "raw": "GET /?q=1 HTTP/1.1\r\nHost: a.test\r\n\r\n",
+    }
+    tasks._run_dast(
+        ws, [request], input_name="input.jsonl", out_name="dast.jsonl",
+        selection_name="template-selection.json", label="app",
+    )
+
+    scan = next(command for command in calls if "-im" in command)
+    assert scan[scan.index("-fa") + 1] == "medium"
+    assert scan[scan.index("-fuzz-param-frequency") + 1] == "23"
+    assert not {"-tags", "-etags", "-id", "-eid", "-ni"}.intersection(scan)
+    manifest = json.loads((ws.raw("dast") / "template-selection.json").read_text())
+    assert manifest["templates"][0]["id"] == "custom-dast"
+    finding = tasks.tools.read_jsonl(ws.findings / "dast.jsonl")[0]
+    assert finding["ptflow_dast"] == {
+        "selection": "all", "pack": "engagement", "pack_revision": "rev-1",
+    }
 
 
 # --- dedicated vuln scanners (dalfox / sqlmap) ---
@@ -1802,6 +1991,44 @@ def test_cve_sort_key_prioritizes_exploited_then_cvss():
 
 
 # --- consolidate (terminal fan-in) ---
+def test_surface_checkpoint_snapshots_only_mature_findings_and_replaces_stale(tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("surface", root=tmp_path).ensure()
+    app = act.app("app-1").ensure()
+    tools.write_jsonl(app.findings / "cve.jsonl", [{"cve": "CVE-SURFACE", "cvss": 9.1}])
+    tools.write_jsonl(app.findings / "cve_full.jsonl", [{"cve": "CVE-DEEP", "cvss": 9.9}])
+    tools.write_jsonl(app.findings / "dast.jsonl", [{"template-id": "surface-xss"}])
+    tools.write_jsonl(app.findings / "wpprobe.jsonl", [{"cve": "CVE-PHASE4"}])
+    tools.write_lines(app.canonical("takeover.txt"), ["github.io app.example"])
+    tools.write_jsonl(act.findings / "nuclei_scope.jsonl", [{"template-id": "still-spanning"}])
+    stale = act.checkpoints / "surface" / "findings" / "stale.jsonl"
+    tools.write_jsonl(stale, [{"old": True}])
+
+    tasks.surface_checkpoint(act)
+
+    checkpoint = act.checkpoints / "surface" / "findings"
+    assert not stale.exists()
+    assert {path.name for path in checkpoint.glob("*.jsonl")} == {
+        "cve.jsonl", "dast.jsonl", "takeover.jsonl",
+    }
+    assert tools.read_jsonl(checkpoint / "cve.jsonl")[0]["cve"] == "CVE-SURFACE"
+    assert not (checkpoint / "wpprobe.jsonl").exists()
+    report = json.loads((act.base / "report-surface.json").read_text())
+    assert report["summary"]["total"] == 3
+    assert "CVE-DEEP" not in (act.base / "report-surface.md").read_text()
+    assert "still-spanning" not in (act.base / "report-surface.md").read_text()
+    assert not (act.findings / "cve.jsonl").exists()  # final fan-in namespace stays untouched
+
+    tools.write_jsonl(app.findings / "cve.jsonl", [])
+    tools.write_jsonl(app.findings / "dast.jsonl", [])
+    tools.write_lines(app.canonical("takeover.txt"), [])
+    tasks.surface_checkpoint(act)
+    assert list(checkpoint.glob("*.jsonl")) == []
+    assert json.loads((act.base / "report-surface.json").read_text())["summary"]["total"] == 0
+
+
 def test_consolidate_lifts_per_app_findings_by_type(tmp_path):
     from ptflow.core import tools
     from ptflow.core.paths import Activity

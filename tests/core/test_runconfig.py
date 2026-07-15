@@ -1,4 +1,8 @@
 # tests/core/test_runconfig.py
+import json
+import tomllib
+from pathlib import Path
+
 import pytest
 
 from ptflow.core import runconfig
@@ -24,6 +28,20 @@ def test_resolve_coerces_bool_list_and_path():
     assert out["PTFLOW_HTTP_HEADER"] == "Cookie: a;;X: b"  # list → ;;-joined
     assert out["PTFLOW_SQLMAP"].endswith("/x/sqlmap.py")   # path expanduser
     assert "~" not in out["PTFLOW_SQLMAP"]
+
+
+def test_resolve_serializes_structured_dast_config():
+    config = {
+        "dast": {
+            "aggression": "high",
+            "fuzz_param_frequency": 10000,
+            "packs": [{"name": "local", "path": "./rules", "enabled": True}],
+        },
+    }
+    out = _envmap(runconfig.resolve(config, {}, None))
+    assert out["PTFLOW_DAST_AGGRESSION"] == "high"
+    assert out["PTFLOW_DAST_FUZZ_PARAM_FREQUENCY"] == "10000"
+    assert json.loads(out["PTFLOW_DAST_PACKS"])[0]["name"] == "local"
 
 
 def test_resolve_dynamic_wordlist_roles():
@@ -92,6 +110,21 @@ def test_ai_flag_resolves_to_env():
     assert envs["PTFLOW_AI_MODEL"] == "claude-opus-4-8"
 
 
+def test_ai_enabled_table_is_valid_and_snapshot_is_refeedable(tmp_path):
+    config = {"ai": {"enabled": True, "provider": "ollama", "model": "gpt-oss:20b"}}
+    resolved = runconfig.resolve(config, {}, None)
+    envs = _envmap(resolved)
+    assert envs["PTFLOW_AI"] == "on"
+
+    snapshot = runconfig.snapshot(tmp_path, resolved)
+
+    assert snapshot is not None
+    with snapshot.open("rb") as fh:
+        parsed = tomllib.load(fh)
+    assert parsed["ai"]["enabled"] == "on"
+    assert _envmap(runconfig.resolve(parsed, {}, None))["PTFLOW_AI_PROVIDER"] == "ollama"
+
+
 def test_resolve_disabled_steps_sparse_and_precedence():
     config = {"steps": {"external": {"dast": False, "cve_lookup": True}}}
     names = {"dast", "cve_lookup", "httpx"}
@@ -157,9 +190,23 @@ def test_snapshot_nothing_set_returns_none(tmp_path):
 
 def test_ai_provider_enum_accepts_new_values():
     from ptflow.core import runconfig
-    for prov in ("claude-code", "openai"):
+    providers = (
+        "ollama", "openrouter", "huggingface", "openai-compatible", "openai", "claude-code",
+    )
+    for prov in providers:
         resolved = runconfig.resolve({"ai": {"provider": prov}}, {})
         assert any(r.env == "PTFLOW_AI_PROVIDER" and r.value == prov for r in resolved)
+
+
+def test_ai_provider_presets_are_valid_and_enabled():
+    root = Path(__file__).resolve().parents[2]
+    for name in ("ollama", "openrouter", "huggingface", "mixed"):
+        config = runconfig.load_config(str(root / "configs" / "ai" / f"{name}.toml"))
+        envs = _envmap(runconfig.resolve(config, {}, None))
+        assert envs["PTFLOW_AI"] == "on"
+        assert envs["PTFLOW_AI_PROVIDER"] == ("ollama" if name == "mixed" else name)
+        assert envs["PTFLOW_AI_MODEL"]
+        assert envs["PTFLOW_AI_BASE_URL"].startswith(("http://", "https://"))
 
 
 def test_ai_provider_enum_rejects_unknown():
@@ -168,3 +215,36 @@ def test_ai_provider_enum_rejects_unknown():
     from ptflow.core import runconfig
     with pytest.raises(runconfig.ConfigError):
         runconfig.resolve({"ai": {"provider": "anthropic"}}, {})
+
+
+def test_ai_stage_routing_and_runtime_controls_resolve():
+    config = {
+        "ai": {
+            "cache": True,
+            "max_calls": 12,
+            "max_cost": "3.50",
+            "remote_secrets": "redacted",
+            "stages": {
+                "report": {
+                    "enabled": True,
+                    "provider": "openrouter",
+                    "model": "vendor/model",
+                    "max_output_tokens": 9000,
+                },
+            },
+        },
+    }
+    envs = _envmap(runconfig.resolve(config, {}, None))
+    assert envs["PTFLOW_AI_CACHE"] == "on"
+    assert envs["PTFLOW_AI_MAX_CALLS"] == "12"
+    assert envs["PTFLOW_AI_MAX_COST"] == "3.50"
+    assert envs["PTFLOW_AI_REMOTE_SECRETS"] == "redacted"
+    assert envs["PTFLOW_AI_STAGE_REPORT_ENABLED"] == "on"
+    assert envs["PTFLOW_AI_STAGE_REPORT_PROVIDER"] == "openrouter"
+    assert envs["PTFLOW_AI_STAGE_REPORT_MODEL"] == "vendor/model"
+    assert envs["PTFLOW_AI_STAGE_REPORT_MAX_OUTPUT_TOKENS"] == "9000"
+
+
+def test_ai_stage_provider_enum_rejects_unknown():
+    with pytest.raises(runconfig.ConfigError):
+        runconfig.resolve({"ai": {"stages": {"report": {"provider": "anthropic"}}}}, {})

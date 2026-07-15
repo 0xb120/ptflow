@@ -1033,8 +1033,7 @@ def _run(cmd: list[str], *, stdin: str, dest: Path, label: str) -> str:
     except (OSError, subprocess.SubprocessError, tools.AbortedError) as exc:
         log.debug("  · %s failed: %s", label, exc)
         return ""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(out, encoding="utf-8")
+    tools.write_text(dest, out)
     return out
 
 
@@ -1046,8 +1045,7 @@ def _capture(cmd: list[str], *, dest: Path, label: str) -> str:
     except (OSError, subprocess.SubprocessError, tools.AbortedError) as exc:
         log.debug("  · %s failed: %s", label, exc)
         return ""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(out, encoding="utf-8")
+    tools.write_text(dest, out)
     return out
 
 
