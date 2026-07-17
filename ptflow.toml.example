@@ -37,13 +37,13 @@ recrawl = "on"
 # hosts. OFF by default — costs HOURS/host. Turn on only for a deep assessment.
 deep_dive = false
 
-# External breadth port policy. `balanced` keeps the pre-cluster path predictable: the curated ~250
-# web-port pass is followed by naabu top-1000 with a 15-minute wall-clock budget; partial results are
-# preserved when the budget expires. `exhaustive` opts into the former unbounded full-65535 barrier
-# (the deadline is ignored). Every run records the effective coverage in portscan_coverage.json.
+# External breadth port policy. Both modes keep the pre-cluster path predictable: curated ~250 web
+# ports + naabu top-1000 with a 15-minute budget, preserving partial results. `exhaustive` additionally
+# runs full-65535 as a spanning pass and hands only genuinely new web apps to a nested webscan run.
+# Every run records effective/late coverage in portscan_coverage.json.
 [external]
 portscan_mode = "balanced"           # balanced | exhaustive
-portscan_deadline_seconds = 900       # positive integer; balanced extended pass only
+portscan_deadline_seconds = 900       # positive integer; common pre-cluster top-1000 pass
 
 # ── Optional LLM layer ──────────────────────────────────────────────────────
 # Named providers supply their standard base URL. Model is always explicit for reproducibility.

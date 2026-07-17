@@ -215,6 +215,26 @@ def test_select_unique_webapps_prefers_final_named_2xx_and_drops_plaintext_tls_a
     assert tasks.select_unique_webapps(records) == ["https://app.test"]
 
 
+def test_select_incremental_web_targets_drops_known_app_alias_and_dual_scheme_noise():
+    initial = [{
+        "url": "https://10.0.0.5:443", "final_url": "https://app.test/", "status_code": 200,
+        "title": "App", "content_length": 100, "webserver": "nginx",
+        "hash": {"body_sha256": "same-body"},
+    }]
+    late = [{
+        "url": "https://10.0.0.5:8443", "final_url": "https://app.test/", "status_code": 200,
+        "title": "App", "content_length": 100, "webserver": "nginx",
+        "hash": {"body_sha256": "same-body"},
+    }, {
+        "url": "http://10.0.0.5:9000", "status_code": 400, "title": "Plain HTTP error",
+        "content_length": 20, "webserver": "nginx",
+    }, {
+        "url": "https://10.0.0.5:9000", "status_code": 200, "title": "New admin",
+        "content_length": 500, "webserver": "caddy", "hash": {"body_sha256": "new-body"},
+    }]
+    assert tasks.select_incremental_web_targets(late, initial) == ["https://10.0.0.5:9000"]
+
+
 def test_pipeline_object_shape():
     from ptflow.pipelines.external.pipeline import PIPELINE
 
@@ -226,13 +246,13 @@ def test_pipeline_object_shape():
     cluster_scope = [s.name for s in PIPELINE.stages if s.cluster_scope]
     checkpoints = [s.name for s in PIPELINE.stages if s.after_phase is not None]
     app = [s.name for s in PIPELINE.stages if s.per_app]
-    # Policy port scan + service fingerprints are a coverage barrier before cluster. Only the
-    # whole-scope nuclei pass remains spanning over the per-app loops.
+    # The bounded policy scan + service fingerprints form the pre-cluster barrier. Exhaustive mode's
+    # full scan/httpx delta and whole-scope nuclei span the per-app loops.
     assert activity == [
         "provision_wl", "expand", "subdomain_bruteforce", "resolve", "scope_gate", "portscan",
         "portscan_full", "httpx", "nerva",
     ]
-    assert spanning == ["nuclei_scope"]
+    assert spanning == ["portscan_exhaustive", "httpx_late", "nuclei_scope"]
     assert cluster_scope == ["screenshot"]  # batched screenshot, post-cluster ∥ the loops
     assert checkpoints == ["surface_checkpoint"]
     assert app == [
@@ -252,6 +272,10 @@ def test_pipeline_object_shape():
     assert by_name["portscan_full"].needs == ("portscan",)
     assert by_name["nerva"].spanning is False
     assert by_name["nerva"].needs == ("portscan_full",)
+    assert by_name["portscan_exhaustive"].spanning is True
+    assert by_name["portscan_exhaustive"].needs == ("portscan_full",)
+    assert by_name["httpx_late"].spanning is True
+    assert by_name["httpx_late"].needs == ("portscan_exhaustive",)
     # whole-scope nuclei is spanning: starts after httpx, runs ∥ cluster + per-app, joins at fan-in
     assert by_name["nuclei_scope"].spanning is True
     assert by_name["nuclei_scope"].needs == ("httpx",)
@@ -302,7 +326,7 @@ def test_portscan_policy_balanced_is_bounded_and_writes_coverage(monkeypatch, tm
     assert {key: coverage[key] for key in expected} == expected
 
 
-def test_portscan_policy_exhaustive_has_no_deadline(monkeypatch, tmp_path):
+def test_portscan_policy_exhaustive_runs_full_as_separate_unbounded_pass(monkeypatch, tmp_path):
     from ptflow.core.paths import Activity
 
     calls: list[tuple[list[str], dict]] = []
@@ -313,19 +337,32 @@ def test_portscan_policy_exhaustive_has_no_deadline(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tasks.tools, "run", fake_run)
     monkeypatch.setattr(tasks, "PORTSCAN_MODE", "exhaustive")
+    monkeypatch.setattr(tasks, "PORTSCAN_DEADLINE_S", 37)
     act = Activity.named("exhaustive-ports", root=tmp_path).ensure()
     tasks.tools.write_lines(act.asset_discovery_canonical("inscope_ips.txt"), ["10.0.0.2"])
 
     tasks.portscan_full(act)
 
     [(cmd, kwargs)] = calls
+    assert cmd[cmd.index("-top-ports") + 1] == "1000"
+    assert kwargs["timeout"] == 37
+    pending = json.loads(act.asset_discovery_canonical("portscan_coverage.json").read_text())
+    assert pending["status"] == "exhaustive_pending"
+    assert pending["completed"] is False
+
+    calls.clear()
+    tasks.portscan_exhaustive(act)
+
+    [(cmd, kwargs)] = calls
     assert cmd[cmd.index("-top-ports") + 1] == "full"
     assert kwargs["timeout"] is None
     coverage = json.loads(act.asset_discovery_canonical("portscan_coverage.json").read_text())
     assert coverage["mode"] == "exhaustive"
-    assert coverage["extended_requested_ports"] == 65535
-    assert coverage["deadline_seconds"] is None
+    assert coverage["extended_requested_ports"] == 1000
+    assert coverage["exhaustive_requested_ports"] == 65535
+    assert coverage["deadline_seconds"] == 37
     assert coverage["completed"] is True
+    assert coverage["exhaustive_status"] == "completed"
 
 
 def test_portscan_policy_timeout_preserves_partial_results(monkeypatch, tmp_path):
@@ -1484,6 +1521,50 @@ def test_httpx_fingerprint_reads_explicit_urls_and_full_scan_ports(monkeypatch, 
     assert {r["url"] for r in tools.read_jsonl(canon("httpx_full_metadata.jsonl"))} == {
         "http://app.test:3552", "http://10.0.0.5:9999",
     }
+
+
+def test_httpx_late_probes_only_full_scan_delta_and_writes_incremental_scope(
+    monkeypatch, tmp_path,
+):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    calls: list[str] = []
+
+    def fake_run(_cmd, **kwargs):
+        calls.append(kwargs.get("stdin") or "")
+        return "\n".join((
+            json.dumps({
+                "url": "http://10.0.0.5:8443", "status_code": 400,
+                "title": "Plain HTTP error", "content_length": 20, "webserver": "nginx",
+            }),
+            json.dumps({
+                "url": "https://10.0.0.5:8443", "status_code": 200,
+                "title": "Late admin", "content_length": 500, "webserver": "caddy",
+            }),
+        )) + "\n"
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    monkeypatch.setattr(tasks, "PORTSCAN_MODE", "exhaustive")
+    act = Activity.named("late-httpx", root=tmp_path).ensure()
+    canon = act.asset_discovery_canonical
+    tools.write_lines(canon("naabu_web.txt"), ["10.0.0.5:443"])
+    tools.write_lines(canon("naabu_full.txt"), ["10.0.0.5:22", "10.0.0.5:443"])
+    tools.write_lines(canon("naabu_exhaustive.txt"), [
+        "10.0.0.5:22", "10.0.0.5:443", "10.0.0.5:8443",
+    ])
+    tools.write_jsonl(canon("httpx_full_metadata.jsonl"), [])
+
+    tasks.httpx_late(act)
+
+    assert calls == ["10.0.0.5:8443"]
+    assert tools.read_lines(act.base / tasks.LATE_WEB_SCOPE_FILE) == ["https://10.0.0.5:8443"]
+    [late] = tools.read_jsonl(canon("httpx_late_metadata.jsonl"))
+    assert late["url"] == "https://10.0.0.5:8443"
+    coverage = json.loads(canon("portscan_coverage.json").read_text())
+    assert coverage["late_socket_candidates"] == 1
+    assert coverage["incremental_web_targets"] == 1
+    assert coverage["late_followup_ready"] is True
 
 
 def test_auth_headers_reach_remaining_http_target_tools(monkeypatch, tmp_path):
@@ -2716,6 +2797,36 @@ def test_external_pipeline_exposes_consolidate(tmp_path):
     act = Activity.named("demo", root=tmp_path).ensure()
     act.app("app-1").ensure()
     assert PIPELINE.consolidate(act) == {}   # the pipeline hook delegates to tasks.consolidate
+
+
+def test_external_exhaustive_followup_hands_only_ready_late_scope_to_webscan(
+    monkeypatch, tmp_path,
+):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+    from ptflow.pipelines.external.pipeline import PIPELINE
+
+    monkeypatch.setattr(tasks, "PORTSCAN_MODE", "exhaustive")
+    act = Activity.named("late-followup", root=tmp_path).ensure()
+    tools.write_lines(act.base / tasks.LATE_WEB_SCOPE_FILE, ["https://10.0.0.5:8443"])
+    tools.write_text(act.asset_discovery_canonical("portscan_coverage.json"),
+                     json.dumps({"late_followup_ready": True}))
+    tools.write_text(act.base / "coverage.json", json.dumps({"stages": [{
+        "stage": "httpx_late", "app_id": None, "status": "success",
+    }]}))
+
+    [followup] = PIPELINE.followups(act)
+
+    assert followup.pipeline == "webscan"
+    assert followup.activity == tasks.LATE_WEB_ACTIVITY
+    assert followup.scope == str(act.base / tasks.LATE_WEB_SCOPE_FILE)
+
+    tools.write_text(act.base / "coverage.json", json.dumps({"stages": [{
+        "stage": "httpx_late", "app_id": None, "status": "disabled",
+    }]}))
+    assert PIPELINE.followups(act) == []
+    monkeypatch.setattr(tasks, "PORTSCAN_MODE", "balanced")
+    assert PIPELINE.followups(act) == []
 
 
 # --- tech_vulnscan / wpprobe ---

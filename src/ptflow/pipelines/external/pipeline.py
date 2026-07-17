@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from ptflow.core.agent import HypothesisProvider, StubProvider
 from ptflow.core.ai.client import stage_enabled
-from ptflow.core.stage import Stage
+from ptflow.core.stage import Followup, Stage
 from ptflow.pipelines.external import ai, tasks
 
 if TYPE_CHECKING:
@@ -34,12 +34,17 @@ class ExternalPipeline:
         Stage("resolve", tasks.resolve, needs=("subdomain_bruteforce",)),
         Stage("scope_gate", tasks.scope_gate, needs=("resolve",), net=False),  # RoE authorization gate
         Stage("portscan", tasks.portscan, needs=("scope_gate",)),
-        # Policy barrier: balanced (default) adds a deadline-bounded top-1000 pass; exhaustive opt-in
-        # scans all 65535. httpx/nerva then fan out over every socket found before clustering, so the
-        # chosen coverage policy is applied consistently to all per-app loops.
+        # Predictable common barrier: curated web ports + deadline-bounded top-1000. httpx/nerva feed
+        # the main cluster immediately; exhaustive coverage is the spanning incremental tail below.
         Stage("portscan_full", tasks.portscan_full, needs=("portscan",)),
         Stage("httpx", tasks.httpx_fingerprint, needs=("portscan_full",)),
         Stage("nerva", tasks.nerva_fingerprint, needs=("portscan_full",)),
+        # Exhaustive-only tail: the tasks are stable no-ops in balanced mode. The full scan runs ∥
+        # cluster/loops; httpx_late fingerprints only sockets absent from the pre-cluster set and the
+        # CLI hands genuinely new apps to a separate depth-only webscan run after the spanning join.
+        Stage("portscan_exhaustive", tasks.portscan_exhaustive,
+              needs=("portscan_full",), spanning=True),
+        Stage("httpx_late", tasks.httpx_late, needs=("portscan_exhaustive",), spanning=True),
         # whole-scope nuclei — spanning: runs ∥ clustering + all per-app loops, joined at the fan-in
         Stage("nuclei_scope", tasks.nuclei_scope, needs=("httpx",), spanning=True),
         # post-cluster spanning — ONE batched screenshot run (1 host/group) → unified gallery, ∥ loops
@@ -126,6 +131,10 @@ class ExternalPipeline:
         (one file per finding type). The orchestrator calls this if present (the dormant agent seam
         stays in place beside it)."""
         return tasks.consolidate(activity)
+
+    def followups(self, activity: Activity) -> list[Followup]:
+        """Exhaustive mode: depth-scan only the new web apps found by the spanning full-port tail."""
+        return tasks.external_followups(activity)
 
     def provider(self) -> HypothesisProvider:
         return ai.LLMHypothesisProvider() if _AI and stage_enabled("triage") else StubProvider()

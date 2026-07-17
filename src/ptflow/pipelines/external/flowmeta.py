@@ -84,13 +84,9 @@ FLOWMETA: dict[str, StepMeta] = {
         outputs=("honeypots.txt", "naabu_web.txt"),
     ),
     "portscan_full": StepMeta(
-        summary="BREADTH policy-driven sugli IP validi (non-honeypot): balanced DEFAULT = top-1000 "
-                "con deadline 900s e risultati parziali preservati; exhaustive OPT-IN = full 65535 senza "
-                "deadline. Barriera pre-cluster per httpx+nerva.",
-        commands=(
-            "naabu -top-ports 1000 -exclude-cdn -c 50 -rate 1000   # balanced, timeout configurabile",
-            "naabu -top-ports full -exclude-cdn -c 50 -rate 1000   # exhaustive opt-in",
-        ),
+        summary="BREADTH comune a entrambi i modi — top-1000 sugli IP validi con deadline 900s e "
+                "risultati parziali preservati. Barriera prevedibile pre-cluster per httpx+nerva.",
+        commands=("naabu -top-ports 1000 -exclude-cdn -c 50 -rate 1000   # timeout configurabile",),
         outputs=("naabu_full.txt", "portscan_coverage.json"),
         notes=("nome stage/artifact legacy mantenuto per resume; il manifest dichiara la copertura reale",),
     ),
@@ -112,6 +108,23 @@ FLOWMETA: dict[str, StepMeta] = {
         outputs=("nerva_full_metadata.jsonl",),
     ),
     # --- spanning ---
+    "portscan_exhaustive": StepMeta(
+        summary="SPANNING, exhaustive OPT-IN — full scan 65535 mentre cluster e loop principali avanzano. "
+                "Balanced = no-op. Il risultato alimenta solo il delta tardivo.",
+        commands=("naabu -top-ports full -exclude-cdn -c 50 -rate 1000   # nessuna deadline",),
+        outputs=("naabu_exhaustive.txt", "portscan_coverage.json"),
+    ),
+    "httpx_late": StepMeta(
+        summary="SPANNING tail — sottrae le socket pre-cluster dal full scan, identifica HTTP/HTTPS, "
+                "scarta alias di app già analizzate e prepara il follow-up webscan incrementale.",
+        commands=(
+            "comm/full-delta: naabu_exhaustive - union(naabu_web, naabu_full)",
+            "httpx -nf -sc -cl -td -title -hash sha256 -favicon -fr -j",
+            "select_incremental_web_targets → riusa gli stessi edge del cluster principale",
+        ),
+        outputs=("httpx_late_metadata.jsonl", "late_web_targets.txt", "portscan_coverage.json"),
+        notes=("il target del follow-up è l'URL originario in-scope, mai il redirect finale terzo",),
+    ),
     "nuclei_scope": StepMeta(
         summary="Un processo full-template su tutto lo scope deduplicato (subdomains + webapps), un "
                 "solo rate-limit globale — più gentile del per-app sui backend condivisi.",

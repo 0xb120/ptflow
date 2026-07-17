@@ -4,8 +4,9 @@ from ptflow.pipelines import load_pipeline
 from ptflow.pipelines.webscan.pipeline import PIPELINE
 
 # Stages deliberately OMITTED vs external: scope expansion, active network scan, and per-app OSINT.
-_OMITTED = {"expand", "subdomain_bruteforce", "resolve", "portscan", "portscan_full", "nerva", "nuclei_scope",
-            "passive_probe", "subenum", "takeover", "fetch_delta"}
+_OMITTED = {"expand", "subdomain_bruteforce", "resolve", "portscan", "portscan_full",
+            "portscan_exhaustive", "httpx_late", "nerva", "nuclei_scope", "passive_probe", "subenum",
+            "takeover", "fetch_delta"}
 # The web-depth loops webscan keeps (reused from external.tasks unchanged).
 _KEPT_LOOPS = {"crawl", "crawl_headless", "api_spec", "mine_responses", "request_catalog",
                "dast", "xss", "sqli", "cve_lookup", "wordlist", "tech_enum", "content_discovery",

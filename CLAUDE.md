@@ -240,11 +240,13 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                                                            #   under scans/ (subdomains.txt, tls_names.txt,
                                                            #   httpx_full_metadata.jsonl, excluded_cdn.jsonl,
                                                            #   naabu_web.txt [fast/httpx], naabu_full.txt
-                                                           #   [policy pass] + portscan_coverage.json,
+                                                           #   [bounded policy], naabu_exhaustive.txt [spanning],
+                                                           #   httpx_late_metadata.jsonl + portscan_coverage.json,
                                                            #   nerva_full_metadata.jsonl, …)
                                                            #   scope_gate: inscope_{subdomains,tls_names,ips,
                                                            #   domain_ip_map}.txt (RoE-authorized set the active
                                                            #   stages read) + excluded_out_of_scope.jsonl (audit)
+  late_web_targets.txt                  # exhaustive-only delta handed to nested late_web_recon/
   .state/  <stage>.done  scope.sha  config.sha   # --resume markers; invalidated on scope/config change
   scans/                                 # ONLY per-app group workspaces (no special-cased breadth dir)
     <app_id>/                            # one clustered app group (per-app loops)
@@ -381,11 +383,13 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     authorized `inscope_*` set before any active scan; see the scope-gate note in "External design
     decisions" below) → `portscan`
     (FAST: ~250 curated web ports `WEB_PORTS` → honeypot filter → `naabu_web.txt`) → `portscan_full`
-    (legacy stage name; policy barrier: `balanced` DEFAULT scans naabu top-1000 under a 900s deadline
-    and preserves partial output, `exhaustive` OPT-IN scans all 65535 without a deadline; actual status in
-    `portscan_coverage.json`) → `httpx` ∥ `nerva` → `cluster` fan-out. The barrier is deliberate: every
-    socket found under the selected coverage policy reaches fingerprinting and the per-app loops. Plus
-    `nuclei_scope` —
+    (legacy name; COMMON bounded top-1000 barrier, 900s deadline, partial output preserved) → `httpx` ∥
+    `nerva` → `cluster` fan-out. In `exhaustive` mode, `portscan_exhaustive` (full 65535) → `httpx_late`
+    runs as a **spanning chain** ∥ cluster + main loops; it subtracts the pre-cluster socket set, drops
+    aliases using the main cluster's identity edges, and writes `late_web_targets.txt`. After the spanning
+    join the CLI automatically composes a nested depth-only `webscan` activity `late_web_recon/` for those
+    genuinely new apps. Balanced mode makes both tail stages stable no-ops. Actual coverage/status lives in
+    `portscan_coverage.json`. Plus `nuclei_scope` —
     another **spanning** whole-scope full-template nuclei scan (one process, one global `-rl` over
     deduped subdomains + webapps) launched after `httpx`, running ∥ everything, joined at the fan-in
     (`findings/nuclei_scope.jsonl`). Template updates are explicit/out-of-band (`nuclei -ut` before the
@@ -520,8 +524,8 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
   (a future `PTFLOW_CREDS`) are deliberately **opt-in, not yet wired**. `internal` ships its own flow map
   (`pipelines/internal/flowmeta.py` → `docs/internal-pipeline-*`), like every non-stub pipeline.
 - **`webscan`** — external's web-DEPTH loops over a **PRE-AGGREGATED web target list** (`pipelines/webscan/
-  pipeline.py`). This is the "dedicated external profile" the `internal` hand-off targets: given a list of
-  known web services (`scheme://host[:port]`, e.g. an internal run's `web_targets.txt`), it runs external's
+  pipeline.py`). It is the shared composition target for `internal`'s aggregated services and external
+  exhaustive mode's late full-scan delta. Given known web services (`scheme://host[:port]`), it runs external's
   crawl → catalog → DAST → fuzz depth, **skipping** scope EXPANSION (`expand`/`resolve` — subdomain/DNS/
   TLS/OSINT), active NETWORK scan (`portscan`/`portscan_full`/`nerva`/`nuclei_scope`), and per-app OSINT
   (`passive_probe`/`subenum`/`takeover`/`fetch_delta` — gau/urlfinder/subfinder/DNS). **It REUSES external's
@@ -530,10 +534,9 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
   port is honoured, → the same `httpx_full_metadata.jsonl` `cluster()`/the loops consume) and the stage
   graph is curated (its own `Stage` objects wrap external's functions with rewired `needs`). Dropped stages'
   artifacts are simply absent; external's **tolerant reads** (`read_lines`/`read_jsonl` → `[]`) degrade the
-  depth loops cleanly. **external itself is untouched** (no mode-conditionals sprinkled through it — a
-  sibling pipeline was chosen over an external mode flag precisely to keep the proven external DAG pristine and
-  match the pluggable-pipeline model). *Design decisions:* (1) sibling pipeline, NOT an external mode — one
-  place holds the web-mode composition, external stays single-purpose; (2) `-nfs` here (honour input scheme)
+  depth loops cleanly. The sibling pipeline keeps the depth graph single-purpose; parent pipelines only
+  produce an on-disk scope and a `Followup`. *Design decisions:* (1) sibling pipeline, NOT duplicated loops —
+  one place holds web-depth composition; (2) `-nfs` here (honour input scheme)
   is correct where every target carries an explicit scheme+port, the inverse of external discovery's
   https-default (external design note); (3) largely EGRESS-FREE with OSINT gone, but two external internals
   still call out — `content_discovery`'s trufflehog `--results=verified` validates hits against the
@@ -999,7 +1002,8 @@ flow changed:
   (50 vs 150) and feroxbuster `-t`/`-L`, for a domestic line. Aggregate load ≈ concurrency × rate,
   so the per-tool rate is the real lever (a `net` concurrency cap alone won't tame the single
   port-policy/nuclei stages). External's separate `PTFLOW_EXTERNAL_PORTSCAN_MODE=balanced|exhaustive`
-  controls breadth coverage; balanced's deadline defaults to 900s. The active profile is logged at run
+  controls breadth coverage: both share the 900s pre-cluster top-1000 budget; exhaustive additionally
+  launches the unbounded full scan as a spanning incremental tail. The active profile is logged at run
   start (preflight).
 - **AI layer (opt-in, `--ai` / `PTFLOW_AI=on` / `[ai].enabled=true`)** — adds four best-effort LLM
   functions via a **provider-agnostic** `core/ai/` seam (`LLMClient` Protocol + `make_client()`).

@@ -181,8 +181,8 @@ expert defaults in the code; `profile` is the bundle for the rate-sensitive ones
 |----------|------------------|--------------|
 | `PTFLOW_PROFILE` | `wide` (default) · `home` | Rate profile. `wide` = full bandwidth; `home` throttles the heavy hitters (naabu `-rate` 300 vs 1000, nuclei `-rl` 50 vs 150, feroxbuster `-t`/`-L`) to spare a domestic line/router. The active profile is logged at run start. |
 | `PTFLOW_NET_LIMIT` | integer · default `10` (or `4` when `PTFLOW_PROFILE=home`) | Global cap on concurrent **network** stages (per-app *and* spanning), so the aggregate uplink load stays bounded. In-process, no Prefect server needed. |
-| `PTFLOW_EXTERNAL_PORTSCAN_MODE` | `balanced` (default) · `exhaustive` | External pipeline pre-cluster port policy. `balanced` combines the curated ~250 web-port pass with naabu top-1000; `exhaustive` opts into the unbounded full-65535 pass. Both feed `httpx`/`nerva` before clustering. |
-| `PTFLOW_EXTERNAL_PORTSCAN_DEADLINE_SECONDS` | positive integer · default `900` | Hard wall-clock budget for the balanced top-1000 pass. Partial open-port results are preserved on timeout and the actual status is written to `asset_discovery/canonical/portscan_coverage.json`. Ignored in exhaustive mode. |
+| `PTFLOW_EXTERNAL_PORTSCAN_MODE` | `balanced` (default) · `exhaustive` | Both modes start with curated ~250 web ports + a bounded top-1000 barrier. `exhaustive` additionally runs full-65535 as a spanning pass, fingerprints only late sockets and automatically hands genuinely new web apps to a nested `webscan` activity. |
+| `PTFLOW_EXTERNAL_PORTSCAN_DEADLINE_SECONDS` | positive integer · default `900` | Hard wall-clock budget for the common pre-cluster top-1000 pass. Partial results are preserved on timeout and status is written to `asset_discovery/canonical/portscan_coverage.json`. The exhaustive spanning pass remains unbounded. |
 
 ### Auth & crawl behavior
 

@@ -45,6 +45,7 @@ from ptflow.core import dast as dastconfig
 from ptflow.core import reporting, scope, telemetry, tools, workspace
 from ptflow.core.log import get_logger, is_verbose
 from ptflow.core.requirements import Requirement, check
+from ptflow.core.stage import Followup
 from ptflow.pipelines.external import wordlists
 
 if TYPE_CHECKING:
@@ -109,6 +110,8 @@ if PORTSCAN_MODE not in {"balanced", "exhaustive"}:  # direct env bypassing runc
     PORTSCAN_MODE = "balanced"
 PORTSCAN_BALANCED_TOP_PORTS = "1000"  # naabu natively supports only 100, 1000, or full
 PORTSCAN_DEADLINE_S = _positive_int_env("PTFLOW_EXTERNAL_PORTSCAN_DEADLINE_SECONDS", 900)
+LATE_WEB_SCOPE_FILE = "late_web_targets.txt"
+LATE_WEB_ACTIVITY = "late_web_recon"
 HONEYPOT_MIN_OPEN_PORTS = 15      # >= this many open ports => suspected honeypot
 RESOLVERS = "/opt/resolvers/resolvers-trusted.txt"
 SHUFFLEDNS_CONC = PROFILE.shuffledns_conc
@@ -118,8 +121,8 @@ SHUFFLEDNS_RETRIES = "2"
 # ports: union of aquatone-xlarge, hosting-panels, 8xxx alt-HTTP, app/dev servers, data/ops UIs,
 # containers, IoT/devices, proxies. NOT nmap's generic top-1k - so httpx sees web apps on uncommon
 # ports (5601/8161/9200/7001/...) that top-1k misses, while staying fast. Non-web ports (SSH/DB/SMB/
-# RDP) are deliberately absent. The policy-driven pre-cluster pass then supplies either naabu's
-# top-1000 general ports (balanced, bounded default) or all 65535 (exhaustive opt-in) to httpx/nerva.
+# RDP) are deliberately absent. The bounded pre-cluster pass adds naabu's top-1000 general ports.
+# Exhaustive mode additionally runs all 65535 as a spanning pass and hands only new web apps to webscan.
 WEB_PORTS = (
     "80,81,82,83,84,85,86,87,88,89,90,280,300,443,591,593,631,777,832,880,888,981,1010,"
     "1024,1080,1311,2052,2053,2080,2082,2083,2086,2087,2095,2096,2222,2375,2376,2379,2380,"
@@ -771,6 +774,32 @@ def select_unique_webapps(httpx_records: list[dict]) -> list[str]:
         buckets[key].append(record)
     selected = [_terminal_url(min(buckets[key], key=_httpx_record_rank)) for key in order]
     return tools.dedupe(selected)
+
+
+def select_incremental_web_targets(late_records: Iterable[dict],
+                                   initial_records: Iterable[dict]) -> list[str]:
+    """Original URLs for late HTTP services that do not belong to an already-scanned app.
+
+    Alias detection deliberately reuses the main cluster's identity edges (socket, redirect-final
+    origin, body hash, apex-scoped favicon/signature). We retain the record's original in-scope URL,
+    not a possibly third-party redirect destination, as the follow-up authorization boundary.
+    """
+    known: dict[str, set[object]] = {edge: set() for edge in _CLUSTER_EDGES}
+    for record in initial_records:
+        signals = _cluster_signals(record)
+        for edge in _CLUSTER_EDGES:
+            if signals[edge] is not None:
+                known[edge].add(signals[edge])
+    targets: list[str] = []
+    for record in select_httpx_services(late_records):
+        signals = _cluster_signals(record)
+        if any(signals[edge] is not None and signals[edge] in known[edge]
+               for edge in _CLUSTER_EDGES):
+            continue
+        url = str(record.get("url") or "")
+        if url.startswith(("http://", "https://")):
+            targets.append(url)
+    return tools.dedupe(targets)
 
 
 def url_host(url: str) -> str:
@@ -2268,9 +2297,9 @@ def portscan(activity: Activity) -> None:
 
     Scans the curated ~250 HTTP(S)-bearing ports (WEB_PORTS), NOT nmap's generic top-1k — so httpx
     sees web apps on uncommon ports (5601/8161/9200/7001/…) that top-1k would miss, while staying
-    fast. A policy-driven scan follows this cheap pass and remains behind the pre-cluster barrier:
-    balanced mode adds naabu's top-1000 under a wall-clock budget; exhaustive mode scans all 65535.
-    Every socket found before that barrier is therefore available to httpx/nerva and application grouping.
+    fast. A bounded top-1000 scan follows this cheap pass and remains behind the pre-cluster barrier.
+    Every socket found before that barrier is available to httpx/nerva and application grouping; in
+    exhaustive mode the full-65535 delta runs later as a spanning follow-up source.
     The naabu stdout is provenance (raw/naabu/), consumed in memory by
     honeypot_split/select_web_ports."""
     canon = activity.asset_discovery_canonical
@@ -2285,45 +2314,93 @@ def portscan(activity: Activity) -> None:
     tools.write_lines(canon("naabu_web.txt"), select_web_ports(scanned, valid_ips))
 
 
-def portscan_full(activity: Activity) -> None:
-    """Policy-driven pre-cluster port scan → legacy-compatible ``naabu_full.txt``.
+def _portscan_coverage(activity: Activity) -> dict[str, Any]:
+    path = activity.asset_discovery_canonical("portscan_coverage.json")
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
-    ``balanced`` (default) scans naabu's top-1000 general ports with a configurable hard deadline and
-    preserves partial stdout on timeout. ``exhaustive`` is opt-in and retains the former unbounded
-    full-65535 behavior. The stage/artifact names stay stable for resume and existing workspaces;
-    ``portscan_coverage.json`` records the actual policy and completion state without ambiguity.
+
+def _write_portscan_coverage(activity: Activity, manifest: Mapping[str, Any]) -> None:
+    tools.write_text(activity.asset_discovery_canonical("portscan_coverage.json"),
+                     json.dumps(dict(manifest), indent=2, sort_keys=True) + "\n")
+
+
+def portscan_full(activity: Activity) -> None:
+    """Bounded pre-cluster top-1000 scan → legacy-compatible ``naabu_full.txt``.
+
+    Both modes use this fast barrier so the main application loops start predictably. ``exhaustive``
+    adds a separate full-65535 spanning pass whose new web apps are scanned by a later ``webscan``
+    follow-up. The legacy stage/artifact names stay stable for resume and existing workspaces.
     """
     canon = activity.asset_discovery_canonical
     honeypots = set(tools.read_lines(canon("honeypots.txt")))
     valid = [ip for ip in tools.read_lines(canon("inscope_ips.txt")) if ip not in honeypots]
-    exhaustive = PORTSCAN_MODE == "exhaustive"
-    top_ports = "full" if exhaustive else PORTSCAN_BALANCED_TOP_PORTS
-    requested_ports = 65535 if exhaustive else int(PORTSCAN_BALANCED_TOP_PORTS)
-    deadline = None if exhaustive else PORTSCAN_DEADLINE_S
     out, status, duration = _run_policy_scan(
-        ["naabu", "-silent", "-top-ports", top_ports, "-exclude-cdn",
+        ["naabu", "-silent", "-top-ports", PORTSCAN_BALANCED_TOP_PORTS, "-exclude-cdn",
          "-c", NAABU_CONC, "-rate", NAABU_RATE],
-        stdin="\n".join(valid), dest=canon("naabu_full.txt"), timeout=deadline,
+        stdin="\n".join(valid), dest=canon("naabu_full.txt"), timeout=PORTSCAN_DEADLINE_S,
     )
+    complete = status in {"completed", "no_targets"}
     manifest = {
         "mode": PORTSCAN_MODE,
-        "status": status,
-        "completed": status in {"completed", "no_targets"},
+        "status": "exhaustive_pending" if PORTSCAN_MODE == "exhaustive" else status,
+        "completed": complete and PORTSCAN_MODE == "balanced",
         "timed_out": status == "timed_out",
-        "deadline_seconds": deadline,
+        "deadline_seconds": PORTSCAN_DEADLINE_S,
         "input_ips": len(valid),
         "excluded_honeypot_ips": len(honeypots),
         "curated_web_ports": len(WEB_PORTS.split(",")),
-        "extended_port_selection": f"top-{top_ports}" if top_ports != "full" else "full",
-        "extended_requested_ports": requested_ports,
+        "extended_port_selection": f"top-{PORTSCAN_BALANCED_TOP_PORTS}",
+        "extended_requested_ports": int(PORTSCAN_BALANCED_TOP_PORTS),
         "curated_web_open_sockets": len(tools.read_lines(canon("naabu_web.txt"))),
         "extended_open_sockets": len(_lines(out)),
         "duration_seconds": round(duration, 3),
+        "precluster_status": status,
+        "exhaustive_status": "pending" if PORTSCAN_MODE == "exhaustive" else "not_requested",
+        "late_followup_ready": False,
     }
-    tools.write_text(canon("portscan_coverage.json"),
-                     json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    _write_portscan_coverage(activity, manifest)
     log.info("  → portscan coverage — mode=%s status=%s sockets=%d → portscan_coverage.json",
              PORTSCAN_MODE, status, len(_lines(out)))
+
+
+def portscan_exhaustive(activity: Activity) -> None:
+    """SPANNING opt-in full-65535 scan; never serializes the main cluster/application loops."""
+    canon = activity.asset_discovery_canonical
+    dest = canon("naabu_exhaustive.txt")
+    # This stage always exists in the DAG so the flow map is stable. Balanced runs clear any prior
+    # exhaustive artifact and finish as a cheap no-op.
+    if PORTSCAN_MODE != "exhaustive":
+        tools.write_text(dest, "")
+        manifest = _portscan_coverage(activity)
+        manifest.update({"status": manifest.get("precluster_status", "completed"),
+                         "completed": manifest.get("precluster_status") in {"completed", "no_targets"},
+                         "exhaustive_status": "not_requested", "late_followup_ready": False})
+        _write_portscan_coverage(activity, manifest)
+        return
+    honeypots = set(tools.read_lines(canon("honeypots.txt")))
+    valid = [ip for ip in tools.read_lines(canon("inscope_ips.txt")) if ip not in honeypots]
+    out, status, duration = _run_policy_scan(
+        ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn",
+         "-c", NAABU_CONC, "-rate", NAABU_RATE],
+        stdin="\n".join(valid), dest=dest, timeout=None,
+    )
+    manifest = _portscan_coverage(activity)
+    manifest.update({
+        "status": status,
+        "completed": status in {"completed", "no_targets"},
+        "exhaustive_status": status,
+        "exhaustive_requested_ports": 65535,
+        "exhaustive_open_sockets": len(_lines(out)),
+        "exhaustive_duration_seconds": round(duration, 3),
+        "late_followup_ready": False,
+    })
+    _write_portscan_coverage(activity, manifest)
 
 
 def httpx_fingerprint(activity: Activity) -> None:
@@ -2380,6 +2457,54 @@ def httpx_fingerprint(activity: Activity) -> None:
         log.info("  → scope: excluded %d raw-IP CDN/cloud target(s) (hostnames kept) → excluded_cdn.jsonl",
                  len(dropped))
     tools.write_lines(canon("unique_webapps.txt"), select_unique_webapps(kept))
+
+
+def httpx_late(activity: Activity) -> None:
+    """SPANNING tail — fingerprint only full-scan sockets absent from the pre-cluster set.
+
+    The output scope contains only services whose cluster identity does not overlap an app already
+    scanned by the main run. It is consumed after the spanning join by an external → webscan Followup.
+    """
+    canon = activity.asset_discovery_canonical
+    scope_path = activity.base / LATE_WEB_SCOPE_FILE
+    metadata_path = canon("httpx_late_metadata.jsonl")
+    raw_path = activity.asset_discovery_raw("httpx") / "late.jsonl"
+    # Clear stale outputs before every execution (including balanced no-op and empty-delta cases).
+    tools.write_lines(scope_path, [])
+    tools.write_jsonl(metadata_path, [])
+    tools.write_text(raw_path, "")
+    if PORTSCAN_MODE != "exhaustive":
+        manifest = _portscan_coverage(activity)
+        manifest["late_followup_ready"] = False
+        _write_portscan_coverage(activity, manifest)
+        return
+    initial_sockets = set(tools.read_lines(canon("naabu_web.txt")))
+    initial_sockets.update(tools.read_lines(canon("naabu_full.txt")))
+    delta = [socket for socket in tools.read_lines(canon("naabu_exhaustive.txt"))
+             if socket not in initial_sockets]
+    out = _run(
+        "httpx",
+        [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
+         "-favicon", "-location", "-fr", "-irh", "-nf", "-j"],
+        stdin="\n".join(delta), dest=raw_path, label="late-full-scan-delta",
+    )
+    services = select_httpx_services(_jsonl_str(out))
+    tools.write_jsonl(metadata_path, services)
+    targets = select_incremental_web_targets(
+        services, tools.read_jsonl(canon("httpx_full_metadata.jsonl")),
+    )
+    tools.write_lines(scope_path, targets)
+    manifest = _portscan_coverage(activity)
+    manifest.update({
+        "late_socket_candidates": len(delta),
+        "late_http_services": len(services),
+        "late_aliases_dropped": max(0, len(services) - len(targets)),
+        "incremental_web_targets": len(targets),
+        "late_followup_ready": True,
+    })
+    _write_portscan_coverage(activity, manifest)
+    log.info("  → late web delta — %d socket(s), %d HTTP service(s), %d new target(s) → %s",
+             len(delta), len(services), len(targets), LATE_WEB_SCOPE_FILE)
 
 
 def ingest_httpx(activity: Activity) -> None:
@@ -6461,3 +6586,38 @@ def consolidate(activity: Activity) -> dict[str, int]:
     log.info("  → consolidate — %s",
              ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "no per-app findings")
     return counts
+
+
+def _latest_stage_completed(activity: Activity, stage_name: str) -> bool:
+    """Whether the latest finalized run completed or legitimately resume-skipped an activity stage."""
+    path = activity.base / "coverage.json"
+    if not path.exists():
+        return False
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return any(
+        record.get("stage") == stage_name
+        and record.get("app_id") is None
+        and record.get("status") in {"success", "resume-skipped"}
+        for record in manifest.get("stages", [])
+        if isinstance(record, dict)
+    )
+
+
+def external_followups(activity: Activity) -> list[Followup]:
+    """Hand exhaustive-only, genuinely new web apps to a separate depth-only webscan run."""
+    if PORTSCAN_MODE != "exhaustive" or not _latest_stage_completed(activity, "httpx_late"):
+        return []
+    coverage = _portscan_coverage(activity)
+    if not coverage.get("late_followup_ready"):
+        return []
+    scope_file = activity.base / LATE_WEB_SCOPE_FILE
+    targets = tools.read_lines(scope_file)
+    if not targets:
+        log.info("  · exhaustive scan found no incremental web app — no late follow-up")
+        return []
+    log.info("  → late web hand-off: webscan on %d new target(s) → %s/",
+             len(targets), LATE_WEB_ACTIVITY)
+    return [Followup(pipeline="webscan", activity=LATE_WEB_ACTIVITY, scope=str(scope_file))]
