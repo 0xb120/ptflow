@@ -10,10 +10,11 @@ info:
     verified: true
   tags: ptflow,dast,sqli,stable,fuzzing-req-body
 
-flow: (http(1) && http(2) && http(3)) || (http(4) && http(5) && http(6))
+flow: (http("quoted_true_a") && http("quoted_true_b") && http("quoted_false")) || (http("numeric_true_a") && http("numeric_true_b") && http("numeric_false"))
 
 http:
   -
+    id: quoted_true_a
     pre-condition:
       - type: dsl
         dsl:
@@ -33,6 +34,7 @@ http:
         internal: true
 
   -
+    id: quoted_true_b
     fuzzing:
       - part: body
         mode: single
@@ -43,12 +45,13 @@ http:
     matchers:
       - type: dsl
         dsl:
-          - 'http_2_status_code == http_1_status_code'
-          - 'len(http_2_body) >= len(http_1_body) - 64 && len(http_2_body) <= len(http_1_body) + 64'
+          - 'quoted_true_b_status_code == quoted_true_a_status_code'
+          - 'len(quoted_true_b_body) >= len(quoted_true_a_body) - 64 && len(quoted_true_b_body) <= len(quoted_true_a_body) + 64'
         condition: and
         internal: true
 
   -
+    id: quoted_false
     fuzzing:
       - part: body
         mode: single
@@ -59,11 +62,12 @@ http:
     matchers:
       - type: dsl
         dsl:
-          - 'http_3_status_code == http_1_status_code'
-          - '(len(http_1_body) > len(http_3_body) && len(http_1_body) - len(http_3_body) >= 256 && (len(http_1_body) - len(http_3_body)) * 100 >= len(http_1_body) * 10) || (len(http_3_body) > len(http_1_body) && len(http_3_body) - len(http_1_body) >= 256 && (len(http_3_body) - len(http_1_body)) * 100 >= len(http_1_body) * 10)'
+          - 'quoted_false_status_code == quoted_true_a_status_code'
+          - '(len(quoted_true_a_body) > len(quoted_false_body) && len(quoted_true_a_body) - len(quoted_false_body) >= 256 && (len(quoted_true_a_body) - len(quoted_false_body)) * 100 >= len(quoted_true_a_body) * 10) || (len(quoted_false_body) > len(quoted_true_a_body) && len(quoted_false_body) - len(quoted_true_a_body) >= 256 && (len(quoted_false_body) - len(quoted_true_a_body)) * 100 >= len(quoted_true_a_body) * 10)'
         condition: and
 
   -
+    id: numeric_true_a
     pre-condition:
       - type: dsl
         dsl:
@@ -83,6 +87,7 @@ http:
         internal: true
 
   -
+    id: numeric_true_b
     fuzzing:
       - part: body
         mode: single
@@ -93,12 +98,13 @@ http:
     matchers:
       - type: dsl
         dsl:
-          - 'http_5_status_code == http_4_status_code'
-          - 'len(http_5_body) >= len(http_4_body) - 64 && len(http_5_body) <= len(http_4_body) + 64'
+          - 'numeric_true_b_status_code == numeric_true_a_status_code'
+          - 'len(numeric_true_b_body) >= len(numeric_true_a_body) - 64 && len(numeric_true_b_body) <= len(numeric_true_a_body) + 64'
         condition: and
         internal: true
 
   -
+    id: numeric_false
     fuzzing:
       - part: body
         mode: single
@@ -109,6 +115,6 @@ http:
     matchers:
       - type: dsl
         dsl:
-          - 'http_6_status_code == http_4_status_code'
-          - '(len(http_4_body) > len(http_6_body) && len(http_4_body) - len(http_6_body) >= 256 && (len(http_4_body) - len(http_6_body)) * 100 >= len(http_4_body) * 10) || (len(http_6_body) > len(http_4_body) && len(http_6_body) - len(http_4_body) >= 256 && (len(http_6_body) - len(http_4_body)) * 100 >= len(http_4_body) * 10)'
+          - 'numeric_false_status_code == numeric_true_a_status_code'
+          - '(len(numeric_true_a_body) > len(numeric_false_body) && len(numeric_true_a_body) - len(numeric_false_body) >= 256 && (len(numeric_true_a_body) - len(numeric_false_body)) * 100 >= len(numeric_true_a_body) * 10) || (len(numeric_false_body) > len(numeric_true_a_body) && len(numeric_false_body) - len(numeric_true_a_body) >= 256 && (len(numeric_false_body) - len(numeric_true_a_body)) * 100 >= len(numeric_true_a_body) * 10)'
         condition: and
