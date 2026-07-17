@@ -104,6 +104,55 @@ org installer is `/opt/custom-tools/org/install-offsec-tools.sh`). Prints a grou
 optional tools/datasets are warnings → exit `0`). It shares the `requirements()` manifest with the
 run-time `preflight` summary, so the two never disagree. Honours `PTFLOW_*` path overrides.
 
+### Install the CLI for the current user
+
+The project already publishes the `ptflow` console entry point. Install it once with uv to make
+`ptflow` available from any directory, without prefixing every command with `uv run`:
+
+```bash
+cd /path/to/ptflow
+uv tool install --editable .
+ptflow --help
+```
+
+The editable install is recommended for a development checkout: Python source changes are picked up
+without reinstalling the tool. Re-run the install after changing project metadata or dependencies.
+Use `uv tool install .` instead when you want an independent snapshot of the current checkout.
+
+If uv reports that its executable directory is not on `PATH`, run `uv tool update-shell` and restart
+the shell. This installs only the Python CLI and its Python dependencies; binaries and datasets used
+by the real pipelines still need to be provisioned separately and can be checked with `ptflow doctor`.
+
+### Configuration files and locations
+
+`ptflow` currently loads a TOML file **only** when it is passed explicitly with `--config`; it does
+not auto-discover `ptflow.toml` in the current directory or a user-level config under `~/.config`.
+The recommended location convention is:
+
+| Location | Intended use |
+|----------|--------------|
+| `~/.config/ptflow/config.toml` (or `$XDG_CONFIG_HOME/ptflow/config.toml`) | Personal defaults shared by runs. Pass it explicitly with `--config`. |
+| `./ptflow.toml` | Settings specific to the current engagement or project. |
+| `<activity>/config.toml` | Auto-generated snapshot of the effective settings used by that run. |
+
+For example, a globally installed CLI can use personal defaults from any working directory:
+
+```bash
+ptflow run external audit /path/to/scope.txt \
+  --root /path/to/output \
+  --config ~/.config/ptflow/config.toml
+```
+
+Configuration precedence is `--set` > `PTFLOW_*` environment variables > `--config` file > code
+defaults. `~` is expanded in both the `--config` filename and path-valued settings. Relative paths,
+including `./ptflow.toml`, the scope file, and relative paths stored in TOML, are interpreted from the
+directory where `ptflow` is invoked—not from the package checkout or the TOML file's directory. Use
+absolute paths or `~` for shared configuration, tool, dataset, and wordlist paths.
+
+After a run, the effective non-default configuration is written to `<activity>/config.toml` for
+reproducibility. It can be fed back through `--config`; secret values such as HTTP headers and
+Interactsh tokens are stored as `<redacted>` and must be restored before reuse.
+
 ### Install & dev gate
 
 ```bash
