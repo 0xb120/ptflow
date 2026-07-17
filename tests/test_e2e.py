@@ -101,6 +101,7 @@ def test_cli_observe_forwards_api_url_to_orchestrate(tmp_path, monkeypatch):
     rc = main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path), "--observe"])
     assert rc == 0
     assert captured["observe"] == "http://127.0.0.1:4200/api"  # default local server, forwarded through
+    assert len(captured["config_fingerprint"]) == 64
 
     captured.clear()
     main(["run", "example", "acme", str(scope_file), "--root", str(tmp_path)])

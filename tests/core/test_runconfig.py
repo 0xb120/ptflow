@@ -114,6 +114,20 @@ def test_snapshot_none_when_empty(tmp_path):
     assert runconfig.snapshot(tmp_path, []) is None
 
 
+def test_resume_fingerprint_is_stable_and_sensitive_without_exposing_secrets():
+    resolved = runconfig.resolve(
+        {"profile": "home", "http_header": ["Authorization: Bearer secret"]}, {}, None)
+    same = list(reversed(resolved))
+    first = runconfig.resume_fingerprint("external", resolved, {"dast", "xss"})
+    assert first == runconfig.resume_fingerprint("external", same, {"xss", "dast"})
+    assert first != runconfig.resume_fingerprint("external", resolved, {"dast"})
+    assert first != runconfig.resume_fingerprint("webscan", resolved, {"dast", "xss"})
+    changed = runconfig.resolve(
+        {"profile": "home", "http_header": ["Authorization: Bearer different"]}, {}, None)
+    assert first != runconfig.resume_fingerprint("external", changed, {"dast", "xss"})
+    assert "secret" not in first
+
+
 def test_ai_flag_resolves_to_env():
     resolved = runconfig.resolve({}, {}, ["ai=on", "ai.model=claude-opus-4-8"])
     envs = {r.env: r.value for r in resolved}

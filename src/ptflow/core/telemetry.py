@@ -313,6 +313,7 @@ def begin_run(  # noqa: PLR0913
     disabled: Sequence[str],
     fanout: int,
     net_limit: int,
+    config_fingerprint: str | None = None,
 ) -> RunTrace:
     run_id = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
     started = _now()
@@ -322,6 +323,7 @@ def begin_run(  # noqa: PLR0913
         "pipeline": pipeline.name,
         "activity": activity.base.name,
         "scope_sha256": hashlib.sha256(scope_text.encode()).hexdigest(),
+        "config_sha256": config_fingerprint,
         "started_at": started,
         "finished_at": None,
         "status": "running",

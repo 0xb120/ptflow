@@ -167,6 +167,16 @@ def _marker(activity: Activity, stage_name: str, app_id: str | None) -> Path:
     return base / f"{stage_name}.done"
 
 
+def _clear_resume_markers(activity: Activity) -> int:
+    """Delete stale completion markers before a full rerun; keep hashes and all scan artifacts."""
+    markers = [*activity.state.glob("*.done")]
+    for app in activity.list_apps():
+        markers.extend(app.state.glob("*.done"))
+    for marker in markers:
+        marker.unlink(missing_ok=True)
+    return len(markers)
+
+
 @task(tags=["net"])
 def _run_stage(  # noqa: PLR0913
     pipeline_name: str,
@@ -383,17 +393,40 @@ def _run_dag(  # noqa: PLR0913
     return tuple(failures)
 
 
-def _resume_ok(activity: Activity, scope_text: str, *, resume: bool) -> bool:
-    """Honour --resume only if the scope is UNCHANGED. The current scope hash is recorded under
-    .state/scope.sha; if a prior run's hash differs, the stage markers are stale → ignore them
-    (full rerun) and warn, so resuming never silently reuses results computed for a different scope."""
+def _resume_ok(activity: Activity, scope_text: str, *, resume: bool,
+               config_fingerprint: str | None = None) -> bool:
+    """Honour ``--resume`` only when scope and effective run configuration are unchanged.
+
+    Hashes live under ``.state/{scope,config}.sha``. A pre-fingerprint workspace that already has a
+    scope hash is invalidated once, then migrated by writing ``config.sha``. Callers that do not supply
+    a fingerprint retain the historical scope-only behavior for library compatibility.
+    """
     sha = hashlib.sha256(scope_text.encode()).hexdigest()
     sha_file = activity.state / "scope.sha"
-    if resume and sha_file.exists() and sha_file.read_text(encoding="utf-8", errors="replace").strip() != sha:
+    config_file = activity.state / "config.sha"
+    prior_run = sha_file.exists()
+    if resume and prior_run and sha_file.read_text(
+            encoding="utf-8", errors="replace").strip() != sha:
         log.warning("⚠ resume: scope changed since last run — ignoring stage markers (full rerun)")
         resume = False
+    elif resume and prior_run and config_fingerprint is not None:
+        if not config_file.exists():
+            log.warning("⚠ resume: prior run predates config fingerprints — ignoring stage markers "
+                        "once (full rerun)")
+            resume = False
+        elif config_file.read_text(
+                encoding="utf-8", errors="replace").strip() != config_fingerprint:
+            log.warning("⚠ resume: effective configuration changed since last run — ignoring stage "
+                        "markers (full rerun)")
+            resume = False
     activity.state.mkdir(parents=True, exist_ok=True)
     sha_file.write_text(sha, encoding="utf-8")
+    if config_fingerprint is not None:
+        config_file.write_text(config_fingerprint, encoding="utf-8")
+    if not resume:
+        cleared = _clear_resume_markers(activity)
+        if cleared:
+            log.info("  → resume: cleared %d stale completion marker(s) before full rerun", cleared)
     return resume
 
 
@@ -418,11 +451,13 @@ def orchestrate(  # noqa: PLR0913
     resume: bool = False,
     observe: str | None = None,
     disabled_steps: frozenset[str] = frozenset(),
+    config_fingerprint: str | None = None,
 ) -> tuple[Path, int]:
     """Run the full pipeline for one activity. Returns (activity base dir, stage-failure count);
     the count is 0 on a clean run and >0 when one or more stages failed (the CLI maps it to its
     exit code). With `resume`, stages that completed cleanly in a prior run of this activity are
-    skipped (only failed/incomplete ones rerun) — auto-invalidated if scope.txt changed. With
+    skipped (only failed/incomplete ones rerun) — auto-invalidated if scope or the supplied effective
+    configuration fingerprint changed. With
     `observe` (a Prefect API URL), the run streams to that server's UI (run graph, states, timings,
     logs) instead of spinning a throwaway ephemeral server — pure telemetry, the pipeline is
     unchanged. temporary_settings applies the redirect at runtime (env set post-import is too late).
@@ -435,7 +470,9 @@ def orchestrate(  # noqa: PLR0913
     activity.scope.write_text(scope_text, encoding="utf-8")
     activity.scope_init.write_text(scope_text, encoding="utf-8")
     resume_requested = resume
-    resume = _resume_ok(activity, scope_text, resume=resume)
+    resume = _resume_ok(
+        activity, scope_text, resume=resume, config_fingerprint=config_fingerprint,
+    )
     if observe and not _server_reachable(observe):
         log.warning("⚠ observe: Prefect server unreachable at %s — falling back to ephemeral "
                     "(start it with `ptflow serve`)", observe)
@@ -450,7 +487,7 @@ def orchestrate(  # noqa: PLR0913
     run_trace = telemetry.begin_run(
         activity, pipeline, scope_text=scope_text, resume_requested=resume_requested,
         resume_effective=resume, disabled=disabled, fanout=CONFIG.fanout.max_workers,
-        net_limit=_NET_LIMIT,
+        net_limit=_NET_LIMIT, config_fingerprint=config_fingerprint,
     )
     # name the flow run after the activity (UI), and size the pool to fan-out + spanning headroom so
     # the spanning stages run ∥ the loops instead of starving them (_FANOUT_SLOTS holds the fan-out cap)

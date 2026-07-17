@@ -329,6 +329,7 @@ def _run(args: argparse.Namespace) -> int:
     base, failures = orchestrate(
         pipeline, args.activity, args.scope, root=args.root,
         resume=args.resume, observe=args.observe, disabled_steps=disabled,
+        config_fingerprint=runconfig.resume_fingerprint(pipeline.name, resolved, disabled),
     )
     runconfig.snapshot(Path(base), resolved,
                        disabled_keys=[f"steps.{pipeline.name}.{n}" for n in sorted(disabled)])
@@ -353,6 +354,8 @@ def _run(args: argparse.Namespace) -> int:
             fu_base, fu_failures = orchestrate(
                 fu_pipeline, fu.activity, fu.scope, root=str(base),
                 resume=args.resume, observe=args.observe, disabled_steps=fu_disabled,
+                config_fingerprint=runconfig.resume_fingerprint(
+                    fu_pipeline.name, resolved, fu_disabled),
             )
             runconfig.snapshot(Path(fu_base), resolved,
                                disabled_keys=[f"steps.{fu_pipeline.name}.{n}" for n in sorted(fu_disabled)])

@@ -12,6 +12,7 @@ single consumption point — no constant is re-plumbed. ``snapshot()`` records t
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tomllib
@@ -253,6 +254,24 @@ def resolve(config: Mapping[str, Any], env: Mapping[str, str],
         if value is not None:
             out.append(Resolved(rk.env, rk.path, value, secret=False))
     return out
+
+
+def resume_fingerprint(pipeline: str, resolved: Iterable[Resolved],
+                       disabled_steps: Iterable[str]) -> str:
+    """Stable, secret-safe hash of the effective operator inputs that can change stage output.
+
+    Raw values — including secrets — participate in the digest, but only the SHA-256 is persisted.
+    Explicit defaults and implicit code defaults may conservatively produce different hashes; a safe
+    full rerun is preferable to silently reusing artifacts produced under a different configuration.
+    """
+    payload = {
+        "schema": 1,
+        "pipeline": pipeline,
+        "resolved": sorted((r.env, r.value) for r in resolved),
+        "disabled_steps": sorted(disabled_steps),
+    }
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def resolve_disabled_steps(config: Mapping[str, Any], sets: Iterable[str] | None,

@@ -105,6 +105,37 @@ def test_resume_ok_invalidates_on_scope_change(tmp_path):
     assert orchestrator._resume_ok(act, "scopeB", resume=False) is False  # never resumes when not asked
 
 
+def test_resume_ok_invalidates_on_config_change_and_migrates_legacy_state(tmp_path):
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("configured", root=tmp_path).ensure()
+    assert orchestrator._resume_ok(
+        act, "scope", resume=True, config_fingerprint="config-a") is True
+    assert (act.state / "config.sha").read_text() == "config-a"
+    activity_marker = act.state / "httpx.done"
+    app_marker = act.app("app").ensure().state / "crawl.done"
+    activity_marker.write_text("")
+    app_marker.parent.mkdir(parents=True)
+    app_marker.write_text("")
+    assert orchestrator._resume_ok(
+        act, "scope", resume=True, config_fingerprint="config-a") is True
+    assert activity_marker.exists()
+    assert app_marker.exists()
+    assert orchestrator._resume_ok(
+        act, "scope", resume=True, config_fingerprint="config-b") is False
+    assert not activity_marker.exists()
+    assert not app_marker.exists()
+    assert orchestrator._resume_ok(
+        act, "scope", resume=True, config_fingerprint="config-b") is True
+
+    legacy = Activity.named("legacy", root=tmp_path).ensure()
+    assert orchestrator._resume_ok(legacy, "scope", resume=False) is False
+    assert not (legacy.state / "config.sha").exists()
+    assert orchestrator._resume_ok(
+        legacy, "scope", resume=True, config_fingerprint="config-a") is False
+    assert (legacy.state / "config.sha").read_text() == "config-a"
+
+
 def test_per_app_loops_groups_by_phase_in_order():
     stages = [
         Stage("expand", lambda *_: None),                          # activity → excluded

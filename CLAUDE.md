@@ -30,7 +30,7 @@ that fan out under Prefect.
 uv sync --all-groups                                   # install (incl. dev/lint/test groups)
 uv run ptflow run <pipeline> <activity> <scope.txt> [--root DIR] [-v] [--resume]
                                                        # output → <root>/<activity>/ (root defaults to cwd)
-                                                       # --resume: skip stages a prior run finished (same scope)
+                                                       # --resume: skip stages from same scope + effective config
                   [--config ptflow.toml] [--set KEY=VALUE ...]   # operator knobs (see "Run config")
 uv run ptflow doctor [<pipeline>]                      # verify a pipeline's external tools + datasets
                                                        # are installed (default: external); exit 1 if a
@@ -245,7 +245,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                                                            #   scope_gate: inscope_{subdomains,tls_names,ips,
                                                            #   domain_ip_map}.txt (RoE-authorized set the active
                                                            #   stages read) + excluded_out_of_scope.jsonl (audit)
-  .state/  <stage>.done  scope.sha        # --resume markers (skip completed stages; invalidated on scope change)
+  .state/  <stage>.done  scope.sha  config.sha   # --resume markers; invalidated on scope/config change
   scans/                                 # ONLY per-app group workspaces (no special-cased breadth dir)
     <app_id>/                            # one clustered app group (per-app loops)
       meta.json  hosts.txt  endpoints.txt  subs.txt  takeover.txt  …

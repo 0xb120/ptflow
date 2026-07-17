@@ -45,7 +45,7 @@ Options:
 |------|--------------|
 | `--root DIR` | Parent directory for the activity. Output goes to `<root>/<activity>/`. Default: the current directory. |
 | `-v`, `--verbose` | Surface the exact command and full stdout/stderr of every tool on the console. The complete run log is **always** persisted to `<activity>/logs/run.log` regardless of this flag. |
-| `--resume` | Skip stages that a prior run of this activity already finished (`.state/<stage>.done` markers). Markers are invalidated automatically if the scope changes. |
+| `--resume` | Skip stages that a prior run of this activity already finished (`.state/<stage>.done` markers). Markers are invalidated automatically if the scope or effective run configuration changes. Older workspaces without a config fingerprint rerun once, then resume normally. |
 | `--observe [API_URL]` | Stream this run to the Prefect UI (run graph + task states + per-stage logs). `API_URL` defaults to the local server (`http://127.0.0.1:4200/api`); start it first with `ptflow serve`. |
 | `--config PATH` | TOML file of operator knobs (profile, oast, tool paths, wordlists, …) instead of scattered env vars. See [`ptflow.toml.example`](ptflow.toml.example) and [Environment variables](#environment-variables). |
 | `--set KEY=VALUE` | Override one config knob, repeatable — highest precedence (e.g. `--set oast=on --set profile=home`). |
