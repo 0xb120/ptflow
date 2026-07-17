@@ -34,9 +34,9 @@ class ExternalPipeline:
         Stage("resolve", tasks.resolve, needs=("subdomain_bruteforce",)),
         Stage("scope_gate", tasks.scope_gate, needs=("resolve",), net=False),  # RoE authorization gate
         Stage("portscan", tasks.portscan, needs=("scope_gate",)),
-        # Correctness barrier: the full scan must complete before clustering, otherwise late web
-        # services never enter any per-app loop. httpx and nerva then fan out in parallel over the
-        # complete port set; explicit scope URLs are also fed directly to httpx by the task.
+        # Policy barrier: balanced (default) adds a deadline-bounded top-1000 pass; exhaustive opt-in
+        # scans all 65535. httpx/nerva then fan out over every socket found before clustering, so the
+        # chosen coverage policy is applied consistently to all per-app loops.
         Stage("portscan_full", tasks.portscan_full, needs=("portscan",)),
         Stage("httpx", tasks.httpx_fingerprint, needs=("portscan_full",)),
         Stage("nerva", tasks.nerva_fingerprint, needs=("portscan_full",)),

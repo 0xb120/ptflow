@@ -56,14 +56,14 @@ log = get_logger()
 
 # --- rate profiles (PTFLOW_PROFILE, resolved at import — set it BEFORE launching) ---
 # The aggregate network load is roughly concurrency x per-tool rate. A `net` concurrency cap alone
-# doesn't bound it (the heavy hitters — the full-port naabu flood, nuclei -rl — are single stages),
+# doesn't bound it (the heavy hitters — the naabu policy pass, nuclei -rl — are single stages),
 # so the per-tool RATES are the real lever. Two profiles: `wide` (today's values, for real
-# bandwidth) and `home` (gentle on a domestic line/router — naabu especially, the full-port packet
-# flood that exhausts a consumer NAT/conntrack table).
+# bandwidth) and `home` (gentle on a domestic line/router — naabu exhaustive mode especially can
+# exhaust a consumer NAT/conntrack table).
 @dataclass(frozen=True)
 class Profile:
     name: str
-    naabu_rate: str   # naabu -rate (packets/s) — the prime "clogs my router" knob (full-port flood)
+    naabu_rate: str   # naabu -rate (packets/s) — the prime "clogs my router" knob
     naabu_conc: str   # naabu -c
     nuclei_rl: str    # nuclei -rl (req/s, global)
     nuclei_conc: str  # nuclei -c (templates in parallel)
@@ -85,12 +85,30 @@ def _resolve_profile() -> Profile:
     return _PROFILES.get(os.environ.get("PTFLOW_PROFILE", "wide").lower().strip(), WIDE)
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    """Positive integer env value, falling back to a safe code default for direct-env callers.
+
+    Values arriving through ``runconfig`` are validated before this module is imported; the fallback
+    keeps direct library imports and hand-written environments just as defensive.
+    """
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 PROFILE = _resolve_profile()
 
 # --- tunables (mirror scope2surface.sh; conservative — live infra) ---
 NAABU_TLS_TOP_PORTS = "1000"
-NAABU_RATE = PROFILE.naabu_rate   # applied to every naabu run (TLS harvest + web + full portscan)
+NAABU_RATE = PROFILE.naabu_rate   # applied to every naabu run (TLS harvest + web + policy pass)
 NAABU_CONC = PROFILE.naabu_conc
+PORTSCAN_MODE = os.environ.get("PTFLOW_EXTERNAL_PORTSCAN_MODE", "balanced").lower().strip()
+if PORTSCAN_MODE not in {"balanced", "exhaustive"}:  # direct env bypassing runconfig validation
+    PORTSCAN_MODE = "balanced"
+PORTSCAN_BALANCED_TOP_PORTS = "1000"  # naabu natively supports only 100, 1000, or full
+PORTSCAN_DEADLINE_S = _positive_int_env("PTFLOW_EXTERNAL_PORTSCAN_DEADLINE_SECONDS", 900)
 HONEYPOT_MIN_OPEN_PORTS = 15      # >= this many open ports => suspected honeypot
 RESOLVERS = "/opt/resolvers/resolvers-trusted.txt"
 SHUFFLEDNS_CONC = PROFILE.shuffledns_conc
@@ -100,8 +118,8 @@ SHUFFLEDNS_RETRIES = "2"
 # ports: union of aquatone-xlarge, hosting-panels, 8xxx alt-HTTP, app/dev servers, data/ops UIs,
 # containers, IoT/devices, proxies. NOT nmap's generic top-1k - so httpx sees web apps on uncommon
 # ports (5601/8161/9200/7001/...) that top-1k misses, while staying fast. Non-web ports (SSH/DB/SMB/
-# RDP) are deliberately absent. The pre-cluster full scan supplies every additional open port to
-# httpx and nerva, so uncommon HTTP services cannot appear too late for the application loops.
+# RDP) are deliberately absent. The policy-driven pre-cluster pass then supplies either naabu's
+# top-1000 general ports (balanced, bounded default) or all 65535 (exhaustive opt-in) to httpx/nerva.
 WEB_PORTS = (
     "80,81,82,83,84,85,86,87,88,89,90,280,300,443,591,593,631,777,832,880,888,981,1010,"
     "1024,1080,1311,2052,2053,2080,2082,2083,2086,2087,2095,2096,2222,2375,2376,2379,2380,"
@@ -560,9 +578,10 @@ def preflight() -> None:
     best-effort stage. Renders from the same `requirements()` manifest as `ptflow doctor`."""
     log.info(
         "  → profile: %s (naabu -rate %s -c %s · shuffledns -t %s · nuclei -rl %s · "
-        "ferox -t %s -L %s)",
+        "ferox -t %s -L %s · portscan %s%s)",
         PROFILE.name, NAABU_RATE, NAABU_CONC, SHUFFLEDNS_CONC, NUCLEI_RL, FEROX_THREADS,
-        FEROX_SCAN_LIMIT,
+        FEROX_SCAN_LIMIT, PORTSCAN_MODE,
+        f"/{PORTSCAN_DEADLINE_S}s" if PORTSCAN_MODE == "balanced" else "",
     )
     report = check(requirements())
     core = [r for r in report.results if r.req.kind == "core"]
@@ -598,7 +617,7 @@ def honeypot_split(naabu_lines: list[str], threshold: int = HONEYPOT_MIN_OPEN_PO
 
 def select_web_ports(naabu_lines: list[str], valid_ips: list[str]) -> list[str]:
     """Open `ip:port` lines on the VALID (non-honeypot) IPs — the FAST web target set httpx probes,
-    while the full 65535-port scan supplies the exhaustive pre-cluster target set. Pure."""
+    while the policy pass supplies the balanced top-1000 or exhaustive full target set. Pure."""
     valid = set(valid_ips)
     return [ln for ln in naabu_lines if ":" in ln and ln.rsplit(":", 1)[0] in valid]
 
@@ -2021,6 +2040,51 @@ def _run(tool: str, cmd: list[str], *, stdin: str, dest: Path, label: str) -> st
     return out
 
 
+def _exception_stdout(exc: subprocess.CalledProcessError | subprocess.TimeoutExpired) -> str:
+    """Text stdout retained on a failed or timed-out subprocess exception."""
+    out = exc.output or ""
+    return out.decode(errors="replace") if isinstance(out, bytes) else str(out)
+
+
+def _run_policy_scan(cmd: list[str], *, stdin: str, dest: Path,
+                     timeout: int | None) -> tuple[str, str, float]:
+    """Run the policy-driven naabu pass and always persist the stdout it produced.
+
+    Returns ``(stdout, status, duration_seconds)``. A balanced scan hitting its wall-clock budget is
+    an intentional partial success: ``tools.run`` kills the whole process group, its retained stdout
+    is written to the canonical artifact, and downstream fingerprinting continues over those sockets.
+    Non-zero naabu exits keep the historical best-effort behavior while the coverage manifest records
+    ``failed`` instead of falsely claiming a complete scan.
+    """
+    started = time.monotonic()
+    if not stdin.strip():
+        tools.write_text(dest, "")
+        return "", "no_targets", 0.0
+    log.info("  → naabu (port policy) — %d input(s)%s", len(_lines(stdin)),
+             f", deadline {timeout}s" if timeout is not None else "")
+    try:
+        out = tools.run(cmd, stdin=stdin, check=True, timeout=timeout,
+                        stream_stderr=is_verbose())
+        status = "completed"
+    except subprocess.TimeoutExpired as exc:
+        out = _exception_stdout(exc)
+        status = "timed_out"
+        log.warning("⚠ naabu port policy hit the %ss deadline — preserving %d partial result(s)",
+                    timeout, len(_lines(out)))
+    except subprocess.CalledProcessError as exc:
+        out = _exception_stdout(exc)
+        status = "failed"
+        log.warning("⚠ naabu port policy exited %d — preserving %d partial result(s)",
+                    exc.returncode, len(_lines(out)))
+    duration = time.monotonic() - started
+    tools.write_text(dest, out)
+    log.info("    naabu (port policy) → %d line(s) → %s [%s]",
+             len(_lines(out)), dest.name, status)
+    if is_verbose() and out.strip():
+        log.debug("    stdout:\n%s", out.rstrip())
+    return out, status, duration
+
+
 # --- breadth sub-phases (each reads/writes via disk → independently rerunnable) ---
 def provision_wl(activity: Activity) -> None:
     """BREADTH — resolve global wordlist ROLES into wl_global/<role>.txt (env/discovery/BYO).
@@ -2204,8 +2268,9 @@ def portscan(activity: Activity) -> None:
 
     Scans the curated ~250 HTTP(S)-bearing ports (WEB_PORTS), NOT nmap's generic top-1k — so httpx
     sees web apps on uncommon ports (5601/8161/9200/7001/…) that top-1k would miss, while staying
-    fast. The full scan follows this cheap pass and remains behind the pre-cluster barrier: correctness
-    requires every late open port to be available to httpx/nerva before application grouping begins.
+    fast. A policy-driven scan follows this cheap pass and remains behind the pre-cluster barrier:
+    balanced mode adds naabu's top-1000 under a wall-clock budget; exhaustive mode scans all 65535.
+    Every socket found before that barrier is therefore available to httpx/nerva and application grouping.
     The naabu stdout is provenance (raw/naabu/), consumed in memory by
     honeypot_split/select_web_ports."""
     canon = activity.asset_discovery_canonical
@@ -2221,23 +2286,50 @@ def portscan(activity: Activity) -> None:
 
 
 def portscan_full(activity: Activity) -> None:
-    """Full 65535-port scan on valid IPs → naabu_full.txt for pre-cluster httpx + nerva.
+    """Policy-driven pre-cluster port scan → legacy-compatible ``naabu_full.txt``.
 
-    Recomputes the valid set from disk (inscope_ips.txt minus honeypots). This stage intentionally sits
-    on the breadth barrier: a service discovered here must not miss clustering and all per-app loops.
+    ``balanced`` (default) scans naabu's top-1000 general ports with a configurable hard deadline and
+    preserves partial stdout on timeout. ``exhaustive`` is opt-in and retains the former unbounded
+    full-65535 behavior. The stage/artifact names stay stable for resume and existing workspaces;
+    ``portscan_coverage.json`` records the actual policy and completion state without ambiguity.
     """
     canon = activity.asset_discovery_canonical
     honeypots = set(tools.read_lines(canon("honeypots.txt")))
     valid = [ip for ip in tools.read_lines(canon("inscope_ips.txt")) if ip not in honeypots]
-    _run("naabu", ["naabu", "-silent", "-top-ports", "full", "-exclude-cdn",
-                   "-c", NAABU_CONC, "-rate", NAABU_RATE],
-         stdin="\n".join(valid), dest=canon("naabu_full.txt"), label="full")
+    exhaustive = PORTSCAN_MODE == "exhaustive"
+    top_ports = "full" if exhaustive else PORTSCAN_BALANCED_TOP_PORTS
+    requested_ports = 65535 if exhaustive else int(PORTSCAN_BALANCED_TOP_PORTS)
+    deadline = None if exhaustive else PORTSCAN_DEADLINE_S
+    out, status, duration = _run_policy_scan(
+        ["naabu", "-silent", "-top-ports", top_ports, "-exclude-cdn",
+         "-c", NAABU_CONC, "-rate", NAABU_RATE],
+        stdin="\n".join(valid), dest=canon("naabu_full.txt"), timeout=deadline,
+    )
+    manifest = {
+        "mode": PORTSCAN_MODE,
+        "status": status,
+        "completed": status in {"completed", "no_targets"},
+        "timed_out": status == "timed_out",
+        "deadline_seconds": deadline,
+        "input_ips": len(valid),
+        "excluded_honeypot_ips": len(honeypots),
+        "curated_web_ports": len(WEB_PORTS.split(",")),
+        "extended_port_selection": f"top-{top_ports}" if top_ports != "full" else "full",
+        "extended_requested_ports": requested_ports,
+        "curated_web_open_sockets": len(tools.read_lines(canon("naabu_web.txt"))),
+        "extended_open_sockets": len(_lines(out)),
+        "duration_seconds": round(duration, 3),
+    }
+    tools.write_text(canon("portscan_coverage.json"),
+                     json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    log.info("  → portscan coverage — mode=%s status=%s sockets=%d → portscan_coverage.json",
+             PORTSCAN_MODE, status, len(_lines(out)))
 
 
 def httpx_fingerprint(activity: Activity) -> None:
     """Phase 4a — HTTP fingerprinting (httpx) → httpx_full_metadata.jsonl + unique_webapps.txt.
 
-    Runs after the full scan and in parallel with nerva. Explicit scope URLs are probed separately with
+    Runs after the policy scan and in parallel with nerva. Explicit scope URLs are probed separately with
     ``-nfs`` so their scheme, port and path are honored verbatim; discovered names/ports use ``-nf`` to
     try both HTTP and HTTPS. SCOPE HYGIENE: httpx flags
     CDN/cloud/WAF hosts (cdncheck), and split_cdn_ip_records drops the raw-IP probes of that shared

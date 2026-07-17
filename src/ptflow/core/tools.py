@@ -225,9 +225,13 @@ def run(  # noqa: PLR0913
         _register(proc)
         try:
             out, _ = proc.communicate(input=input_data, timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             _kill_group(proc, signal.SIGKILL)
-            proc.communicate()  # reap the killed group
+            # ``communicate`` retains the bytes/text collected before the timeout across calls.  Keep
+            # that complete partial stdout on the exception so a bounded scanner can persist useful
+            # findings instead of discarding everything produced before its wall-clock budget expired.
+            out, _ = proc.communicate()  # reap the killed group
+            exc.output = out
             telemetry.record_command(
                 tool=tool, status="timeout", return_code=None,
                 duration=time.monotonic() - started, timeout=timeout,

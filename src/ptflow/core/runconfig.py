@@ -32,6 +32,7 @@ _AI_PROVIDERS = (
 _AI_STAGE_NAMES = ("wordlist", "cve_poc", "secret_triage", "triage", "report")
 _ENUMS = {
     "PTFLOW_PROFILE": ("wide", "home"),
+    "PTFLOW_EXTERNAL_PORTSCAN_MODE": ("balanced", "exhaustive"),
     "PTFLOW_RECRAWL": ("off", "preview", "on"),
     "PTFLOW_AI_PROVIDER": _AI_PROVIDERS,
     "PTFLOW_AI_REMOTE_SECRETS": ("off", "redacted", "full"),
@@ -59,6 +60,8 @@ class Knob(NamedTuple):
 _KNOBS: tuple[Knob, ...] = (
     Knob("profile", "PTFLOW_PROFILE", "str"),
     Knob("net_limit", "PTFLOW_NET_LIMIT", "int"),
+    Knob("external.portscan_mode", "PTFLOW_EXTERNAL_PORTSCAN_MODE", "str"),
+    Knob("external.portscan_deadline_seconds", "PTFLOW_EXTERNAL_PORTSCAN_DEADLINE_SECONDS", "int"),
     Knob("http_header", "PTFLOW_HTTP_HEADER", "list", secret=True),
     Knob("oast", "PTFLOW_OAST", "bool"),
     Knob("recrawl", "PTFLOW_RECRAWL", "str"),
@@ -191,6 +194,14 @@ def _validate(env: str, value: str) -> None:
         except json.JSONDecodeError as exc:
             msg = f"invalid {env}: {exc}"
             raise ConfigError(msg) from exc
+    if env == "PTFLOW_EXTERNAL_PORTSCAN_DEADLINE_SECONDS":
+        try:
+            valid = int(value) > 0
+        except ValueError:
+            valid = False
+        if not valid:
+            msg = f"invalid {env}={value!r} — expected a positive integer"
+            raise ConfigError(msg)
 
 
 def _pick(knob: Knob, overrides: dict[str, str], env: Mapping[str, str],

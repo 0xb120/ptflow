@@ -44,6 +44,13 @@ def test_resolve_serializes_structured_dast_config():
     assert json.loads(out["PTFLOW_DAST_PACKS"])[0]["name"] == "local"
 
 
+def test_resolve_external_portscan_policy():
+    config = {"external": {"portscan_mode": "balanced", "portscan_deadline_seconds": 900}}
+    out = _envmap(runconfig.resolve(config, {}, ["external.portscan_mode=exhaustive"]))
+    assert out["PTFLOW_EXTERNAL_PORTSCAN_MODE"] == "exhaustive"
+    assert out["PTFLOW_EXTERNAL_PORTSCAN_DEADLINE_SECONDS"] == "900"
+
+
 def test_resolve_dynamic_wordlist_roles():
     config = {"wordlists": {"roles": {"content": "olfa.txt", "params": "p.txt"}}}
     out = _envmap(runconfig.resolve(config, {}, ["wordlists.roles.php=php.txt"]))
@@ -55,6 +62,10 @@ def test_resolve_dynamic_wordlist_roles():
 def test_resolve_validates_enums_and_set_syntax():
     with pytest.raises(runconfig.ConfigError):
         runconfig.resolve({"profile": "turbo"}, {}, None)        # not wide|home
+    with pytest.raises(runconfig.ConfigError):
+        runconfig.resolve({"external": {"portscan_mode": "full"}}, {}, None)
+    with pytest.raises(runconfig.ConfigError):
+        runconfig.resolve({"external": {"portscan_deadline_seconds": 0}}, {}, None)
     with pytest.raises(runconfig.ConfigError):
         runconfig.resolve({}, {}, ["oast"])                      # missing '='
 

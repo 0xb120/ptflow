@@ -240,7 +240,8 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                                                            #   under scans/ (subdomains.txt, tls_names.txt,
                                                            #   httpx_full_metadata.jsonl, excluded_cdn.jsonl,
                                                            #   naabu_web.txt [fast/httpx], naabu_full.txt
-                                                           #   [spanning], nerva_full_metadata.jsonl, …)
+                                                           #   [policy pass] + portscan_coverage.json,
+                                                           #   nerva_full_metadata.jsonl, …)
                                                            #   scope_gate: inscope_{subdomains,tls_names,ips,
                                                            #   domain_ip_map}.txt (RoE-authorized set the active
                                                            #   stages read) + excluded_out_of_scope.jsonl (audit)
@@ -379,11 +380,12 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     (offline RoE authorization gate — filters discovery down to the
     authorized `inscope_*` set before any active scan; see the scope-gate note in "External design
     decisions" below) → `portscan`
-    (FAST: ~250 curated web ports `WEB_PORTS` → honeypot filter → `naabu_web.txt`) → `httpx`
-    → `cluster` fan-out. The expensive **full 65535-port scan is off the critical path**:
-    `portscan_full` (**spanning**, after `portscan`) → `naabu_full.txt` → `nerva` (**spanning**)
-    run ∥ clustering + the loops, joined at the fan-in. `httpx` only needs the fast top-1k web set,
-    so the ~15-min full scan no longer serializes in front of all web work. Plus `nuclei_scope` —
+    (FAST: ~250 curated web ports `WEB_PORTS` → honeypot filter → `naabu_web.txt`) → `portscan_full`
+    (legacy stage name; policy barrier: `balanced` DEFAULT scans naabu top-1000 under a 900s deadline
+    and preserves partial output, `exhaustive` OPT-IN scans all 65535 without a deadline; actual status in
+    `portscan_coverage.json`) → `httpx` ∥ `nerva` → `cluster` fan-out. The barrier is deliberate: every
+    socket found under the selected coverage policy reaches fingerprinting and the per-app loops. Plus
+    `nuclei_scope` —
     another **spanning** whole-scope full-template nuclei scan (one process, one global `-rl` over
     deduped subdomains + webapps) launched after `httpx`, running ∥ everything, joined at the fan-in
     (`findings/nuclei_scope.jsonl`). Template updates are explicit/out-of-band (`nuclei -ut` before the
@@ -993,10 +995,12 @@ flow changed:
   top of `pipelines/external/tasks.py` — tuned conservatively for live infra; don't bump blindly.
 - **Rate profile** (env **`PTFLOW_PROFILE`** ∈ `wide|home`, default `wide`, resolved at import — set it
   *before* launching): `wide` = today's rates (real bandwidth); `home` throttles naabu `-rate`
-  (300 vs 1000 — the full-port packet flood that exhausts a consumer NAT/router), nuclei `-rl`
+  (300 vs 1000 — especially relevant to exhaustive full-port scans), nuclei `-rl`
   (50 vs 150) and feroxbuster `-t`/`-L`, for a domestic line. Aggregate load ≈ concurrency × rate,
   so the per-tool rate is the real lever (a `net` concurrency cap alone won't tame the single
-  full-port/nuclei stages). The active profile is logged at run start (preflight).
+  port-policy/nuclei stages). External's separate `PTFLOW_EXTERNAL_PORTSCAN_MODE=balanced|exhaustive`
+  controls breadth coverage; balanced's deadline defaults to 900s. The active profile is logged at run
+  start (preflight).
 - **AI layer (opt-in, `--ai` / `PTFLOW_AI=on` / `[ai].enabled=true`)** — adds four best-effort LLM
   functions via a **provider-agnostic** `core/ai/` seam (`LLMClient` Protocol + `make_client()`).
   **`PTFLOW_AI_PROVIDER`** selects `ollama` (default, local endpoint

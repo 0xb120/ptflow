@@ -226,7 +226,7 @@ def test_pipeline_object_shape():
     cluster_scope = [s.name for s in PIPELINE.stages if s.cluster_scope]
     checkpoints = [s.name for s in PIPELINE.stages if s.after_phase is not None]
     app = [s.name for s in PIPELINE.stages if s.per_app]
-    # Full-port + service fingerprints are a correctness barrier before cluster. Only the
+    # Policy port scan + service fingerprints are a coverage barrier before cluster. Only the
     # whole-scope nuclei pass remains spanning over the per-app loops.
     assert activity == [
         "provision_wl", "expand", "subdomain_bruteforce", "resolve", "scope_gate", "portscan",
@@ -246,7 +246,7 @@ def test_pipeline_object_shape():
     by_name = {s.name: s for s in PIPELINE.stages}
     assert set(by_name["subdomain_bruteforce"].needs) == {"expand", "provision_wl"}
     assert by_name["resolve"].needs == ("subdomain_bruteforce",)
-    # httpx/nerva both consume the complete pre-cluster port set.
+    # httpx/nerva both consume the selected pre-cluster port set.
     assert by_name["httpx"].needs == ("portscan_full",)
     assert by_name["portscan_full"].spanning is False
     assert by_name["portscan_full"].needs == ("portscan",)
@@ -265,6 +265,93 @@ def test_pipeline_object_shape():
     assert by_name["screenshot"].per_app is False
     assert by_name["surface_checkpoint"].after_phase == 2
     assert by_name["surface_checkpoint"].net is False
+
+
+def test_portscan_policy_balanced_is_bounded_and_writes_coverage(monkeypatch, tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        return "10.0.0.1:22\n10.0.0.1:443\n"
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    monkeypatch.setattr(tasks, "PORTSCAN_MODE", "balanced")
+    monkeypatch.setattr(tasks, "PORTSCAN_DEADLINE_S", 37)
+    act = Activity.named("balanced-ports", root=tmp_path).ensure()
+    canon = act.asset_discovery_canonical
+    tools.write_lines(canon("inscope_ips.txt"), ["10.0.0.1"])
+    tools.write_lines(canon("naabu_web.txt"), ["10.0.0.1:443"])
+
+    tasks.portscan_full(act)
+
+    [(cmd, kwargs)] = calls
+    assert cmd[cmd.index("-top-ports") + 1] == "1000"
+    assert kwargs["timeout"] == 37
+    assert kwargs["check"] is True
+    assert tools.read_lines(canon("naabu_full.txt")) == ["10.0.0.1:22", "10.0.0.1:443"]
+    coverage = json.loads(canon("portscan_coverage.json").read_text())
+    expected = {
+        "mode": "balanced", "status": "completed", "completed": True, "timed_out": False,
+        "deadline_seconds": 37, "input_ips": 1, "extended_port_selection": "top-1000",
+        "extended_requested_ports": 1000, "curated_web_open_sockets": 1,
+        "extended_open_sockets": 2,
+    }
+    assert {key: coverage[key] for key in expected} == expected
+
+
+def test_portscan_policy_exhaustive_has_no_deadline(monkeypatch, tmp_path):
+    from ptflow.core.paths import Activity
+
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        return "10.0.0.2:65000\n"
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    monkeypatch.setattr(tasks, "PORTSCAN_MODE", "exhaustive")
+    act = Activity.named("exhaustive-ports", root=tmp_path).ensure()
+    tasks.tools.write_lines(act.asset_discovery_canonical("inscope_ips.txt"), ["10.0.0.2"])
+
+    tasks.portscan_full(act)
+
+    [(cmd, kwargs)] = calls
+    assert cmd[cmd.index("-top-ports") + 1] == "full"
+    assert kwargs["timeout"] is None
+    coverage = json.loads(act.asset_discovery_canonical("portscan_coverage.json").read_text())
+    assert coverage["mode"] == "exhaustive"
+    assert coverage["extended_requested_ports"] == 65535
+    assert coverage["deadline_seconds"] is None
+    assert coverage["completed"] is True
+
+
+def test_portscan_policy_timeout_preserves_partial_results(monkeypatch, tmp_path):
+    import subprocess
+
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"], output="10.0.0.3:8443\n")
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    monkeypatch.setattr(tasks, "PORTSCAN_MODE", "balanced")
+    monkeypatch.setattr(tasks, "PORTSCAN_DEADLINE_S", 1)
+    act = Activity.named("partial-ports", root=tmp_path).ensure()
+    canon = act.asset_discovery_canonical
+    tools.write_lines(canon("inscope_ips.txt"), ["10.0.0.3"])
+
+    tasks.portscan_full(act)
+
+    assert tools.read_lines(canon("naabu_full.txt")) == ["10.0.0.3:8443"]
+    coverage = json.loads(canon("portscan_coverage.json").read_text())
+    assert coverage["status"] == "timed_out"
+    assert coverage["completed"] is False
+    assert coverage["timed_out"] is True
+    assert coverage["extended_open_sockets"] == 1
 
 
 def test_pipeline_phase_wiring():

@@ -16,7 +16,7 @@ subdomain_bruteforce["subdomain_bruteforce<br>shuffledns -mode bruteforce -d &lt
 resolve["resolve<br>shuffledns -mode resolve -r resolvers-trusted    # fallback: dnsx -silent<br>dnsx -a -resp-only -silent                       # → unique_ips<br>dnsx -a -resp -nc -silent                        # → domain_ip_map"]
 scope_gate["scope_gate  ·  net=False<br># build_allowlist(scope_init) + filter_assets(subdomains + tls_names, domain_ip_map, unique_ips)<br># offline (net=False) · complementa naabu -exclude-cdn / split_cdn_ip_records (niente check CDN qui)"]
 portscan["portscan<br>naabu -p &lt;~250 WEB_PORTS&gt; -exclude-cdn -c 50 -rate 1000   # rate=profilo<br># → honeypot_split (≥15 porte aperte = honeypot) + select_web_ports"]
-portscan_full["portscan_full<br>naabu -top-ports full -exclude-cdn -c 50 -rate 1000   # rate=profilo"]
+portscan_full["portscan_full<br>naabu -top-ports 1000 -exclude-cdn -c 50 -rate 1000   # balanced, timeout configurabile<br>naabu -top-ports full -exclude-cdn -c 50 -rate 1000   # exhaustive opt-in"]
 httpx["httpx<br>httpx -sc -cl -td -title -ip -hash sha256<br>      -favicon -location -fr -irh -nf -j   # discovery: probe http+https<br>httpx -nfs ... &lt; scope_urls.txt             # preserva scheme+porta espliciti<br>split_cdn_ip_records → drop bare-IP CDN/cloud/WAF (→ excluded_cdn.jsonl)"]
 nerva["nerva<br>nerva --json"]
 end

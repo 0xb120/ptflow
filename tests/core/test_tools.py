@@ -103,6 +103,18 @@ def test_run_stream_stderr_returns_stdout():
     assert tools.run(["printf", "hi"], stream_stderr=True) == "hi"
 
 
+def test_run_timeout_retains_partial_stdout():
+    import subprocess
+    import sys
+
+    import pytest
+
+    cmd = [sys.executable, "-c", "import time; print('partial', flush=True); time.sleep(30)"]
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        tools.run(cmd, timeout=1)
+    assert caught.value.output == "partial\n"
+
+
 def test_run_tolerates_non_utf8_output():
     # a tool emitting a non-UTF-8 byte (0x93, a Windows-1252 smart quote — seen in urlfinder OSINT
     # output) must NOT raise UnicodeDecodeError and kill the stage; the bad byte → U+FFFD

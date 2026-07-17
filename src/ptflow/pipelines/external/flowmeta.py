@@ -78,20 +78,26 @@ FLOWMETA: dict[str, StepMeta] = {
     ),
     "portscan": StepMeta(
         summary="Scan VELOCE su ~250 porte WEB curate (WEB_PORTS) → filtro honeypot → naabu_web.txt "
-                "(segnale rapido). Il full-port completa la superficie prima del cluster.",
+                "(segnale rapido). Il pass policy-driven amplia la superficie prima del cluster.",
         commands=("naabu -p <~250 WEB_PORTS> -exclude-cdn -c 50 -rate 1000   # rate=profilo",
                   "# → honeypot_split (≥15 porte aperte = honeypot) + select_web_ports"),
         outputs=("honeypots.txt", "naabu_web.txt"),
     ),
     "portscan_full": StepMeta(
-        summary="BREADTH — scan full 65535 porte sugli IP validi (non-honeypot) → naabu_full.txt. "
-                "Barriera pre-cluster: alimenta sia httpx sia nerva, così i servizi tardivi entrano nei loop.",
-        commands=("naabu -top-ports full -exclude-cdn -c 50 -rate 1000   # rate=profilo",),
-        outputs=("naabu_full.txt",),
+        summary="BREADTH policy-driven sugli IP validi (non-honeypot): balanced DEFAULT = top-1000 "
+                "con deadline 900s e risultati parziali preservati; exhaustive OPT-IN = full 65535 senza "
+                "deadline. Barriera pre-cluster per httpx+nerva.",
+        commands=(
+            "naabu -top-ports 1000 -exclude-cdn -c 50 -rate 1000   # balanced, timeout configurabile",
+            "naabu -top-ports full -exclude-cdn -c 50 -rate 1000   # exhaustive opt-in",
+        ),
+        outputs=("naabu_full.txt", "portscan_coverage.json"),
+        notes=("nome stage/artifact legacy mantenuto per resume; il manifest dichiara la copertura reale",),
     ),
     "httpx": StepMeta(
         summary="Fingerprint HTTP + segnali per il cluster (favicon, body-hash, redirect-final, header). "
-                "Legge URL espliciti + tutte le porte del full scan; scope hygiene sulle probe CDN by-IP.",
+                "Legge URL espliciti + tutte le socket trovate dalla policy porte; scope hygiene sulle probe "
+                "CDN by-IP.",
         commands=("httpx -sc -cl -td -title -ip -hash sha256",
                   "      -favicon -location -fr -irh -nf -j   # discovery: probe http+https",
                   "httpx -nfs ... < scope_urls.txt             # preserva scheme+porta espliciti",
