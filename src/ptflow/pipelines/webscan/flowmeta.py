@@ -18,7 +18,8 @@ from ptflow.pipelines.external import flowmeta as _ext
 
 FLOWMETA: dict[str, StepMeta] = {
     **_ext.FLOWMETA,
-    # the ONLY webscan-specific step — it stands in for external's entire breadth (expand/resolve/
+    # the ONLY webscan-specific step — it stands in for external's entire breadth
+    # (expand/subdomain_bruteforce/resolve/
     # portscan/httpx): httpx over a pre-aggregated web-target list, honouring the input scheme.
     "ingest": StepMeta(
         summary="BREADTH (minimale) — httpx sulla lista di target web PRE-AGGREGATA, ONORANDO lo scheme "

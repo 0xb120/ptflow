@@ -295,7 +295,7 @@ shared/global INPUT lists; `scans/<app_id>/wl_custom/` is the wordlists GENERATE
 that app from its own corpus (`Activity.wl_global` / `AppWorkspace.wl_custom`).
 
 **Global wordlists are resolved by ROLE, not hardcoded** (`pipelines/external/wordlists.py`). The
-`provision_wl` breadth stage resolves each role (`content`, `wordpress`, `drupal`, `joomla`) to a
+`provision_wl` breadth stage resolves each role (`subdomains`, `content`, `wordpress`, `drupal`, `joomla`) to a
 concrete file and symlinks it into `wl_global/<role>.txt`; steps then read by role
 (`wordlists.role_path(activity, "content")`). Resolution order: BYO (`wl_global/<role>.txt` already
 present) › explicit env `PTFLOW_WL_<ROLE>` › discovery (first candidate filename under a search dir;
@@ -374,7 +374,9 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
 - **`external`** — the REAL ProjectDiscovery toolchain (`pipelines/external/tasks.py`), a faithful port of
   bash recon scripts (`scope2surface.sh` breadth, `surfagr.sh` clustering). Stages:
   - **Breadth** (activity scope): `provision_wl` (resolve global wordlist roles → `wl_global/`) ∥
-    `expand` → `resolve` → `scope_gate` (offline RoE authorization gate — filters discovery down to the
+    `expand` (passive wildcard enum) → `subdomain_bruteforce` (shuffledns, only explicit `*.domain`
+    scope entries; waits for both passive enum and wordlist provisioning) → `resolve` → `scope_gate`
+    (offline RoE authorization gate — filters discovery down to the
     authorized `inscope_*` set before any active scan; see the scope-gate note in "External design
     decisions" below) → `portscan`
     (FAST: ~250 curated web ports `WEB_PORTS` → honeypot filter → `naabu_web.txt`) → `httpx`

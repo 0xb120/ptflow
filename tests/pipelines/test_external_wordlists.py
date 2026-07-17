@@ -72,3 +72,18 @@ def test_staged_roles_resolve_from_search_dir(tmp_path, monkeypatch):
     assert wordlists.role_path(act, "an_directories").read_text(encoding="utf-8") == "/\n/admin\n"
     assert wordlists.role_path(act, "an_php").read_text(encoding="utf-8") == "index.php\n"
     assert wordlists.role_path(act, "mn_php") is None  # not installed → degrade
+
+
+def test_subdomains_role_resolves_dns_wordlist(tmp_path, monkeypatch):
+    coll = tmp_path / "coll"
+    dns = coll / "Discovery" / "DNS"
+    dns.mkdir(parents=True)
+    source = dns / "subdomains-top1million-110000.txt"
+    source.write_text("www\nmcp\n", encoding="utf-8")
+    monkeypatch.setattr(wordlists, "_DEFAULT_DIRS", ())
+    monkeypatch.setenv("PTFLOW_WORDLISTS", str(coll))
+    act = Activity.named("dns-role", root=tmp_path).ensure()
+
+    wordlists.provision(act)
+
+    assert wordlists.role_path(act, "subdomains").read_text(encoding="utf-8") == "www\nmcp\n"

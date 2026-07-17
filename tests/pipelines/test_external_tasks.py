@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from ptflow.core.scope import Target
 from ptflow.pipelines.external import tasks
 
@@ -57,6 +59,7 @@ def test_home_profile_is_gentler_than_wide():
     assert int(tasks.HOME.nuclei_rl) < int(tasks.WIDE.nuclei_rl)
     assert int(tasks.HOME.ferox_threads) <= int(tasks.WIDE.ferox_threads)
     assert int(tasks.HOME.naabu_conc) < int(tasks.WIDE.naabu_conc)
+    assert int(tasks.HOME.shuffledns_conc) < int(tasks.WIDE.shuffledns_conc)
 
 
 def test_wide_profile_matches_legacy_rates():
@@ -226,7 +229,8 @@ def test_pipeline_object_shape():
     # Full-port + service fingerprints are a correctness barrier before cluster. Only the
     # whole-scope nuclei pass remains spanning over the per-app loops.
     assert activity == [
-        "provision_wl", "expand", "resolve", "scope_gate", "portscan", "portscan_full", "httpx", "nerva",
+        "provision_wl", "expand", "subdomain_bruteforce", "resolve", "scope_gate", "portscan",
+        "portscan_full", "httpx", "nerva",
     ]
     assert spanning == ["nuclei_scope"]
     assert cluster_scope == ["screenshot"]  # batched screenshot, post-cluster ∥ the loops
@@ -240,6 +244,8 @@ def test_pipeline_object_shape():
         "cve_lookup_full", "tech_vulnscan",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
+    assert set(by_name["subdomain_bruteforce"].needs) == {"expand", "provision_wl"}
+    assert by_name["resolve"].needs == ("subdomain_bruteforce",)
     # httpx/nerva both consume the complete pre-cluster port set.
     assert by_name["httpx"].needs == ("portscan_full",)
     assert by_name["portscan_full"].spanning is False
@@ -743,6 +749,56 @@ def test_expand_splits_scope_offline(tmp_path):
     assert tools.read_lines(act.scope_urls) == []
     assert tools.read_lines(act.scope_ip) == []
     assert sorted(tools.read_lines(act.scope_dns)) == ["example.com", "nmap.org"]
+
+
+def test_subdomain_bruteforce_runs_after_passive_only_for_wildcard_scope(
+    monkeypatch, tmp_path,
+):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("active-dns", root=tmp_path).ensure()
+    act.scope_init.write_text(
+        "*.example.com\nplain.example.net\n*.corp.test\n", encoding="utf-8",
+    )
+    tools.write_lines(act.scope_dns, ["passive.example.com", "example.com", "corp.test"])
+    subdomains = act.wl_global / "subdomains.txt"
+    subdomains.write_text("www\nmcp\n", encoding="utf-8")
+    calls: list[tuple[str, list[str], str, str]] = []
+
+    def fake_run(tool, cmd, *, stdin, dest, label):
+        assert "shuffledns" in str(dest)
+        calls.append((tool, cmd, stdin, label))
+        apex_domain = cmd[cmd.index("-d") + 1]
+        return f"mcp.{apex_domain}\n"
+
+    monkeypatch.setattr(tasks, "_run", fake_run)
+
+    tasks.subdomain_bruteforce(act)
+
+    assert [call[3] for call in calls] == ["example.com", "corp.test"]
+    assert all(call[0] == "shuffledns" for call in calls)
+    assert all(call[1][1:3] == ["-mode", "bruteforce"] for call in calls)
+    assert all(call[1][call[1].index("-w") + 1] == str(subdomains) for call in calls)
+    assert all("-sw" in call[1] and "-duc" in call[1] for call in calls)
+    assert tools.read_lines(act.scope_dns) == [
+        "passive.example.com", "example.com", "corp.test",
+        "mcp.example.com", "mcp.corp.test",
+    ]
+
+
+def test_subdomain_bruteforce_without_wildcard_does_not_run(monkeypatch, tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("no-wildcard", root=tmp_path).ensure()
+    act.scope_init.write_text("example.com\n", encoding="utf-8")
+    tools.write_lines(act.scope_dns, ["example.com"])
+    monkeypatch.setattr(tasks, "_run", lambda *_args, **_kwargs: pytest.fail("must not run"))
+
+    tasks.subdomain_bruteforce(act)
+
+    assert tools.read_lines(act.scope_dns) == ["example.com"]
 
 
 def test_cluster_groups_by_signature(tmp_path):

@@ -69,12 +69,13 @@ class Profile:
     nuclei_conc: str  # nuclei -c (templates in parallel)
     ferox_threads: str       # feroxbuster -t
     ferox_scan_limit: str    # feroxbuster -L (concurrent dir scans)
+    shuffledns_conc: str     # shuffledns -t (concurrent active DNS resolutions)
 
 
 WIDE = Profile(name="wide", naabu_rate="1000", naabu_conc="50", nuclei_rl="150", nuclei_conc="25",
-               ferox_threads="5", ferox_scan_limit="2")
+               ferox_threads="5", ferox_scan_limit="2", shuffledns_conc="2000")
 HOME = Profile(name="home", naabu_rate="300", naabu_conc="20", nuclei_rl="50", nuclei_conc="10",
-               ferox_threads="3", ferox_scan_limit="1")
+               ferox_threads="3", ferox_scan_limit="1", shuffledns_conc="500")
 _PROFILES = {p.name: p for p in (WIDE, HOME)}
 
 
@@ -92,6 +93,8 @@ NAABU_RATE = PROFILE.naabu_rate   # applied to every naabu run (TLS harvest + we
 NAABU_CONC = PROFILE.naabu_conc
 HONEYPOT_MIN_OPEN_PORTS = 15      # >= this many open ports => suspected honeypot
 RESOLVERS = "/opt/resolvers/resolvers-trusted.txt"
+SHUFFLEDNS_CONC = PROFILE.shuffledns_conc
+SHUFFLEDNS_RETRIES = "2"
 
 # Curated WEB ports for the FAST portscan. 250 distinct HTTP(S)-bearing
 # ports: union of aquatone-xlarge, hosting-panels, 8xxx alt-HTTP, app/dev servers, data/ops UIs,
@@ -494,7 +497,8 @@ def _header_flags(flag: str = "-H") -> list[str]:
 # nothing). OPTIONAL: best-effort fleet whose absence is expected/fine (the stage simply skips).
 _CORE_TOOLS = {
     "mapcidr": "mapcidr", "naabu": "naabu", "dnsx": "dnsx", "tlsx": "tlsx",
-    "shuffledns": "shuffledns", "subfinder": "subfinder", "assetfinder": "assetfinder",
+    "shuffledns": "shuffledns", "massdns": "massdns", "subfinder": "subfinder",
+    "assetfinder": "assetfinder",
     "httpx": HTTPX, "katana": "katana", "gau": "gau", "urlfinder": "urlfinder",
     "nerva": "nerva", "subjack": "subjack", "feroxbuster": FEROX,
 }
@@ -554,8 +558,12 @@ def preflight() -> None:
     VISIBLY instead of yielding a silent empty result. Never aborts (best-effort): a missing CORE tool
     is a WARNING (that stage produces nothing); missing OPTIONAL tools/datasets just skip their
     best-effort stage. Renders from the same `requirements()` manifest as `ptflow doctor`."""
-    log.info("  → profile: %s (naabu -rate %s -c %s · nuclei -rl %s · ferox -t %s -L %s)",
-             PROFILE.name, NAABU_RATE, NAABU_CONC, NUCLEI_RL, FEROX_THREADS, FEROX_SCAN_LIMIT)
+    log.info(
+        "  → profile: %s (naabu -rate %s -c %s · shuffledns -t %s · nuclei -rl %s · "
+        "ferox -t %s -L %s)",
+        PROFILE.name, NAABU_RATE, NAABU_CONC, SHUFFLEDNS_CONC, NUCLEI_RL, FEROX_THREADS,
+        FEROX_SCAN_LIMIT,
+    )
     report = check(requirements())
     core = [r for r in report.results if r.req.kind == "core"]
     opt = [r for r in report.results if r.req.kind == "optional"]
@@ -2081,6 +2089,50 @@ def expand(activity: Activity) -> None:
         )
 
     tools.write_lines(activity.scope_dns, [*dns_names, *wildcards])
+
+
+def subdomain_bruteforce(activity: Activity) -> None:
+    """Actively enumerate only wildcard scope entries after passive enumeration.
+
+    ``expand`` has already harvested TLS/PTR names and run assetfinder/subfinder. This stage reparses
+    the authoritative scope file, selects only ``*.domain`` entries, and runs one bounded shuffledns
+    bruteforce per wildcard apex. Results are merged into the existing canonical candidate set; the
+    following ``resolve`` and ``scope_gate`` stages still perform liveness and RoE enforcement.
+    """
+    targets = scope.parse_scope(activity.scope_init.read_text(encoding="utf-8", errors="replace"))
+    _, _, wildcards, _ = split_scope(targets)
+    if not wildcards:
+        log.debug("  · skip subdomain_bruteforce (no wildcard scope entries)")
+        return
+    wordlist = wordlists.role_path(activity, "subdomains")
+    if wordlist is None:
+        log.warning(
+            "⚠ skip subdomain_bruteforce — unresolved wordlist role 'subdomains' "
+            "(set PTFLOW_WL_SUBDOMAINS or install a DNS wordlist)",
+        )
+        return
+
+    discovered: list[str] = []
+    for apex_domain in wildcards:
+        discovered += _lines(_run(
+            "shuffledns",
+            [
+                "shuffledns", "-mode", "bruteforce", "-d", apex_domain,
+                "-w", str(wordlist), "-r", RESOLVERS, "-t", SHUFFLEDNS_CONC,
+                "-retries", SHUFFLEDNS_RETRIES, "-sw", "-silent", "-duc",
+            ],
+            stdin=apex_domain,
+            dest=_raw(activity, "shuffledns", f"bruteforce-{apex_domain}"),
+            label=apex_domain,
+        ))
+    total = tools.write_lines(
+        activity.scope_dns,
+        [*tools.read_lines(activity.scope_dns), *wildcards, *discovered],
+    )
+    log.info(
+        "  → subdomain_bruteforce — %d wildcard apex(es), %d active result(s) → %d DNS candidate(s)",
+        len(wildcards), len(tools.dedupe(discovered)), total,
+    )
 
 
 def resolve(activity: Activity) -> None:

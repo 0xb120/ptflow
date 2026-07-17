@@ -12,6 +12,7 @@ subgraph BREADTH["① BREADTH · activity scope — una volta su tutto lo scope"
 direction TB
 provision_wl["provision_wl  ·  net=False<br># wordlists.provision() — un symlink wl_global/&lt;role&gt;.txt per ruolo risolto"]
 expand["expand<br>mapcidr -silent                                  # espande i CIDR<br>naabu -top-ports 1000 -exclude-cdn -c 50 -rate 1000   # porte per harvest TLS (rate=profilo)<br>tlsx -san -cn -resp-only  →  dnsx -silent        # nomi dai cert → risolti<br>dnsx -ptr -resp-only                             # PTR sugli IP<br>assetfinder -subs-only    subfinder -silent      # enum delle wildcard"]
+subdomain_bruteforce["subdomain_bruteforce<br>shuffledns -mode bruteforce -d &lt;wildcard-apex&gt; -w wl_global/subdomains.txt<br>  -r resolvers-trusted -t &lt;profilo&gt; -retries 2 -sw -silent -duc<br># un processo/apex; merge deduplicato dei risultati nel corpus passivo scope_dns.txt"]
 resolve["resolve<br>shuffledns -mode resolve -r resolvers-trusted    # fallback: dnsx -silent<br>dnsx -a -resp-only -silent                       # → unique_ips<br>dnsx -a -resp -nc -silent                        # → domain_ip_map"]
 scope_gate["scope_gate  ·  net=False<br># build_allowlist(scope_init) + filter_assets(subdomains + tls_names, domain_ip_map, unique_ips)<br># offline (net=False) · complementa naabu -exclude-cdn / split_cdn_ip_records (niente check CDN qui)"]
 portscan["portscan<br>naabu -p &lt;~250 WEB_PORTS&gt; -exclude-cdn -c 50 -rate 1000   # rate=profilo<br># → honeypot_split (≥15 porte aperte = honeypot) + select_web_ports"]
@@ -21,7 +22,9 @@ nerva["nerva<br>nerva --json"]
 end
 scope -.->|∥ offline| provision_wl
 scope --> expand
-expand --> resolve
+expand --> subdomain_bruteforce
+provision_wl --> subdomain_bruteforce
+subdomain_bruteforce --> resolve
 resolve --> scope_gate
 scope_gate --> portscan
 portscan --> portscan_full
@@ -126,7 +129,7 @@ classDef phase1 fill:#10331c,stroke:#4cc46b,color:#dcf6e3;
 classDef phase2 fill:#3a2f06,stroke:#e6c247,color:#f8edc2;
 classDef phase3 fill:#3a0f23,stroke:#ef6a9b,color:#fbd9e6;
 classDef phase4 fill:#3a1a08,stroke:#f08a4c,color:#fbe2d2;
-class provision_wl,expand,resolve,scope_gate,portscan,portscan_full,httpx,nerva breadth
+class provision_wl,expand,subdomain_bruteforce,resolve,scope_gate,portscan,portscan_full,httpx,nerva breadth
 class nuclei_scope,screenshot span
 class surface_checkpoint checkpoint
 class passive_probe,crawl,crawl_headless,subenum,takeover,fetch_delta,api_spec,mine_responses,request_catalog phase1

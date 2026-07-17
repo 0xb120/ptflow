@@ -20,7 +20,7 @@ from ptflow.core.flowmap import MapSpec, StepMeta
 FLOWMETA: dict[str, StepMeta] = {
     # --- breadth (activity scope) ---
     "provision_wl": StepMeta(
-        summary="Risolve i ruoli di wordlist globale (content/an_directories/an_php·aspx·jsp/an_txt·xml/"
+        summary="Risolve i ruoli di wordlist globale (subdomains/content/an_directories/an_php·aspx·jsp/an_txt·xml/"
                 "mn_php·phpmillion·html/params/CMS) → wl_global/. Ordine: BYO (file già presente) > env "
                 "PTFLOW_WL_<ROLE> > discovery in PTFLOW_WORDLISTS/SecLists.",
         commands=("# wordlists.provision() — un symlink wl_global/<role>.txt per ruolo risolto",),
@@ -28,7 +28,8 @@ FLOWMETA: dict[str, StepMeta] = {
         notes=("offline, gira ∥ a expand · ruolo non risolto ⇒ lo step a valle degrada su wl_custom",),
     ),
     "expand": StepMeta(
-        summary="Espande lo scope: split per tipo, espande i CIDR, harvest TLS-SAN + PTR, enum wildcard.",
+        summary="Espande lo scope: split per tipo, espande i CIDR, harvest TLS-SAN + PTR ed esegue "
+                "l'enumerazione PASSIVA degli apex wildcard.",
         commands=(
             "mapcidr -silent                                  # espande i CIDR",
             "naabu -top-ports 1000 -exclude-cdn -c 50 -rate 1000   # porte per harvest TLS (rate=profilo)",
@@ -37,6 +38,19 @@ FLOWMETA: dict[str, StepMeta] = {
             "assetfinder -subs-only    subfinder -silent      # enum delle wildcard",
         ),
         outputs=("scope/scope_urls.txt", "scope/scope_ip.txt", "tls_names.txt", "scope/scope_dns.txt"),
+    ),
+    "subdomain_bruteforce": StepMeta(
+        summary="Enumerazione DNS ATTIVA, dopo assetfinder/subfinder: rilegge lo scope e usa solo gli "
+                "apex dichiarati come *.dominio, con wordlist a ruolo e wildcard filtering stretto.",
+        commands=(
+            "shuffledns -mode bruteforce -d <wildcard-apex> -w wl_global/subdomains.txt",
+            "  -r resolvers-trusted -t <profilo> -retries 2 -sw -silent -duc",
+            "# un processo/apex; merge deduplicato dei risultati nel corpus passivo scope_dns.txt",
+        ),
+        outputs=("raw/shuffledns/bruteforce-<apex>.txt", "scope/scope_dns.txt"),
+        notes=("needs expand + provision_wl: l'ordine passivo → attivo è garantito dal DAG",
+               "nessuna entry wildcard ⇒ skip; ruolo subdomains assente ⇒ warning + degradazione passiva",
+               "resolve + scope_gate restano responsabili di liveness e autorizzazione RoE"),
     ),
     "resolve": StepMeta(
         summary="Risolve i candidati DNS a subdomini live e consolida gli IP (+ mappa dominio→IP).",

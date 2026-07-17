@@ -33,6 +33,14 @@ _DEFAULT_DIRS = (
 # role -> ordered candidate paths relative to a search dir; first existing wins. Lists the
 # common filenames across collections, so it's provider-agnostic (not SecLists-only).
 ROLE_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "subdomains": (  # active wildcard enumeration (shuffledns); prefixes, not FQDNs
+        "Discovery/DNS/subdomains-top1million-110000.txt",
+        "Discovery/DNS/subdomains-top1million-20000.txt",
+        "Discovery/DNS/subdomains-top1million-5000.txt",
+        "Discovery/DNS/bitquark-subdomains-top100000.txt",
+        "subdomains-top1million-110000.txt", "subdomains-top1million-20000.txt",
+        "subdomains-top1million-5000.txt", "bitquark-subdomains-top100000.txt",
+    ),
     "content": (  # general content BASE — prefer OneListForAll's curated micro list, fall back to SecLists
         "onelistforallmicro.txt", "Discovery/Web-Content/onelistforallmicro.txt",
         "Discovery/Web-Content/raft-medium-directories.txt",

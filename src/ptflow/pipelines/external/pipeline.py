@@ -27,7 +27,11 @@ class ExternalPipeline:
         # activity scope (whole-scope asset discovery)
         Stage("provision_wl", tasks.provision_wl, net=False),  # wordlist roles → wl_global/ (offline, ∥)
         Stage("expand", tasks.expand),
-        Stage("resolve", tasks.resolve, needs=("expand",)),
+        # Passive wildcard enum completes in expand; active DNS bruteforce then consumes the
+        # provisioned subdomains role only for explicit *.domain scope entries.
+        Stage("subdomain_bruteforce", tasks.subdomain_bruteforce,
+              needs=("expand", "provision_wl")),
+        Stage("resolve", tasks.resolve, needs=("subdomain_bruteforce",)),
         Stage("scope_gate", tasks.scope_gate, needs=("resolve",), net=False),  # RoE authorization gate
         Stage("portscan", tasks.portscan, needs=("scope_gate",)),
         # Correctness barrier: the full scan must complete before clustering, otherwise late web

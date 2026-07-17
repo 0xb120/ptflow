@@ -265,7 +265,7 @@ pytest tests/dast/test_custom_templates.py -q  # live positive + negative calibr
 | Variable | What it does |
 |----------|--------------|
 | `PTFLOW_WORDLISTS` | `:`-separated search directories for global wordlists, prepended to the common locations (e.g. `/usr/share/seclists`). |
-| `PTFLOW_WL_<ROLE>` | Absolute path that pins a specific role's list, overriding discovery. Resolution order per role: BYO (`wl_global/<role>.txt`) › `PTFLOW_WL_<ROLE>` › discovery under `PTFLOW_WORDLISTS`/SecLists › unresolved (the step degrades gracefully). Roles include `content`, `params`, the staged `an_*`/`mn_*` Assetnote lists, and the CMS lists `wordpress`/`drupal`/`joomla`. |
+| `PTFLOW_WL_<ROLE>` | Absolute path that pins a specific role's list, overriding discovery. Resolution order per role: BYO (`wl_global/<role>.txt`) › `PTFLOW_WL_<ROLE>` › discovery under `PTFLOW_WORDLISTS`/SecLists › unresolved (the step degrades gracefully). Roles include `subdomains` (active shuffledns only for `*.domain` scope entries), `content`, `params`, the staged `an_*`/`mn_*` Assetnote lists, and the CMS lists `wordpress`/`drupal`/`joomla`. |
 
 > For the *why* behind these knobs (rate-profile rationale, the deep-dive gating, the staged
 > wordlist strategy, …) see **[CLAUDE.md](CLAUDE.md)** — the single source of truth.

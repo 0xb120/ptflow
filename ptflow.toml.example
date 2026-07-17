@@ -90,10 +90,11 @@ eyewitness = ""                                    # EyeWitness override (empty 
 # Search dir for the global lists (SecLists/Assetnote): roles are resolved by discovery in here.
 dir = "/opt/wordlist"
 
-# Pin a specific file for a ROLE (wins over discovery). Roles: content · wordpress · drupal · joomla ·
+# Pin a specific file for a ROLE (wins over discovery). Roles: subdomains · content · wordpress · drupal · joomla ·
 # params · an_* · mn_*. Useful to fix exactly which list a role uses.
 [wordlists.roles]
 # content = "onelistforallmicro.txt"
+# subdomains = "Discovery/DNS/subdomains-top1million-110000.txt"
 # params  = "burp-parameter-names.txt"
 
 # ── Self-hosted OAST (alternative to the public servers) ────────────────────

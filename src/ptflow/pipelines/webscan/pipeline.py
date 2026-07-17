@@ -3,7 +3,7 @@
 This is the dedicated "external profile" the internal pipeline hands off to (via `Followup`): it takes an
 already-known list of web services (`scheme://host[:port]`, e.g. `<internal-activity>/web_targets.txt`)
 and runs external's crawl → catalog → DAST → fuzz depth on them, **skipping**:
-  - scope EXPANSION — `expand`/`resolve` (subdomain/DNS/TLS/OSINT enumeration);
+  - scope EXPANSION — `expand`/`subdomain_bruteforce`/`resolve` (subdomain/DNS/TLS/OSINT enumeration);
   - active NETWORK scan — `portscan`/`portscan_full`/`nerva`/`nuclei_scope`;
   - per-app OSINT — `passive_probe`/`subenum`/`takeover`/`fetch_delta` (gau/urlfinder/subfinder/DNS).
 
