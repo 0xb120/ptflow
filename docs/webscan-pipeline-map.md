@@ -78,19 +78,22 @@ end
 BAR4 ==> P4
 BAR5[["━━ BARRIERA: FASE 4 → FASE 5 ━━"]]
 P4 ==> BAR5
-subgraph P5["FASE 5 · risk-budgeted DAST deep"]
+subgraph P5["FASE 5 · hidden parameters"]
 direction TB
 param_fuzz["param_fuzz<br># ranking deterministico + quote host/metodo/location/source; cap base 50/25/15 riallocati tra app<br># query: ogni shape (dedup path-template) · body+json: endpoint con body + probe sui GET · header: x8<br>arjun -i targets_&lt;loc&gt;.txt -oJ &lt;loc&gt;.json -m GET|POST|JSON -t 5 -T 15 --rate-limit 20 -q [--headers auth]<br>x8 -u targets_&lt;loc&gt;.txt -w params -O json -o &lt;loc&gt;.json [-X POST] [-t json] [--headers] [-H auth]<br># matrice (tool, location) in un pool cappato (PARAM_FANOUT=3); cap wall-clock per-tool 600s<br># collapse_global_params: un param trovato su ≥75% degli endpoint testati (≥5) = riflesso<br>#   SITE-WIDE → 1 record host-level {scope:site-wide}, non sprayato su ogni endpoint"]
+end
+BAR5 ==> P5
+BAR6[["━━ BARRIERA: FASE 5 → FASE 6 ━━"]]
+P5 ==> BAR6
+subgraph P6["FASE 6 · risk-budgeted DAST deep"]
+direction TB
 dast_full["dast_full<br># delta = shape in requests_full.jsonl NON già in requests.jsonl (request_key) + build_fuzz_requests(params)<br># risk ranking + quote; cap base 1500 riallocato tra app senza aumentare il budget totale<br>nuclei -dast -im jsonl -l input_full.jsonl -t &lt;pack&gt;...<br>       -fa high -fuzz-param-frequency 10000 -rl &lt;profilo&gt; -c &lt;profilo&gt;<br>       -timeout 10 -retries 2 -j -silent -duc [-H auth]<br># dedup_dast_findings: 1 record per (template, host, path, fuzz position), come in dast"]
 xss_full["xss_full<br># candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)<br>dalfox file &lt;raw&gt; --rawdata --format jsonl --skip-bav -w 30 --timeout 10 [--http] [-H auth]"]
 sqli_full["sqli_full<br># candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)<br>sqlmap -r &lt;raw&gt; --batch --smart --level 1 --risk 1 --threads 4 --disable-coloring [-H auth]"]
 end
-param_fuzz --> dast_full
-param_fuzz --> xss_full
-param_fuzz --> sqli_full
-BAR5 ==> P5
+BAR6 ==> P6
 FANIN[["④ FAN-IN · consolidate<br>findings/&lt;tipo&gt;.jsonl"]]
-P5 ==> FANIN
+P6 ==> FANIN
 screenshot -.->|join| FANIN
 classDef breadth fill:#0d2f54,stroke:#4f9be6,color:#dbe9fb;
 classDef span fill:#2e2147,stroke:#a98ee0,color:#ece4fb;
@@ -103,6 +106,7 @@ classDef phase2 fill:#3a2f06,stroke:#e6c247,color:#f8edc2;
 classDef phase3 fill:#3a0f23,stroke:#ef6a9b,color:#fbd9e6;
 classDef phase4 fill:#3a1a08,stroke:#f08a4c,color:#fbe2d2;
 classDef phase5 fill:#0d2f54,stroke:#4f9be6,color:#dbe9fb;
+classDef phase6 fill:#10331c,stroke:#4cc46b,color:#dcf6e3;
 class provision_wl,ingest breadth
 class screenshot span
 class surface_checkpoint checkpoint
@@ -110,8 +114,9 @@ class crawl,crawl_headless,api_spec,mine_responses,request_catalog phase1
 class xref_catalog,dast,xss,sqli,cve_lookup phase2
 class wordlist,tech_enum,content_discovery,recrawl,cloud_assets phase3
 class request_catalog_full,cve_lookup_full,tech_vulnscan phase4
-class param_fuzz,dast_full,xss_full,sqli_full phase5
+class param_fuzz phase5
+class dast_full,xss_full,sqli_full phase6
 class CLUSTER pivot
-class BAR2,BAR3,BAR4,BAR5 bar
+class BAR2,BAR3,BAR4,BAR5,BAR6 bar
 class FANIN fanin
 ```

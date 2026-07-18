@@ -50,7 +50,7 @@ _AI_STAGES = ai.per_app_stages()
 
 class WebscanPipeline:
     name = "webscan"
-    resume_epoch = 2
+    resume_epoch = 3
     stages: Sequence[Stage] = (
         # BREADTH — minimal: no expansion, no active network scan. Just fingerprint the given targets.
         Stage("provision_wl", external.provision_wl, net=False),
@@ -87,11 +87,12 @@ class WebscanPipeline:
         Stage("request_catalog_full", external.request_catalog_full, per_app=True, phase=4, net=False),
         Stage("cve_lookup_full", external.cve_lookup_full, per_app=True, phase=4, net=False),
         Stage("tech_vulnscan", external.tech_vulnscan, per_app=True, phase=4),
-        # ── LOOP 5 — risk-budgeted deep detection ───────────────────────────────────────────────────
+        # ── LOOP 5 — risk-budgeted hidden-parameter discovery ───────────────────────────────────────
         Stage("param_fuzz", external.param_fuzz, per_app=True, phase=5),
-        Stage("dast_full", external.dast_full, needs=("param_fuzz",), per_app=True, phase=5),
-        Stage("xss_full", external.xss_full, needs=("param_fuzz",), per_app=True, phase=5),
-        Stage("sqli_full", external.sqli_full, needs=("param_fuzz",), per_app=True, phase=5),
+        # ── LOOP 6 — risk-budgeted deep scanners over globally-complete params ──────────────────────
+        Stage("dast_full", external.dast_full, per_app=True, phase=6),
+        Stage("xss_full", external.xss_full, per_app=True, phase=6),
+        Stage("sqli_full", external.sqli_full, per_app=True, phase=6),
         *(_AI_STAGES if _AI else ()),
     )
 

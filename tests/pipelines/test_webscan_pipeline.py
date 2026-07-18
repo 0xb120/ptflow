@@ -53,7 +53,8 @@ def test_webscan_phases_preserved():
     assert by_name["content_discovery"].phase == 3
     assert by_name["request_catalog_full"].phase == 4
     assert by_name["param_fuzz"].phase == 5
-    assert by_name["dast_full"].needs == ("param_fuzz",)
+    assert by_name["dast_full"].phase == 6
+    assert by_name["dast_full"].needs == ()
     assert by_name["surface_checkpoint"].after_phase == 2
 
 

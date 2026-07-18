@@ -23,7 +23,7 @@ _AI_STAGES = ai.per_app_stages()
 
 class ExternalPipeline:
     name = "external"
-    resume_epoch = 2
+    resume_epoch = 3
     stages: Sequence[Stage] = (
         # activity scope (whole-scope asset discovery)
         Stage("provision_wl", tasks.provision_wl, net=False),  # wordlist roles → wl_global/ (offline, ∥)
@@ -112,15 +112,16 @@ class ExternalPipeline:
         Stage("cve_lookup_full", tasks.cve_lookup_full, per_app=True, phase=4, net=False),
         # finding-only per-stack vuln scanners (gated on detected tech), also catalog-independent.
         Stage("tech_vulnscan", tasks.tech_vulnscan, per_app=True, phase=4),
-        # ── per-app PHASE 5 — risk-budgeted deep detection ──────────────────────────────────────────
-        # Discover hidden params, then DAST only the DELTA vs phase 2 + param-injection requests. Caps
-        # are redistributed from small apps to rich apps using every completed full catalog.
+        # ── per-app PHASE 5 — risk-budgeted hidden-parameter discovery ──────────────────────────────
+        # Uses every completed full catalog to redistribute query/body/header budgets deterministically.
         Stage("param_fuzz", tasks.param_fuzz, per_app=True, phase=5),
-        Stage("dast_full", tasks.dast_full, needs=("param_fuzz",), per_app=True, phase=5),
+        # ── per-app PHASE 6 — risk-budgeted deep scanners ───────────────────────────────────────────
+        # The 5→6 barrier freezes params for every app, so demand is the exact delta + synthesized params.
+        Stage("dast_full", tasks.dast_full, per_app=True, phase=6),
         # dedicated vuln scanners over the GUESSED-surface delta + discovered params (the dalfox/sqlmap
         # analog of dast_full): fuzz only what phase 2 didn't already cover. Need the full catalog + params.
-        Stage("xss_full", tasks.xss_full, needs=("param_fuzz",), per_app=True, phase=5),
-        Stage("sqli_full", tasks.sqli_full, needs=("param_fuzz",), per_app=True, phase=5),
+        Stage("xss_full", tasks.xss_full, per_app=True, phase=6),
+        Stage("sqli_full", tasks.sqli_full, per_app=True, phase=6),
         *(_AI_STAGES if _AI else ()),
     )
 

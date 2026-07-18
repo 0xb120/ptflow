@@ -447,10 +447,10 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     a single best-host candidate per group → the unified gallery `screenshots/screenshot/screenshot.html`
     (+ OPTIONAL one EyeWitness run → `report.html` + default-cred leads). Reconciled per group by URL.
     Runs ∥ the loops (no longer a loop-1 step). See "Unified screenshot" below.
-    The per-app loops are a **surface-first, DAST-first** escalation in five phases: map only what's
+    The per-app loops are a **surface-first, DAST-first** escalation in six phases: map only what's
     really there and DAST *that* (fast, high-signal findings) BEFORE sinking hours into guessing; then
     fuzz, then DAST the guessed surface. The clean split (explorable vs guessed) also keeps each DAST
-    pass scoped — phase 5 fuzzes only the delta, never re-DASTing the surface phase 2 already covered.
+    pass scoped — phase 6 fuzzes only the delta, never re-DASTing the surface phase 2 already covered.
   - **Loop 1 — explorable surface** (`phase=1`, NO guessing): `passive_probe` → `crawl` (katana ∥
     crawley + JS-render classification, see below) → `crawl_headless` (gated TIER-1 headless, ∥
     takeover) ; `subenum` ; `takeover` (← crawl + subenum) ; `fetch_delta` (OSINT delta) →
@@ -476,7 +476,7 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
   - **Surface checkpoint** (`after_phase=2`, activity-scope, offline): after the global phase-2 barrier,
     `surface_checkpoint` consolidates only the mature phase-1/2 findings (CVE/DAST/XSS/SQLi surface +
     takeover) into `checkpoints/surface/findings/<type>.jsonl` and publishes
-    `reports/report-surface.md` / `reports/report-surface.json`. It excludes phase-3/4/5 outputs and
+    `reports/report-surface.md` / `reports/report-surface.json`. It excludes phase-3/4/5/6 outputs and
     spanning stages that have not joined yet;
     the terminal report remains authoritative and later folds surface + deep findings.
   - **Loop 3 — guessing / surface expansion** (`phase=3`): `wordlist` (offline seed from JS/body/seed)
@@ -490,10 +490,11 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     corpus). `cve_lookup_full` re-mines the expanded corpus and reports only the delta vs phase 2;
     `tech_vulnscan` runs the finding-only per-stack detectors. The global 4→5 barrier guarantees every
     full catalog exists before cross-app budgets are calculated.
-  - **Loop 5 — risk-budgeted deep detection** (`phase=5`): `param_fuzz` discovers hidden
+  - **Loop 5 — risk-budgeted hidden-parameter discovery** (`phase=5`): `param_fuzz` discovers hidden
     params across **all locations** (query · body · json · header — arjun `-m` ∥ x8
-    `-X`/`--data-type`/`--headers`), not GET-only, over the full catalog → `params.jsonl` ; `dast_full`
-    runs nuclei `-dast` over the **delta** (full catalog minus the surface catalog) + synthesized
+    `-X`/`--data-type`/`--headers`), not GET-only, over the full catalog → `params.jsonl`.
+  - **Loop 6 — risk-budgeted deep scanners** (`phase=6`): after the global 5→6 barrier has frozen every
+    app's params, `dast_full` runs nuclei `-dast` over the **delta** (full catalog minus the surface catalog) + synthesized
     requests for the discovered params → `findings/dast_full.jsonl`. `xss_full` (dalfox) ∥
     `sqli_full` (sqlmap) run the dedicated scanners over the **same delta** (`request_catalog_full` +
     `param_fuzz`) → `findings/xss_full.jsonl` / `findings/sqli_full.jsonl` — the dalfox/sqlmap analog of
@@ -595,7 +596,7 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
   https-default (external design note); (3) largely EGRESS-FREE with OSINT gone, but two external internals
   still call out — `content_discovery`'s trufflehog `--results=verified` validates hits against the
   credential's PROVIDER (external) — mind it on an air-gapped engagement. Verified end-to-end on a
-  loopback server: `ingest` (scheme+port honoured) → `cluster` → all five depth loops (the catalog
+  loopback server: `ingest` (scheme+port honoured) → `cluster` → all six depth loops (the catalog
   captured a POST form + query params), no expansion/OSINT artifacts written. It ships its own flow map
   (`pipelines/webscan/flowmeta.py` → `docs/webscan-pipeline-*`), reusing external's `FLOWMETA` + adding
   only the `ingest` step.
@@ -777,7 +778,7 @@ artifacts so write-once holds and each DAST pass reads exactly its scope.
   folded in (`requests_recrawl.jsonl` + content_discovery 2xx + the re-extracted fuzz corpus, incl.
   feroxbuster-found shapes) → `requests_full.jsonl`. It reads phase-1 + phase-3 artifacts across the
   barriers, so it sees the COMPLETE corpus. The 4→5 barrier freezes it for every app before
-  `param_fuzz` + `dast_full` consume engagement-wide budgets.
+  `param_fuzz`; the 5→6 barrier then freezes discovered params before deep scanners consume budgets.
 - **Closing the fuzzing→DAST gap (shapes are mostly on disk already).** A feroxbuster/jsluice discovery
   entered the catalog as a bare GET — losing its real method/body. So `request_catalog` MINES request
   shapes from the already-downloaded corpus (no re-fetch — "fetch once"): `jsluice_requests` recovers the
@@ -814,7 +815,8 @@ make selection reproducible under reordered catalogs.
 `allocate_group_budgets` preserves the total engagement budget (`base cap × app count`): an app first
 consumes at most its observed catalog demand, then unused capacity is water-filled across richer apps.
 Surface budgets reconstruct each app's catalog plus cross-group routing from completed phase-1 data;
-deep budgets read every `requests_full.jsonl` after the phase-4 barrier. Thus concurrency cannot change
+param budgets read every `requests_full.jsonl` after phase 4, while deep budgets use the exact delta plus
+all synthesized params after phase 5. Thus concurrency cannot change
 the allocation. Per-app base caps remain the traffic-control inputs, but an app may receive more than
 its base when another app cannot use its share.
 
@@ -853,7 +855,7 @@ and `dast.fuzz_param_frequency` (default `10000`). Nuclei OAST templates are act
 - **`dast`** (phase 2) over the explorable-surface set (`_surface_request_set` = `requests.jsonl` **∪**
   the cross-group sidecar `requests_xref.jsonl`) with its **observed** params → `findings/dast.jsonl`
   (input `raw/dast/input.jsonl`). The fast low-hanging-fruit pass.
-- **`dast_full`** (phase 5) over the **delta** (`_delta_request_set` = `requests_full.jsonl` shapes NOT
+- **`dast_full`** (phase 6) over the **delta** (`_delta_request_set` = `requests_full.jsonl` shapes NOT
   already in `requests.jsonl` **nor** `requests_xref.jsonl`, keyed by `request_key`) + `build_fuzz_requests`
   (the discovered hidden params injected into concrete requests per location) → `findings/dast_full.jsonl`
   (input `raw/dast/input_full.jsonl`). It does NOT re-DAST the surface phase 2 already covered (including
@@ -890,7 +892,7 @@ feroxbuster/crawley, arjun/x8, dalfox/sqlmap, wpprobe) so crawl/fetch/fuzz/DAST 
 
 nuclei `-dast`'s generic templates are weak detectors (run-analysis: on a deliberately-vulnerable target
 they fired only `cookie-injection`/`crlf-injection` and missed the real SQLi/XSS). `xss`/`sqli` (phase 2)
-and `xss_full`/`sqli_full` (phase 5) are the **dedicated** complement — the same surface/delta split as
+and `xss_full`/`sqli_full` (phase 6) are the **dedicated** complement — the same surface/delta split as
 `dast`/`dast_full`, sharing `_surface_request_set`/`_delta_request_set`. Both tools consume the catalog's
 **`raw`** request (one process per request, Burp/ZAP raw via dalfox `file --rawdata` / sqlmap `-r`), so
 **every param location** is tested (query/body/json/header/cookie), not GET-only — the payoff of the
@@ -1245,7 +1247,7 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
 - **Dedicated scanners (dalfox/sqlmap) complement nuclei -dast, fed the catalog's raw requests, with NO
   gf-style routing.** A run-analysis proved nuclei `-dast`'s generic templates miss real bugs (only
   `cookie-injection`/`crlf-injection` fired on a deliberately-vulnerable target; the reflected XSS was
-  quote-filtered, the SQLi was blind/no-error). `xss`/`sqli` (phase 2) + `xss_full`/`sqli_full` (phase 5)
+  quote-filtered, the SQLi was blind/no-error). `xss`/`sqli` (phase 2) + `xss_full`/`sqli_full` (phase 6)
   add dalfox + sqlmap on the same surface/delta split as `dast`/`dast_full` (shared
   `_surface_request_set`/`_delta_request_set`). *Why no gf routing:* reconftw pipes `gf xss`/`gf sqli`
   (regex on the param NAME) into the tools — a guess that both misses (a SQLi on `category` isn't in the
@@ -1391,13 +1393,14 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
   miner (WordPress `/wp-content/plugins/<slug>/<ver>/`); nerva IP-only records whose IP isn't in
   `domain_ip_map.txt` (the bracketed-IP parse bug is fixed — IP attribution now works).
 
-- **Per-app loops are surface-first, DAST-first — five phases.** Map only the EXPLORABLE
+- **Per-app loops are surface-first, DAST-first — six phases.** Map only the EXPLORABLE
   surface (OSINT/crawl, no guessing) and DAST *that* first, THEN guess/fuzz, THEN DAST the guessed
   surface. The phases: (1) explorable surface — passive/crawl/headless + `fetch_delta`/`mine_responses` +
   `api_spec`, tail `request_catalog` → `requests.jsonl`; (2) `dast` over that surface (low-hanging fruit);
   (3) guessing — `wordlist`→`tech_enum`→`content_discovery` fixpoint→`recrawl`; (4) freeze every
   `request_catalog_full` (`requests_full.jsonl`) while expanded CVE/tech finding passes run; (5)
-  `param_fuzz`→`dast_full`/`xss_full`/`sqli_full` with global budget redistribution. *Why:* high-signal findings on the REAL attack
+  `param_fuzz` with catalog-complete budget redistribution; (6) `dast_full`/`xss_full`/`sqli_full`
+  after every app's params are frozen, with exact delta+param demand. *Why:* high-signal findings on the REAL attack
   surface arrive fast — across the whole scope (the phase barrier) — before sinking hours into fuzzing;
   the explorable/guessed split also keeps each DAST scoped. *Why `mine_responses` (extract + jsluice) is
   phase 1, not phase 3:* `request_catalog` mines POST/form/XHR shapes from the extracted corpus, so
@@ -1410,7 +1413,9 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
   `dast_full.jsonl`. *Why `dast_full` fuzzes only the DELTA* (full minus surface, by `request_key`) + the
   param-injection requests: phase 2 already covered the surface, so re-DASTing it is wasted nuclei work;
   the hidden params are new injection points so they're always included. *Rejected:* the literal
-  four-phase layout without a full-catalog barrier — it cannot redistribute deep budgets race-free;
+  five-phase layout without a global param barrier — it underestimates deep demand when hidden params
+  add candidates; the older four-phase layout without a full-catalog barrier cannot redistribute catalog
+  budgets race-free;
   the older three-phase reading (fuzz is terminal) also drops DAST coverage of the fuzzing-discovered surface, a
   regression vs the old single end-of-pipeline DAST; running `param_fuzz` in phase 2 — it's guessing
   (brute-forces param names), so it belongs after the low-hanging-fruit pass. *(Supersedes the old Loop

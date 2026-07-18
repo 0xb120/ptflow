@@ -146,7 +146,8 @@ L'implementazione di M1 è completa:
   artifact del feedback loop;
 - budget totale dell'engagement invariato e capacità inutilizzata riallocata dalle app piccole a quelle
   con più request shape;
-- barriera fra catalogo full e deep detection per rendere la riallocazione deterministica e race-free;
+- barriere dopo catalogo full e param discovery per rendere deterministica e race-free la domanda
+  effettiva di ogni scanner deep;
 - audit per-request redatti in `raw/ranking/` e distribuzioni/cap aggregati in `coverage.json`;
 - test di determinismo, quote, redazione dei secret, riallocazione e confronto a budget uguale contro la
   precedente strategia first-N.
@@ -407,14 +408,14 @@ Automatizzare le vulnerabilità ad alto valore che richiedono confronto fra iden
 ### Stage proposti
 
 ```text
-object_inventory       phase 6, offline
-authz_replay           phase 6, network
-idor                    phase 6, network
-mass_assignment         phase 6, network
-session_security        phase 6, network/offline
+object_inventory       phase 7, offline
+authz_replay           phase 7, network
+idor                    phase 7, network
+mass_assignment         phase 7, network
+session_security        phase 7, network/offline
 ```
 
-La fase 6 usa il catalogo completo dopo la deep detection risk-budgeted di fase 5.
+La fase 7 usa il catalogo completo dopo la deep detection risk-budgeted di fase 6.
 
 ### Object inventory
 

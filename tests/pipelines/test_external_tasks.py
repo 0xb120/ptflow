@@ -399,7 +399,7 @@ def test_portscan_policy_timeout_preserves_partial_results(monkeypatch, tmp_path
 
 
 def test_pipeline_phase_wiring():
-    """The 5-phase surface-first/DAST-first per-app model: phase numbers + intra-phase `needs`
+    """The 6-phase surface-first/DAST-first per-app model: phase numbers + intra-phase `needs`
     (cross-phase ordering is the barrier, never `needs`)."""
     from ptflow.pipelines.external.pipeline import PIPELINE
 
@@ -449,13 +449,13 @@ def test_pipeline_phase_wiring():
     assert by_name["request_catalog_full"].needs == ()   # reads PHASE-1 + PHASE-3 across barriers
     assert by_name["cve_lookup_full"].net is False
     assert by_name["cve_lookup_full"].needs == ()
-    # PHASE 5 consumes the globally complete catalogs: hidden params first, then deep scanners.
-    phase5 = ("param_fuzz", "dast_full", "xss_full", "sqli_full")
-    assert {by_name[n].phase for n in phase5} == {5}
+    # PHASE 5 consumes the globally complete catalogs for hidden-param discovery.
     assert by_name["param_fuzz"].needs == ()
-    assert by_name["dast_full"].needs == ("param_fuzz",)
-    assert by_name["xss_full"].needs == ("param_fuzz",)
-    assert by_name["sqli_full"].needs == ("param_fuzz",)
+    assert by_name["param_fuzz"].phase == 5
+    # PHASE 6 starts only after every app completed params, then computes exact deep demand.
+    phase6 = ("dast_full", "xss_full", "sqli_full")
+    assert {by_name[n].phase for n in phase6} == {6}
+    assert all(by_name[n].needs == () for n in phase6)
 
 
 def test_depth_pure_helpers():

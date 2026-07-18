@@ -192,6 +192,54 @@ def test_stage_budget_redistributes_against_complete_engagement_catalogs(tmp_pat
     assert json.loads((rich.raw("ranking") / "budget-test.json").read_text())["redistributed"] == 45
 
 
+def test_endpoint_budget_uses_same_complete_catalog_as_param_selector(tmp_path):
+    activity = Activity.named("param-budget", root=tmp_path).ensure()
+    app = activity.app("app").ensure()
+    tools.write_jsonl(app.canonical("requests_full.jsonl"), [
+        _request("GET", f"https://app.test/asset-{index}.png") for index in range(60)
+    ])
+
+    cap = tasks._stage_request_budget(
+        activity,
+        "app",
+        per_app_cap=50,
+        name="param_query",
+        deep=True,
+        demand_kind="endpoint",
+    )
+
+    assert cap == 50
+    rationale = json.loads((app.raw("ranking") / "budget-param_query.json").read_text())
+    assert rationale["app_demand"] == 60
+    assert rationale["applied"] is True
+
+
+def test_deep_scanner_budget_includes_all_synthesized_params(tmp_path):
+    activity = Activity.named("deep-budget", root=tmp_path).ensure()
+    app = activity.app("app").ensure()
+    tools.write_jsonl(app.canonical("requests.jsonl"), [])
+    tools.write_jsonl(app.canonical("requests_xref.jsonl"), [])
+    tools.write_jsonl(app.canonical("requests_full.jsonl"), [])
+    tools.write_jsonl(app.canonical("params.jsonl"), [
+        {"url": f"https://app.test/path-{index}", "param": "id", "loc": "query"}
+        for index in range(11)
+    ])
+
+    cap = tasks._stage_request_budget(
+        activity,
+        "app",
+        per_app_cap=40,
+        name="sqli_full",
+        deep=True,
+        demand_kind="parameterized",
+    )
+
+    assert cap == 11
+    rationale = json.loads((app.raw("ranking") / "budget-sqli_full.json").read_text())
+    assert rationale["app_demand"] == 11
+    assert rationale["applied"] is False
+
+
 def test_task_integration_persists_audit_and_coverage_distribution(tmp_path):
     activity = Activity.named("ranking", root=tmp_path).ensure()
     audit = activity.base / "ranking.jsonl"

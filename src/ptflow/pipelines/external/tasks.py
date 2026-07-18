@@ -261,9 +261,9 @@ PARAM_FANOUT = 3                 # concurrent (tool, location) param jobs per ap
 PARAM_GLOBAL_RATIO = 0.75   # found on ≥ this fraction of the endpoints tested at a location → collapse
 PARAM_GLOBAL_MIN_HITS = 5   # …but only above this many hits, so a tiny tested set can't trip the ratio
 
-# per-app DAST (PHASE 2 surface + PHASE 5 deep) — nuclei -dast over the request catalog (full requests
+# per-app DAST (PHASE 2 surface + PHASE 6 deep) — nuclei -dast over the request catalog (full requests
 # → fuzz query/path/header/cookie/body, not just GET query). Phase 2 hits the explorable surface
-# (requests.jsonl); phase 5 hits the guessed delta + discovered params. Whole-scope full-template nuclei
+# (requests.jsonl); phase 6 hits the guessed delta + discovered params. Whole-scope full-template nuclei
 # is nuclei_scope (breadth). Best-effort (skips if nuclei / every enabled DAST pack is absent).
 DAST_MAX_REQUESTS = 1500   # cap requests fed to nuclei per app (reconftw DEEP_LIMIT2 analog); logged
 
@@ -437,7 +437,7 @@ def _dast_selection(settings: dastconfig.Settings) -> dastconfig.Selection:
 # — verified. We run the full per-param tests + --text-only (compare visible text only) so detection
 # survives a content-DYNAMIC page, where the default page-comparison is "not stable" and misses the
 # injection — verified: --smart→0, --text-only L1/R1→boolean+UNION in ~14s. Surface (phase 2) + delta
-# (phase 5), mirroring dast/dast_full. Best-effort; per-request wall-clock cap (arjun/x8 livelock lesson).
+# (phase 6), mirroring dast/dast_full. Best-effort; per-request wall-clock cap (arjun/x8 livelock lesson).
 _DALFOX_BIN = Path.home() / "go" / "bin" / "dalfox"
 DALFOX = str(_DALFOX_BIN) if _DALFOX_BIN.exists() else "dalfox"
 _SQLMAP_SCRIPT = os.environ.get("PTFLOW_SQLMAP") or "/opt/sqlmap-dev/sqlmap.py"
@@ -5143,7 +5143,7 @@ def _delta_request_set(
     ws: AppWorkspace, *, cap: int, purpose: ranking.Purpose = "dast",
     name: str = "dast_delta_pool", audit_path: Path | None = None,
 ) -> list[dict]:
-    """The GUESSED-surface DELTA request set (phase 5): full-catalog shapes NOT already covered by the
+    """The GUESSED-surface DELTA request set (phase 6): full-catalog shapes NOT already covered by the
     phase-2 surface — the surface catalog (requests.jsonl) OR the cross-group sidecar (requests_xref.jsonl,
     which phase-2 dast/xss/sqli already tested) — keyed by request_key, PLUS the synthesized requests for
     the discovered hidden params (params.jsonl), deduped and capped. Shared by `dast_full` and the deep
@@ -5192,7 +5192,7 @@ def dast(activity: Activity, app_id: str) -> None:
 
 
 def dast_full(activity: Activity, app_id: str) -> None:
-    """PHASE 5 — DAST the GUESSED surface (detailed). To avoid re-DASTing what phase-2 already covered,
+    """PHASE 6 — DAST the GUESSED surface (detailed). To avoid re-DASTing what phase-2 already covered,
     it fuzzes only the DELTA: the request shapes in the full catalog (requests_full.jsonl) NOT already
     in the surface catalog (requests.jsonl, keyed by request_key) PLUS the synthesized requests for the
     hidden params param_fuzz discovered (params.jsonl) — those are NEW injection points even on a
@@ -5217,7 +5217,7 @@ def dast_full(activity: Activity, app_id: str) -> None:
     )
 
 
-# --- dedicated vuln scanners (PHASE 2 surface + PHASE 5 deep) — dalfox (XSS) ∥ sqlmap (SQLi) ----------
+# --- dedicated vuln scanners (PHASE 2 surface + PHASE 6 deep) — dalfox (XSS) ∥ sqlmap (SQLi) ----------
 # Both consume the catalog's `raw` (one request per process, Burp/ZAP raw), so EVERY param location is
 # tested, not GET-only. NO gf-style name routing: every parameterized request is a candidate, each tool's
 # own engine decides (dalfox reflection+context · sqlmap --smart heuristic). Best-effort, capped, with a
@@ -5231,19 +5231,36 @@ def _has_params(r: dict) -> bool:
     return bool(r.get("params")) or "?" in (r.get("url") or "") or bool(r.get("body"))
 
 
-def _budget_catalog(activity: Activity, ws: AppWorkspace, *, deep: bool) -> list[dict]:
+def _budget_catalog(
+    activity: Activity, ws: AppWorkspace, *, deep: bool, include_static: bool = False,
+) -> list[dict]:
     """Stable engagement-wide demand source for M1 budget redistribution.
 
     Surface demand is reconstructed from phase-1 artifacts so it does not depend on which phase-2
-    ``xref_catalog`` task happens to finish first. Deep demand reads ``requests_full.jsonl`` only after
-    the phase-4 barrier has completed that catalog for every app.
+    ``xref_catalog`` task happens to finish first. Param-endpoint demand reads every full catalog after
+    phase 4; deep scanner demand reads the exact delta plus synthesized params after the phase-5 barrier.
     """
-    if deep:
+    if deep and include_static:
         records = tools.read_jsonl(ws.canonical("requests_full.jsonl"))
+    elif deep:
+        surface_keys = {request_key(record) for record in tools.read_jsonl(
+            ws.canonical("requests.jsonl")
+        )}
+        surface_keys |= {request_key(record) for record in tools.read_jsonl(
+            ws.canonical("requests_xref.jsonl")
+        )}
+        delta = [
+            record for record in tools.read_jsonl(ws.canonical("requests_full.jsonl"))
+            if request_key(record) not in surface_keys
+        ]
+        records = [*delta, *build_fuzz_requests(tools.read_jsonl(ws.canonical("params.jsonl")))]
     else:
         xref, _ = _finalize_catalog(ws, _cross_group_surface(activity, ws), [])
         records = [*tools.read_jsonl(ws.canonical("requests.jsonl")), *xref]
-    return merge_requests(record for record in records if not is_static_dast_request(record))
+    eligible = records if include_static else (
+        record for record in records if not is_static_dast_request(record)
+    )
+    return merge_requests(eligible)
 
 
 def _stage_request_budget(  # noqa: PLR0913
@@ -5258,7 +5275,11 @@ def _stage_request_budget(  # noqa: PLR0913
     """Return this app's share of a fixed engagement budget and persist its safe rationale."""
     demands: dict[str, int] = {}
     for app in activity.list_apps():
-        records = _budget_catalog(activity, app, deep=deep)
+        # Param discovery intentionally ranks the complete endpoint catalog; its demand must not be
+        # estimated from the narrower DAST pool or a single app can lose part of its own base cap.
+        records = _budget_catalog(
+            activity, app, deep=deep, include_static=demand_kind == "endpoint",
+        )
         if demand_kind == "endpoint":
             demand = len({path_template(str(record.get("url") or "")) for record in records})
         elif demand_kind == "parameterized":
@@ -5560,7 +5581,7 @@ def xss(activity: Activity, app_id: str) -> None:
 
 
 def xss_full(activity: Activity, app_id: str) -> None:
-    """PHASE 5 — dalfox over the GUESSED-surface DELTA + discovered-param requests → findings/xss_full.jsonl."""
+    """PHASE 6 — dalfox over the GUESSED-surface DELTA + discovered-param requests → findings/xss_full.jsonl."""
     ws = activity.app(app_id)
     _run_dalfox(
         ws, _scanner_request_set(activity, app_id, deep=True, purpose="xss", stage="xss_full"),
@@ -5578,7 +5599,7 @@ def sqli(activity: Activity, app_id: str) -> None:
 
 
 def sqli_full(activity: Activity, app_id: str) -> None:
-    """PHASE 5 — sqlmap over the GUESSED-surface DELTA + discovered-param requests → findings/sqli_full.jsonl."""
+    """PHASE 6 — sqlmap over the GUESSED-surface DELTA + discovered-param requests → findings/sqli_full.jsonl."""
     ws = activity.app(app_id)
     _run_sqlmap(
         ws, _scanner_request_set(activity, app_id, deep=True, purpose="sqli", stage="sqli_full"),
