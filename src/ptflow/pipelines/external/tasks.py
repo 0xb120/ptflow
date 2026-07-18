@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import (
     parse_qsl,
     quote,
@@ -46,7 +46,7 @@ from ptflow.core import reporting, scope, telemetry, tools, workspace
 from ptflow.core.log import get_logger, is_verbose
 from ptflow.core.requirements import Requirement, check
 from ptflow.core.stage import Followup
-from ptflow.pipelines.external import wordlists
+from ptflow.pipelines.external import ranking, wordlists
 
 if TYPE_CHECKING:
     from ptflow.core.paths import Activity, AppWorkspace
@@ -246,7 +246,7 @@ DEEP_DIVE_DEADLINE_S = 3600  # per-app wall-clock budget for the whole deep dive
 DEEP_DIVE_TIME_LIMIT = "30m"  # feroxbuster --time-limit per deep-dive host run
 DEEP_DIVE_DEPTH = "3"        # recursion depth for the deep dive (Pass A uses FEROX_DEPTH=2)
 
-# parameter fuzzing (PHASE 4) — arjun ∥ x8 hidden-parameter discovery over the enumerated endpoints.
+# parameter fuzzing (PHASE 5) — arjun ∥ x8 hidden-parameter discovery over the enumerated endpoints.
 # Per-endpoint and request-heavy (a 6.5k-name wordlist over N endpoints, two tools), so the endpoint
 # set is deduped by path-template and capped, and both tools run gently (low concurrency + rate cap).
 PARAM_MAX_ENDPOINTS = 50   # cap distinct endpoint shapes fuzzed per app (logged when it bites)
@@ -261,9 +261,9 @@ PARAM_FANOUT = 3                 # concurrent (tool, location) param jobs per ap
 PARAM_GLOBAL_RATIO = 0.75   # found on ≥ this fraction of the endpoints tested at a location → collapse
 PARAM_GLOBAL_MIN_HITS = 5   # …but only above this many hits, so a tiny tested set can't trip the ratio
 
-# per-app DAST (PHASE 2 surface + PHASE 4 deep) — nuclei -dast over the request catalog (full requests
+# per-app DAST (PHASE 2 surface + PHASE 5 deep) — nuclei -dast over the request catalog (full requests
 # → fuzz query/path/header/cookie/body, not just GET query). Phase 2 hits the explorable surface
-# (requests.jsonl); phase 4 hits the guessed delta + discovered params. Whole-scope full-template nuclei
+# (requests.jsonl); phase 5 hits the guessed delta + discovered params. Whole-scope full-template nuclei
 # is nuclei_scope (breadth). Best-effort (skips if nuclei / every enabled DAST pack is absent).
 DAST_MAX_REQUESTS = 1500   # cap requests fed to nuclei per app (reconftw DEEP_LIMIT2 analog); logged
 
@@ -437,12 +437,12 @@ def _dast_selection(settings: dastconfig.Settings) -> dastconfig.Selection:
 # — verified. We run the full per-param tests + --text-only (compare visible text only) so detection
 # survives a content-DYNAMIC page, where the default page-comparison is "not stable" and misses the
 # injection — verified: --smart→0, --text-only L1/R1→boolean+UNION in ~14s. Surface (phase 2) + delta
-# (phase 4), mirroring dast/dast_full. Best-effort; per-request wall-clock cap (arjun/x8 livelock lesson).
+# (phase 5), mirroring dast/dast_full. Best-effort; per-request wall-clock cap (arjun/x8 livelock lesson).
 _DALFOX_BIN = Path.home() / "go" / "bin" / "dalfox"
 DALFOX = str(_DALFOX_BIN) if _DALFOX_BIN.exists() else "dalfox"
 _SQLMAP_SCRIPT = os.environ.get("PTFLOW_SQLMAP") or "/opt/sqlmap-dev/sqlmap.py"
 SQLMAP_CMD = [sys.executable, _SQLMAP_SCRIPT]   # sqlmap is a python script, not a PATH binary
-VULN_MAX_REQUESTS = 40      # cap candidate (parameterized) requests per app per pass per tool
+VULN_MAX_REQUESTS = 40      # base per-app cap; M1 redistributes unused engagement capacity by risk
 VULN_FANOUT = 3             # concurrent scanner processes per app (each is itself network-heavy)
 VULN_TOOL_TIMEOUT = 180     # per-request wall-clock cap (s) — a slow target must not hang the loop
 DALFOX_WORKERS = "30"       # dalfox -w (concurrent payloads per request)
@@ -1380,27 +1380,47 @@ def ferox_transport_failed(out: str) -> bool:
     return False
 
 
-def select_new_urls(records: list[dict], seen: set[str], *, cap: int) -> list[str]:
+def _select_ranked_requests(
+    records: list[dict], *, cap: int, purpose: ranking.Purpose, name: str,
+    audit_path: Path | None = None,
+) -> list[dict]:
+    """Apply the shared allocator and emit safe aggregate + per-request selection evidence."""
+    selection = ranking.allocate(records, cap=cap, purpose=purpose)
+    summary = selection.summary()
+    telemetry.record_cap(
+        name, limit=cap, observed=summary["observed"], selected=summary["selected"],
+    )
+    telemetry.record_drop(f"{name}_cap", max(0, summary["observed"] - summary["selected"]))
+    telemetry.record_selection(name, summary)
+    if audit_path is not None:
+        tools.write_jsonl(audit_path, (decision.as_dict() for decision in selection.decisions))
+    return list(selection.records)
+
+
+def select_new_urls(
+    records: list[dict], seen: set[str], *, cap: int, audit_path: Path | None = None,
+) -> list[str]:
     """feroxbuster hits worth downloading+mining: 2xx/3xx URLs not already in the response store.
 
-    Dedups (order-preserving), drops anything in `seen` (already fetched) and non-2xx/3xx, and caps
-    the count to `cap` to bound a round's download fan-out — logging a WARNING when the cap actually
-    bites (no silent truncation). The frontier the content-discovery fixpoint feeds back. Pure."""
-    out: list[str] = []
-    picked: set[str] = set()
+    Dedups by URL, drops anything in `seen` (already fetched) and non-2xx/3xx, then applies the shared
+    risk/strata allocator to bound a round's download fan-out. The frontier the content-discovery
+    fixpoint feeds back. Pure apart from telemetry/audit output."""
+    candidates: dict[str, dict] = {}
     for r in records:
         url, status = r.get("url"), r.get("status") or 0
-        if not url or url in seen or url in picked or not (200 <= status < 400):  # noqa: PLR2004
+        if not url or url in seen or not (200 <= status < 400):  # noqa: PLR2004
             continue
-        picked.add(url)
-        out.append(url)
-    if len(out) > cap:
-        telemetry.record_cap("content_round_urls", limit=cap, observed=len(out), selected=cap)
-        telemetry.record_drop("content_round_cap", len(out) - cap)
-        log.warning("⚠ content fixpoint: capping round delta %d→%d new url(s)", len(out), cap)
-        return out[:cap]
-    telemetry.record_cap("content_round_urls", limit=cap, observed=len(out), selected=len(out))
-    return out
+        candidates.setdefault(url, {
+            **r, "method": "GET", "sources": r.get("sources") or ["content-discovery"],
+        })
+    selected = _select_ranked_requests(
+        list(candidates.values()), cap=cap, purpose="artifact", name="content_round_urls",
+        audit_path=audit_path,
+    )
+    if len(candidates) > cap:
+        log.warning("⚠ content fixpoint: capping round delta %d→%d new url(s)",
+                    len(candidates), cap)
+    return [str(record["url"]) for record in selected]
 
 
 def merge_ferox_by_url(acc: list[dict], new: list[dict]) -> list[dict]:
@@ -4135,7 +4155,12 @@ def _content_rounds(ws: AppWorkspace, hosts: list[str], frontier: list[str]) -> 
         rounds += 1
         if r == CONTENT_FEEDBACK_ROUNDS:
             break  # round cap reached — no feedback round left to consume new findings
-        new_urls = select_new_urls(recs, seen, cap=DEEP_DOWNLOAD_CAP)
+        new_urls = select_new_urls(
+            recs,
+            seen,
+            cap=DEEP_DOWNLOAD_CAP,
+            audit_path=ws.raw("ranking") / f"content-round-{r}.jsonl",
+        )
         if not new_urls:
             stop = "url-fixpoint"
             break
@@ -4310,39 +4335,45 @@ def path_template(url: str) -> str:
     return f"{base}/{norm}"
 
 
-def select_param_endpoints(urls: Iterable[str], in_scope_hosts: set[str], *, cap: int) -> list[str]:
-    """The endpoints to param-fuzz: in-scope host, deduped by path_template (one shape, first wins,
-    query stripped), capped to `cap` (logged when it bites). Pure (logging only)."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw in urls:
-        u = raw.strip()
+def select_param_endpoints(
+    urls: Iterable[str | dict], in_scope_hosts: set[str], *, cap: int,
+    name: str = "param_query_endpoints", audit_path: Path | None = None,
+) -> list[str]:
+    """Ranked in-scope endpoint shapes for hidden query/header parameter discovery."""
+    by_template: dict[str, dict] = {}
+    for item in urls:
+        record = item if isinstance(item, dict) else {"method": "GET", "url": item, "sources": []}
+        u = str(record.get("url") or "").strip()
         if not u:
             continue
         if in_scope_hosts and url_host(u) not in in_scope_hosts:
             continue
         clean = u.split("#", 1)[0].split("?", 1)[0]
         tpl = path_template(clean)
-        if tpl in seen:
+        candidate = {**record, "url": clean}
+        current = by_template.get(tpl)
+        if current is None:
+            by_template[tpl] = candidate
             continue
-        seen.add(tpl)
-        out.append(clean)
-    if len(out) > cap:
-        telemetry.record_cap("param_query_endpoints", limit=cap, observed=len(out), selected=cap)
-        telemetry.record_drop("param_query_cap", len(out) - cap)
-        log.warning("⚠ param_fuzz: capping endpoint set %d→%d", len(out), cap)
-        return out[:cap]
-    telemetry.record_cap("param_query_endpoints", limit=cap, observed=len(out), selected=len(out))
-    return out
+        ranked = ranking.allocate([current, candidate], cap=1, purpose="param")
+        by_template[tpl] = ranked.records[0]
+    selected = _select_ranked_requests(
+        list(by_template.values()), cap=cap, purpose="param", name=name, audit_path=audit_path,
+    )
+    if len(by_template) > cap:
+        log.warning("⚠ param_fuzz: capping endpoint set %d→%d", len(by_template), cap)
+    return [str(record["url"]) for record in selected]
 
 
-def select_body_targets(catalog: Iterable[dict], in_scope: set[str], *, cap: int) -> tuple[list[str], list[str]]:
+def select_body_targets(
+    catalog: Iterable[dict], in_scope: set[str], *, cap: int, audit_dir: Path | None = None,
+) -> tuple[list[str], list[str]]:
     """From the request catalog, the endpoints to test for BODY/JSON params, split by content type:
     the records the crawl saw with a body or a body-bearing method (POST/PUT/PATCH) — that's where
     hidden body params actually live. Deduped by (method, path-template), each side capped. Returns
     (urlencoded_urls, json_urls). Pure."""
-    body: list[str] = []
-    js: list[str] = []
+    body: list[dict] = []
+    js: list[dict] = []
     seen: set[tuple] = set()
     for r in catalog:
         method = (r.get("method") or "GET").upper()
@@ -4357,12 +4388,19 @@ def select_body_targets(catalog: Iterable[dict], in_scope: set[str], *, cap: int
         ct = next((str(v) for k, v in (r.get("headers") or {}).items()
                    if str(k).lower() == "content-type"), "")
         is_json = "json" in ct.lower() or any(p.get("loc") == "json" for p in r.get("params") or [])
-        (js if is_json else body).append(url)
-    telemetry.record_cap("param_body_endpoints", limit=cap, observed=len(body), selected=min(len(body), cap))
-    telemetry.record_cap("param_json_endpoints", limit=cap, observed=len(js), selected=min(len(js), cap))
-    telemetry.record_drop("param_body_cap", max(0, len(body) - cap))
-    telemetry.record_drop("param_json_cap", max(0, len(js) - cap))
-    return body[:cap], js[:cap]
+        (js if is_json else body).append(r)
+    selected_body = _select_ranked_requests(
+        body, cap=cap, purpose="param", name="param_body_endpoints",
+        audit_path=audit_dir / "param-body.jsonl" if audit_dir else None,
+    )
+    selected_json = _select_ranked_requests(
+        js, cap=cap, purpose="param", name="param_json_endpoints",
+        audit_path=audit_dir / "param-json.jsonl" if audit_dir else None,
+    )
+    return (
+        [str(record["url"]) for record in selected_body],
+        [str(record["url"]) for record in selected_json],
+    )
 
 
 def _first_segment(path: str) -> str:
@@ -4375,17 +4413,16 @@ def _first_segment(path: str) -> str:
 
 
 def select_recrawl_seeds(discovered: Iterable[str], crawled: Iterable[str], in_scope: set[str],
-                         *, cap: int) -> list[str]:
+                         *, cap: int, audit_path: Path | None = None) -> list[str]:
     """The fuzzing-discovered entry points that open UN-CRAWLED territory — a discovered URL whose
     TOP-LEVEL path segment no crawled URL uses (conservative: only genuinely-new top-level regions, so
-    a new sub-dir UNDER an already-crawled region does NOT seed). One shallowest seed per new region,
-    static assets / JS files / out-of-scope dropped, capped. Pure (logging only).
+    a new sub-dir UNDER an already-crawled region does NOT seed). One risk-ranked representative per
+    new region; static assets / JS files / out-of-scope records are dropped. Pure apart from telemetry.
 
     `covered` = the (host, first-segment) of every crawled URL; a discovered /debugging/x whose segment
     'debugging' isn't covered → the crawler never went there → seed (one per new segment)."""
     covered = {(urlsplit(c).netloc, _first_segment(urlsplit(c).path or "/")) for c in crawled if c}
-    seeds: list[str] = []
-    seen: set[tuple] = set()
+    candidates: dict[tuple[str, str], dict] = {}
     for raw in discovered:
         u = (raw or "").strip()
         # skip empties, out-of-scope, static assets (denoise) and JS files (not navigable pages)
@@ -4394,18 +4431,23 @@ def select_recrawl_seeds(discovered: Iterable[str], crawled: Iterable[str], in_s
             continue
         p = urlsplit(u)
         key = (p.netloc, _first_segment(p.path or "/"))
-        if key in covered or key in seen:
+        if key in covered:
             continue
-        seen.add(key)
-        seeds.append(u)
-    seeds.sort(key=lambda s: (s.count("/"), s))   # shallowest entry points first, deterministic
-    if len(seeds) > cap:
-        telemetry.record_cap("recrawl_seeds", limit=cap, observed=len(seeds), selected=cap)
-        telemetry.record_drop("recrawl_seed_cap", len(seeds) - cap)
-        log.warning("⚠ recrawl: capping new-territory seeds %d→%d", len(seeds), cap)
-        return seeds[:cap]
-    telemetry.record_cap("recrawl_seeds", limit=cap, observed=len(seeds), selected=len(seeds))
-    return seeds
+        candidate = {"method": "GET", "url": u, "sources": ["content-discovery"]}
+        current = candidates.get(key)
+        if current is None:
+            candidates[key] = candidate
+        else:
+            candidates[key] = ranking.allocate(
+                [current, candidate], cap=1, purpose="recrawl",
+            ).records[0]
+    selected = _select_ranked_requests(
+        list(candidates.values()), cap=cap, purpose="recrawl", name="recrawl_seeds",
+        audit_path=audit_path,
+    )
+    if len(candidates) > cap:
+        log.warning("⚠ recrawl: capping new-territory seeds %d→%d", len(candidates), cap)
+    return [str(record["url"]) for record in selected]
 
 
 def parse_arjun(text: str, *, loc: str = "query") -> list[dict]:
@@ -4624,7 +4666,13 @@ def recrawl(activity: Activity, app_id: str) -> None:
     discovered = [r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
                   if r.get("url") and 200 <= (r.get("status") or 0) < 300]  # 2xx entry points only  # noqa: PLR2004
     in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
-    seeds = select_recrawl_seeds(discovered, crawled, in_scope, cap=RECRAWL_MAX_SEEDS)
+    seeds = select_recrawl_seeds(
+        discovered,
+        crawled,
+        in_scope,
+        cap=RECRAWL_MAX_SEEDS,
+        audit_path=ws.raw("ranking") / "recrawl.jsonl",
+    )
     seeds_file = ws.raw("recrawl") / "seeds.txt"
     tools.write_lines(seeds_file, seeds)
     if not seeds:
@@ -4787,7 +4835,8 @@ def request_catalog_full(activity: Activity, app_id: str) -> None:
     Same assembly as request_catalog but folds in the fuzzing-discovered surface: recrawl requests +
     content_discovery 2xx hits + the shapes mined from the now-extended corpus (responses/discovered/,
     responses/recrawl/ — re-extracted idempotently). Offline (net=False); reads phase-1 + phase-3
-    artifacts across the barriers, so it sees the COMPLETE corpus. Feeds param_fuzz + dast_full."""
+    artifacts across the barriers, so it sees the COMPLETE corpus. The 4→5 barrier freezes every
+    app's catalog before engagement-wide budgets are computed; phase 5 consumes it."""
     ws = activity.app(app_id)
     catalog, n_mined, n_dead = _assemble_catalog(activity, ws, include_guessed=True)
     telemetry.record_drop("dead_catalog_requests", n_dead)
@@ -4814,7 +4863,7 @@ def xref_catalog(activity: Activity, app_id: str) -> None:
 
 
 def param_fuzz(activity: Activity, app_id: str) -> None:
-    """PHASE 4 — hidden-parameter discovery across ALL locations (query · body · json · header), not
+    """PHASE 5 — hidden-parameter discovery across ALL locations (query · body · json · header), not
     just GET, over the FULL request catalog (requests_full.jsonl) — so it probes the fuzzing-discovered
     endpoints for hidden params too, not only the crawl surface.
 
@@ -4832,15 +4881,56 @@ def param_fuzz(activity: Activity, app_id: str) -> None:
     ws = activity.app(app_id)
     catalog = tools.read_jsonl(ws.canonical("requests_full.jsonl"))
     in_scope = {url_host(h) for h in tools.read_lines(ws.hosts)}
-    query_targets = select_param_endpoints((r.get("url") or "" for r in catalog), in_scope,
-                                           cap=PARAM_MAX_ENDPOINTS)
+    audit_dir = ws.raw("ranking")
+    query_cap = _stage_request_budget(
+        activity, app_id, per_app_cap=PARAM_MAX_ENDPOINTS, name="param_query",
+        deep=True, demand_kind="endpoint",
+    )
+    body_cap = _stage_request_budget(
+        activity, app_id, per_app_cap=PARAM_MAX_BODY_ENDPOINTS, name="param_body",
+        deep=True, demand_kind="endpoint",
+    )
+    header_cap = _stage_request_budget(
+        activity, app_id, per_app_cap=PARAM_MAX_HEADER_ENDPOINTS, name="param_header",
+        deep=True, demand_kind="endpoint",
+    )
+    query_targets = select_param_endpoints(
+        catalog,
+        in_scope,
+        cap=query_cap,
+        audit_path=audit_dir / "param-query.jsonl",
+    )
     if not query_targets:
         log.debug("  · skip param_fuzz (no endpoints) for %s", app_id)
         return
-    body_targets, json_targets = select_body_targets(catalog, in_scope, cap=PARAM_MAX_BODY_ENDPOINTS)
+    body_targets, json_targets = select_body_targets(
+        catalog, in_scope, cap=body_cap, audit_dir=audit_dir,
+    )
     # probe hidden POST params on GET-looking endpoints too (top up urlencoded body, still capped)
-    body_targets = tools.dedupe([*body_targets, *query_targets])[:PARAM_MAX_BODY_ENDPOINTS]
-    header_targets = query_targets[:PARAM_MAX_HEADER_ENDPOINTS]
+    combined_body = {
+        url: {
+            "method": "POST", "url": url,
+            "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+            "body": "ptflow=1", "sources": ["observed-body"],
+        }
+        for url in body_targets
+    }
+    for url in query_targets:
+        combined_body.setdefault(url, {"method": "GET", "url": url, "sources": ["query-topup"]})
+    body_targets = [str(record["url"]) for record in _select_ranked_requests(
+        list(combined_body.values()),
+        cap=body_cap,
+        purpose="param",
+        name="param_body_combined",
+        audit_path=audit_dir / "param-body-final.jsonl",
+    )]
+    header_targets = select_param_endpoints(
+        catalog,
+        in_scope,
+        cap=header_cap,
+        name="param_header_endpoints",
+        audit_path=audit_dir / "param-header.jsonl",
+    )
     params_wl = _effective_params_wl(ws, wordlists.role_path(activity, "params"))
     jobs = [(loc, t) for loc, t in
             (("query", query_targets), ("body", body_targets),
@@ -4912,23 +5002,26 @@ def build_fuzz_requests(params: Iterable[dict]) -> list[dict]:
     return out
 
 
-def dast_requests(catalog: Iterable[dict], params: Iterable[dict], *, cap: int) -> list[dict]:
+def dast_requests(  # noqa: PLR0913
+    catalog: Iterable[dict], params: Iterable[dict], *, cap: int,
+    purpose: ranking.Purpose = "dast", name: str = "dast_requests",
+    audit_path: Path | None = None,
+) -> list[dict]:
     """The full request set to fuzz: the catalog + the synthesized requests for discovered hidden
     params, with parameter-less static asset GETs removed, deduped by shape (merge_requests) and
-    capped (logged when it bites). Pure (telemetry/logging only)."""
+    selected by deterministic risk score and coverage strata. Pure apart from telemetry/audit output."""
     candidates = [*catalog, *build_fuzz_requests(params)]
     filtered = [record for record in candidates if not is_static_dast_request(record)]
     if n_static := len(candidates) - len(filtered):
         telemetry.record_drop("static_dast_requests", n_static)
     merged = merge_requests(filtered)
+    selected = _select_ranked_requests(
+        merged, cap=cap, purpose=purpose, name=name, audit_path=audit_path,
+    )
     if len(merged) > cap:
-        telemetry.record_cap("dast_requests", limit=cap, observed=len(merged), selected=cap)
-        telemetry.record_drop("dast_request_cap", len(merged) - cap)
         log.warning("⚠ dast: capping request set %d→%d (set PTFLOW_* / raise DAST_MAX_REQUESTS)",
                     len(merged), cap)
-        return merged[:cap]
-    telemetry.record_cap("dast_requests", limit=cap, observed=len(merged), selected=len(merged))
-    return merged
+    return selected
 
 
 def dedup_dast_findings(records: Iterable[dict]) -> list[dict]:
@@ -4972,7 +5065,7 @@ def _run_dast(  # noqa: PLR0913
     label: str,
 ) -> None:
     """Run nuclei -dast over a prepared request set → findings/<out_name>. Shared by dast (phase-2
-    surface) + dast_full (phase-4 guessed). nuclei -im jsonl builds each fuzzed request from `raw`, so
+    surface) + dast_full (phase-5 guessed). nuclei -im jsonl builds each fuzzed request from `raw`, so
     it fuzzes query · path · header · cookie · BODY — not just the GET query a bare URL list allows.
     Best-effort: skips if nuclei, every configured pack, the selected templates, or the request set is
     absent. Provenance includes the input and exact all-pack template manifest in raw/dast/."""
@@ -5032,17 +5125,25 @@ def _run_dast(  # noqa: PLR0913
     log.info("    %s (%s) → %d finding(s)%s → findings/%s", stage, label, n, extra, out_name)
 
 
-def _surface_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
+def _surface_request_set(
+    ws: AppWorkspace, *, cap: int, purpose: ranking.Purpose = "dast",
+    name: str = "dast_surface_pool", audit_path: Path | None = None,
+) -> list[dict]:
     """The EXPLORABLE-surface request set (phase 2): the surface catalog (requests.jsonl) UNIONED with the
     cross-group sidecar (requests_xref.jsonl — peers' surface owned by this group, from xref_catalog),
     deduped by shape and capped. Shared by `dast` and the surface vuln scanners (xss/sqli)."""
     catalog = [*tools.read_jsonl(ws.canonical("requests.jsonl")),
                *tools.read_jsonl(ws.canonical("requests_xref.jsonl"))]
-    return dast_requests(catalog, [], cap=cap)
+    return dast_requests(
+        catalog, [], cap=cap, purpose=purpose, name=name, audit_path=audit_path,
+    )
 
 
-def _delta_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
-    """The GUESSED-surface DELTA request set (phase 4): full-catalog shapes NOT already covered by the
+def _delta_request_set(
+    ws: AppWorkspace, *, cap: int, purpose: ranking.Purpose = "dast",
+    name: str = "dast_delta_pool", audit_path: Path | None = None,
+) -> list[dict]:
+    """The GUESSED-surface DELTA request set (phase 5): full-catalog shapes NOT already covered by the
     phase-2 surface — the surface catalog (requests.jsonl) OR the cross-group sidecar (requests_xref.jsonl,
     which phase-2 dast/xss/sqli already tested) — keyed by request_key, PLUS the synthesized requests for
     the discovered hidden params (params.jsonl), deduped and capped. Shared by `dast_full` and the deep
@@ -5055,7 +5156,14 @@ def _delta_request_set(ws: AppWorkspace, *, cap: int) -> list[dict]:
     surface_keys |= {request_key(r) for r in tools.read_jsonl(ws.canonical("requests_xref.jsonl"))}
     delta = [r for r in tools.read_jsonl(ws.canonical("requests_full.jsonl"))
              if request_key(r) not in surface_keys]
-    return dast_requests(delta, tools.read_jsonl(ws.canonical("params.jsonl")), cap=cap)
+    return dast_requests(
+        delta,
+        tools.read_jsonl(ws.canonical("params.jsonl")),
+        cap=cap,
+        purpose=purpose,
+        name=name,
+        audit_path=audit_path,
+    )
 
 
 def dast(activity: Activity, app_id: str) -> None:
@@ -5065,8 +5173,18 @@ def dast(activity: Activity, app_id: str) -> None:
     yet (that's guessing → phase 4). Output → findings/dast.jsonl. Reads requests.jsonl across the
     barrier (phase 1)."""
     ws = activity.app(app_id)
+    request_cap = _stage_request_budget(
+        activity, app_id, per_app_cap=DAST_MAX_REQUESTS, name="dast_surface",
+        deep=False,
+    )
     _run_dast(
-        ws, _surface_request_set(ws, cap=DAST_MAX_REQUESTS),
+        ws,
+        _surface_request_set(
+            ws,
+            cap=request_cap,
+            name="dast_surface_requests",
+            audit_path=ws.raw("ranking") / "dast-surface.jsonl",
+        ),
         input_name="input.jsonl", out_name="dast.jsonl",
         selection_name="template-selection.json",
         label=app_id,
@@ -5074,22 +5192,32 @@ def dast(activity: Activity, app_id: str) -> None:
 
 
 def dast_full(activity: Activity, app_id: str) -> None:
-    """PHASE 4 — DAST the GUESSED surface (detailed). To avoid re-DASTing what phase-2 already covered,
+    """PHASE 5 — DAST the GUESSED surface (detailed). To avoid re-DASTing what phase-2 already covered,
     it fuzzes only the DELTA: the request shapes in the full catalog (requests_full.jsonl) NOT already
     in the surface catalog (requests.jsonl, keyed by request_key) PLUS the synthesized requests for the
     hidden params param_fuzz discovered (params.jsonl) — those are NEW injection points even on a
     crawl-surface endpoint. Output → findings/dast_full.jsonl. Needs request_catalog_full + param_fuzz.
     """
     ws = activity.app(app_id)
+    request_cap = _stage_request_budget(
+        activity, app_id, per_app_cap=DAST_MAX_REQUESTS, name="dast_full",
+        deep=True,
+    )
     _run_dast(
-        ws, _delta_request_set(ws, cap=DAST_MAX_REQUESTS),
+        ws,
+        _delta_request_set(
+            ws,
+            cap=request_cap,
+            name="dast_full_requests",
+            audit_path=ws.raw("ranking") / "dast-full.jsonl",
+        ),
         input_name="input_full.jsonl", out_name="dast_full.jsonl",
         selection_name="template-selection-full.json",
         label=app_id,
     )
 
 
-# --- dedicated vuln scanners (PHASE 2 surface + PHASE 4 deep) — dalfox (XSS) ∥ sqlmap (SQLi) ----------
+# --- dedicated vuln scanners (PHASE 2 surface + PHASE 5 deep) — dalfox (XSS) ∥ sqlmap (SQLi) ----------
 # Both consume the catalog's `raw` (one request per process, Burp/ZAP raw), so EVERY param location is
 # tested, not GET-only. NO gf-style name routing: every parameterized request is a candidate, each tool's
 # own engine decides (dalfox reflection+context · sqlmap --smart heuristic). Best-effort, capped, with a
@@ -5103,14 +5231,112 @@ def _has_params(r: dict) -> bool:
     return bool(r.get("params")) or "?" in (r.get("url") or "") or bool(r.get("body"))
 
 
-def _vuln_candidates(requests_: Iterable[dict], *, cap: int) -> list[dict]:
-    """The parameterized subset of a request set, capped — the scanner candidate list (no name-based
-    routing: presence of a fuzzable param is the ONLY filter)."""
+def _budget_catalog(activity: Activity, ws: AppWorkspace, *, deep: bool) -> list[dict]:
+    """Stable engagement-wide demand source for M1 budget redistribution.
+
+    Surface demand is reconstructed from phase-1 artifacts so it does not depend on which phase-2
+    ``xref_catalog`` task happens to finish first. Deep demand reads ``requests_full.jsonl`` only after
+    the phase-4 barrier has completed that catalog for every app.
+    """
+    if deep:
+        records = tools.read_jsonl(ws.canonical("requests_full.jsonl"))
+    else:
+        xref, _ = _finalize_catalog(ws, _cross_group_surface(activity, ws), [])
+        records = [*tools.read_jsonl(ws.canonical("requests.jsonl")), *xref]
+    return merge_requests(record for record in records if not is_static_dast_request(record))
+
+
+def _stage_request_budget(  # noqa: PLR0913
+    activity: Activity,
+    app_id: str,
+    *,
+    per_app_cap: int,
+    name: str,
+    deep: bool,
+    demand_kind: Literal["all", "endpoint", "parameterized"] = "all",
+) -> int:
+    """Return this app's share of a fixed engagement budget and persist its safe rationale."""
+    demands: dict[str, int] = {}
+    for app in activity.list_apps():
+        records = _budget_catalog(activity, app, deep=deep)
+        if demand_kind == "endpoint":
+            demand = len({path_template(str(record.get("url") or "")) for record in records})
+        elif demand_kind == "parameterized":
+            demand = sum(_has_params(record) for record in records)
+        else:
+            demand = len(records)
+        demands[app.root.name] = demand
+    allocations = ranking.allocate_group_budgets(demands, per_group_cap=per_app_cap)
+    allocated = allocations.get(app_id, max(0, per_app_cap))
+    summary = {
+        "kind": "cross-app-budget",
+        "basis": "full-catalog" if deep else "surface-catalog+xref",
+        "demand_kind": demand_kind,
+        "per_app_cap": max(0, per_app_cap),
+        "app_count": len(demands),
+        "total_budget": max(0, per_app_cap) * len(demands),
+        "total_demand": sum(demands.values()),
+        "app_demand": demands.get(app_id, 0),
+        "allocated": allocated,
+        "redistributed": allocated - max(0, per_app_cap),
+        "applied": demands.get(app_id, 0) > allocated,
+    }
+    telemetry.record_selection(name, summary)
+    tools.write_text(
+        activity.app(app_id).raw("ranking") / f"budget-{name}.json",
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+    )
+    return allocated
+
+
+def _vuln_candidates(
+    requests_: Iterable[dict], *, cap: int, purpose: Literal["sqli", "xss"] = "xss",
+    name: str = "vulnerability_requests", audit_path: Path | None = None,
+) -> list[dict]:
+    """Risk-ranked parameterized scanner candidates (no name-based filtering before scoring)."""
     candidates = [r for r in requests_ if _has_params(r)]
-    telemetry.record_cap("vulnerability_requests", limit=cap, observed=len(candidates),
-                         selected=min(len(candidates), cap))
-    telemetry.record_drop("vulnerability_request_cap", max(0, len(candidates) - cap))
-    return candidates[:cap]
+    return _select_ranked_requests(
+        candidates, cap=cap, purpose=purpose, name=name, audit_path=audit_path,
+    )
+
+
+def _scanner_request_set(
+    activity: Activity, app_id: str, *, deep: bool, purpose: Literal["sqli", "xss"], stage: str,
+) -> list[dict]:
+    ws = activity.app(app_id)
+    audit_dir = ws.raw("ranking")
+    pool_cap = _stage_request_budget(
+        activity, app_id, per_app_cap=DAST_MAX_REQUESTS, name=f"{stage}_pool",
+        deep=deep,
+    )
+    scanner_cap = _stage_request_budget(
+        activity, app_id, per_app_cap=VULN_MAX_REQUESTS, name=stage,
+        deep=deep, demand_kind="parameterized",
+    )
+    pool = (
+        _delta_request_set(
+            ws,
+            cap=pool_cap,
+            purpose=purpose,
+            name=f"{stage}_pool",
+            audit_path=audit_dir / f"{stage}-pool.jsonl",
+        )
+        if deep
+        else _surface_request_set(
+            ws,
+            cap=pool_cap,
+            purpose=purpose,
+            name=f"{stage}_pool",
+            audit_path=audit_dir / f"{stage}-pool.jsonl",
+        )
+    )
+    return _vuln_candidates(
+        pool,
+        cap=scanner_cap,
+        purpose=purpose,
+        name=f"{stage}_requests",
+        audit_path=audit_dir / f"{stage}.jsonl",
+    )
 
 
 def parse_dalfox(out: str) -> list[dict]:
@@ -5327,29 +5553,37 @@ def _run_sqlmap(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
 def xss(activity: Activity, app_id: str) -> None:
     """PHASE 2 — dalfox over the EXPLORABLE-surface parameterized requests → findings/xss.jsonl."""
     ws = activity.app(app_id)
-    _run_dalfox(ws, _vuln_candidates(_surface_request_set(ws, cap=DAST_MAX_REQUESTS), cap=VULN_MAX_REQUESTS),
-                out_name="xss.jsonl", label=app_id)
+    _run_dalfox(
+        ws, _scanner_request_set(activity, app_id, deep=False, purpose="xss", stage="xss"),
+        out_name="xss.jsonl", label=app_id,
+    )
 
 
 def xss_full(activity: Activity, app_id: str) -> None:
-    """PHASE 4 — dalfox over the GUESSED-surface DELTA + discovered-param requests → findings/xss_full.jsonl."""
+    """PHASE 5 — dalfox over the GUESSED-surface DELTA + discovered-param requests → findings/xss_full.jsonl."""
     ws = activity.app(app_id)
-    _run_dalfox(ws, _vuln_candidates(_delta_request_set(ws, cap=DAST_MAX_REQUESTS), cap=VULN_MAX_REQUESTS),
-                out_name="xss_full.jsonl", label=app_id)
+    _run_dalfox(
+        ws, _scanner_request_set(activity, app_id, deep=True, purpose="xss", stage="xss_full"),
+        out_name="xss_full.jsonl", label=app_id,
+    )
 
 
 def sqli(activity: Activity, app_id: str) -> None:
     """PHASE 2 — sqlmap over the EXPLORABLE-surface parameterized requests → findings/sqli.jsonl."""
     ws = activity.app(app_id)
-    _run_sqlmap(ws, _vuln_candidates(_surface_request_set(ws, cap=DAST_MAX_REQUESTS), cap=VULN_MAX_REQUESTS),
-                out_name="sqli.jsonl", label=app_id)
+    _run_sqlmap(
+        ws, _scanner_request_set(activity, app_id, deep=False, purpose="sqli", stage="sqli"),
+        out_name="sqli.jsonl", label=app_id,
+    )
 
 
 def sqli_full(activity: Activity, app_id: str) -> None:
-    """PHASE 4 — sqlmap over the GUESSED-surface DELTA + discovered-param requests → findings/sqli_full.jsonl."""
+    """PHASE 5 — sqlmap over the GUESSED-surface DELTA + discovered-param requests → findings/sqli_full.jsonl."""
     ws = activity.app(app_id)
-    _run_sqlmap(ws, _vuln_candidates(_delta_request_set(ws, cap=DAST_MAX_REQUESTS), cap=VULN_MAX_REQUESTS),
-                out_name="sqli_full.jsonl", label=app_id)
+    _run_sqlmap(
+        ws, _scanner_request_set(activity, app_id, deep=True, purpose="sqli", stage="sqli_full"),
+        out_name="sqli_full.jsonl", label=app_id,
+    )
 
 
 # --- CVE lookup (PHASE 2 surface + PHASE 4 deep) — search_vulns over the ENUMERATED software --------

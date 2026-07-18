@@ -21,7 +21,7 @@ Activity workspace layout (parent dir = activity name):
         report-surface.md/.json       # early deterministic checkpoint report
         report-ai.md                  # optional AI narrative (never replaces report.md)
       checkpoints/surface/findings/   # immutable-ish early snapshot after surface DAST
-      coverage.json                   # run/stage coverage manifest
+      coverage.json                   # run/stage coverage + cap/risk-selection manifest
       poc/   tmp/   logs/
       wl_global/                      # shared/global INPUT wordlists (SecLists & co.)
 """

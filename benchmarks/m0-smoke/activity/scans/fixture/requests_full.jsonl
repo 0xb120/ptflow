@@ -1,0 +1,2 @@
+{"body":"{\"q\":\"fixture\"}","headers":{"Content-Type":"application/json"},"method":"POST","sources":["browser","xhr"],"url":"https://fixture.test/search"}
+{"body":null,"headers":{},"method":"GET","sources":["katana"],"url":"https://fixture.test/"}

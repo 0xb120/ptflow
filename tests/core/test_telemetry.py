@@ -33,6 +33,21 @@ def test_trace_collects_io_commands_and_malformed_drops_without_argv(tmp_path):
         with pytest.raises(tools.ToolNotFoundError):
             tools.require("ptflow-tool-that-does-not-exist")
         telemetry.record_cap("candidate_set", limit=2, observed=5, selected=2)
+        telemetry.record_selection("risk_rank", {
+            "limit": 2,
+            "observed": 5,
+            "selected": 2,
+            "applied": True,
+            "distributions": {
+                "method": {
+                    "observed": {"GET": 4, "POST": 1},
+                    "selected": {"GET": 1, "POST": 1},
+                },
+            },
+            "scores": {"observed": {"min": 1, "max": 9, "average": 4.0}},
+            "selection_reasons": {"quota": 2},
+            "exclusion_reasons": {"budget-exhausted": 3},
+        })
         telemetry.record_drop("candidate_cap", 3)
 
     telemetry.trace_call(
@@ -60,6 +75,10 @@ def test_trace_collects_io_commands_and_malformed_drops_without_argv(tmp_path):
             "selected": 2,
         }
     ]
+    assert fragment["selections"][0]["name"] == "risk_rank"
+    assert fragment["selections"][0]["distributions"]["method"]["selected"] == {
+        "GET": 1, "POST": 1,
+    }
     assert fragment["commands"][0]["tool"] == "sh"
     assert [command["status"] for command in fragment["commands"]] == [
         "success",
@@ -107,6 +126,10 @@ def test_finalize_manifest_includes_limits_disabled_and_stage_summary(tmp_path):
         pipeline_fingerprint="pipeline-hash",
         resume_invalidation_reason="pipeline_contract_changed",
     )
+    def collect():
+        tools.write_lines(act.base / "targets.txt", ["example.com"])
+        telemetry.record_selection("budget", {"kind": "cross-app-budget", "applied": False})
+
     telemetry.trace_call(
         act,
         run.run_id,
@@ -114,7 +137,7 @@ def test_finalize_manifest_includes_limits_disabled_and_stage_summary(tmp_path):
         app_id=None,
         band="breadth",
         net=False,
-        call=lambda: tools.write_lines(act.base / "targets.txt", ["example.com"]),
+        call=collect,
     )
 
     manifest = telemetry.finalize_run(
@@ -136,6 +159,7 @@ def test_finalize_manifest_includes_limits_disabled_and_stage_summary(tmp_path):
     assert manifest["config_sha256"] == "config-hash"
     assert manifest["pipeline_sha256"] == "pipeline-hash"
     assert manifest["summary"]["stage_statuses"] == {"disabled": 1, "success": 1}
+    assert manifest["summary"]["selections"] == {"applied": 0, "observed": 1}
     disabled = next(stage for stage in manifest["stages"] if stage["status"] == "disabled")
     assert disabled["stage"] == "scan"
     assert disabled["scope"] == "all-apps"

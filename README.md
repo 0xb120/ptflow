@@ -5,9 +5,10 @@ disk are the only state — no database.** A breadth asset-discovery phase feeds
 clustering step that fans out into per-app depth loops. The external pipeline runs
 those loops **surface-first, DAST-first**: map the explorable surface (OSINT/crawl)
 and DAST *that* for low-hanging fruit, then guess/fuzz, then DAST the guessed surface
-— each phase separated by a global barrier. Each DAST pass runs alongside an offline
-**known-CVE lookup** that correlates the enumerated software (server/tech/services/libs)
-against a local vuln DB.
+— each phase separated by a global barrier. Deterministic risk ranking and coverage quotas choose
+high-value requests within each cap; unused app budget is transferred to richer surfaces without
+increasing the engagement total. Offline **known-CVE lookup** correlates enumerated software
+(server/tech/services/libs) against a local vuln DB.
 
 ## Quickstart
 
@@ -21,9 +22,8 @@ uv run ruff check . && uv run ty check src/ && uv run pytest   # dev gate
 
 ## Commands
 
-The CLI (`ptflow`) has three subcommands: **`run`** (run a pipeline), **`serve`**
-(start the observability UI), and **`doctor`** (check the external tools + datasets
-a pipeline needs are installed). Run via `uv run ptflow …`.
+The CLI (`ptflow`) exposes pipeline execution and inspection commands plus the offline detection
+benchmark evaluator. Run it via `uv run ptflow …`.
 
 ### `ptflow run` — run a pipeline over a scope
 
@@ -56,13 +56,18 @@ Exit codes: **`0`** all stages OK · **`1`** one or more stages failed (CI/autom
 Every run initializes `coverage.json` under the activity directory with run/stage coverage
 (resume/disabled/failure status and invalidation reason, config/pipeline hashes, logical dependencies,
 observed artifact I/O, command outcomes,
-caps/drops, limits, and dependency inventory). After every app group completes the phase-2 surface
+caps/drops, risk-selection distributions (source, method, authority, content type and parameter
+location), limits, and dependency inventory). Safe per-request ranking audits live under each app's
+`raw/ranking/`; they contain shapes and reasons, never header/body/query values. After every app group completes the phase-2 surface
 DAST, the global `surface_checkpoint` writes an isolated snapshot under
 `checkpoints/surface/findings/` plus the early deterministic `reports/report-surface.md` / `.json`,
 before the long guessing/deep loops start. The terminal fan-in later writes the authoritative
 `reports/report.md` and `reports/report.json` over all normalized/deduplicated findings. With `--ai`,
 the optional narrative remains separate in `reports/report-ai.md`; it never overwrites either
-deterministic report. When a pipeline composes follow-up runs, the parent also writes
+deterministic report. Each normalized finding exposes the common evidence contract (`finding_id`,
+`class`, `target`, `request_ref`, `confidence`, `detector`, `verification_method`, `evidence_refs` and
+`control_evidence_refs`) while preserving the native scanner details. When a pipeline composes
+follow-up runs, the parent also writes
 `reports/composition.json` and a summary-only `reports/report-composed.md` / `.json`: these record
 parent/child lineage, state and aggregate counts while linking—never copying—the authoritative reports.
 
@@ -107,6 +112,27 @@ org installer is `/opt/custom-tools/org/install-offsec-tools.sh`). Prints a grou
 (CORE tools / OPTIONAL tools / datasets) and **exits `1` if a CORE tool is missing** (missing
 optional tools/datasets are warnings → exit `0`). It shares the `requirements()` manifest with the
 run-time `preflight` summary, so the two never disagree. Honours `PTFLOW_*` path overrides.
+
+### `ptflow evaluate` — measure detection quality against a golden set
+
+```bash
+uv run ptflow evaluate <activity-dir> <manifest.json> [--output PATH]
+```
+
+Compares a completed activity with a versioned benchmark manifest, entirely offline. It evaluates
+expected and negative findings, HTTP request shapes and correlated OAST callbacks, then writes
+`<activity>/reports/evaluation.json` by default. The machine report includes TP/FP/FN, precision and
+recall globally and per class, confidence distribution, surface coverage and observed run cost.
+
+Exit codes: **`0`** benchmark passed · **`1`** detection/coverage regression · **`2`** invalid manifest
+or missing input. The versioned contract smoke test can be run with:
+
+```bash
+uv run ptflow evaluate \
+  benchmarks/m0-smoke/activity \
+  benchmarks/m0-smoke/manifest.json \
+  --output /tmp/ptflow-m0-evaluation.json
+```
 
 ### Install the CLI for the current user
 

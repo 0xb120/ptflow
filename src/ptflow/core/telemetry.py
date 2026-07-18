@@ -71,6 +71,7 @@ class StageTrace:
     writes: list[dict[str, Any]] = field(default_factory=list)
     commands: list[dict[str, Any]] = field(default_factory=list)
     caps: list[dict[str, Any]] = field(default_factory=list)
+    selections: list[dict[str, Any]] = field(default_factory=list)
     drops: Counter[str] = field(default_factory=Counter)
     error: str | None = None
     _started: float = field(default_factory=time.monotonic, repr=False)
@@ -94,6 +95,7 @@ class StageTrace:
             "writes": _coalesce_io(self.writes),
             "commands": self.commands,
             "caps": self.caps,
+            "selections": self.selections,
             "drops": dict(sorted(self.drops.items())),
             "error": self.error,
         }
@@ -174,6 +176,17 @@ def record_cap(name: str, *, limit: int, observed: int, selected: int) -> None:
                     "applied": observed > selected,
                 }
             )
+
+
+def record_selection(name: str, summary: dict[str, Any]) -> None:
+    """Record a safe aggregate of a ranked/budgeted candidate selection.
+
+    Callers must omit request bodies, header/query values, and other secrets. The ranking allocator's
+    ``Selection.summary()`` satisfies that contract and exposes only dimensions, counts, and scores.
+    """
+    if trace := _trace():
+        with trace.lock:
+            trace.selections.append({"name": name, **summary})
 
 
 def record_command(  # noqa: PLR0913
@@ -384,6 +397,7 @@ def finalize_run(  # noqa: PLR0913
             "writes": [],
             "commands": [],
             "caps": [],
+            "selections": [],
             "drops": {},
             "error": None,
         }
@@ -398,6 +412,7 @@ def finalize_run(  # noqa: PLR0913
     status_counts = Counter(record["status"] for record in records)
     commands = [command for record in records for command in record["commands"]]
     caps = [cap for record in records for cap in record["caps"]]
+    selections = [selection for record in records for selection in record["selections"]]
     drops = Counter()
     for record in records:
         drops.update(record["drops"])
@@ -417,6 +432,10 @@ def finalize_run(  # noqa: PLR0913
             "caps": {
                 "observed": len(caps),
                 "applied": sum(cap["applied"] for cap in caps),
+            },
+            "selections": {
+                "observed": len(selections),
+                "applied": sum(bool(selection.get("applied")) for selection in selections),
             },
             "observed_reads": sum(len(record["reads"]) for record in records),
             "observed_writes": sum(len(record["writes"]) for record in records),

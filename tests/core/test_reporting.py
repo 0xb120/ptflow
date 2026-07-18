@@ -41,6 +41,17 @@ def test_build_report_deduplicates_identity_and_merges_evidence(tmp_path):
     assert report["summary"]["total"] == 1
     assert report["summary"]["by_severity"]["medium"] == 1
     finding = report["findings"][0]
+    assert report["schema_version"] == 2
+    assert report["summary"]["by_confidence"] == {
+        "verified": 0, "probable": 0, "lead": 1,
+    }
+    assert finding["finding_id"] == finding["id"]
+    assert finding["class"] == "xss"
+    assert finding["confidence"] == "lead"
+    assert finding["detector"] == "nuclei"
+    assert finding["evidence_refs"] == [
+        "findings/dast.jsonl:1", "poc/xss.txt", "findings/dast.jsonl:2",
+    ]
     assert finding["evidence"] == ["first", "second"]
     assert finding["poc_paths"] == ["poc/xss.txt"]
     assert len(finding["sources"]) == 2

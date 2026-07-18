@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ptflow.core import tools
+from ptflow.core import evidence, tools
 
 if TYPE_CHECKING:
     from ptflow.core.paths import Activity
@@ -173,15 +173,26 @@ def gather_findings(
         for line, record in enumerate(tools.read_jsonl(path), start=1):
             key = _finding_key(category, record)
             source = {"path": str(path.relative_to(activity.base)), "line": line}
+            subject = _subject(record)
+            poc_paths = _poc_paths(record)
+            normalized = evidence.normalize_finding(
+                finding_id=key,
+                category=category,
+                record=record,
+                target=subject,
+                source_refs=(f"{source['path']}:{source['line']}",),
+                poc_refs=tuple(poc_paths),
+            )
             if key not in merged:
                 merged[key] = {
                     "id": key,
+                    **normalized.as_dict(),
                     "category": category,
                     "severity": normalize_severity(record),
                     "title": _title(category, record),
-                    "subject": _subject(record),
+                    "subject": subject,
                     "evidence": _evidence(record),
-                    "poc_paths": _poc_paths(record),
+                    "poc_paths": poc_paths,
                     "sources": [source],
                     "details": record,
                 }
@@ -190,7 +201,20 @@ def gather_findings(
             if source not in current["sources"]:
                 current["sources"].append(source)
             current["evidence"] = list(dict.fromkeys([*current["evidence"], *_evidence(record)]))
-            current["poc_paths"] = list(dict.fromkeys([*current["poc_paths"], *_poc_paths(record)]))
+            current["poc_paths"] = list(dict.fromkeys([*current["poc_paths"], *poc_paths]))
+            current["evidence_refs"] = list(dict.fromkeys([
+                *current["evidence_refs"], *normalized.evidence_refs,
+            ]))
+            current["control_evidence_refs"] = list(dict.fromkeys([
+                *current["control_evidence_refs"], *normalized.control_evidence_refs,
+            ]))
+            current["confidence"] = evidence.strongest_confidence(
+                current["confidence"], normalized.confidence,
+            )
+            current["request_ref"] = current["request_ref"] or normalized.request_ref
+            current["verification_method"] = (
+                current["verification_method"] or normalized.verification_method
+            )
     rank = {severity: i for i, severity in enumerate(_SEVERITIES)}
     return sorted(
         merged.values(),
@@ -207,14 +231,45 @@ def gather_findings(
 def build_report(activity: Activity, *, findings_dir: Path | None = None) -> dict[str, Any]:
     findings = gather_findings(activity, findings_dir=findings_dir)
     counts = Counter(finding["severity"] for finding in findings)
+    confidence = Counter(finding["confidence"] for finding in findings)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "summary": {
             "total": len(findings),
             "by_severity": {severity: counts[severity] for severity in _SEVERITIES},
+            "by_confidence": {
+                label: confidence[label] for label in ("verified", "probable", "lead")
+            },
         },
         "findings": findings,
     }
+
+
+def _render_finding(finding: dict[str, Any]) -> list[str]:
+    lines = [
+        f"### {finding['title']}",
+        "",
+        f"- ID: `{finding['id']}`",
+        f"- Category: `{finding['category']}`",
+        f"- Class: `{finding['class']}`",
+        f"- Confidence: `{finding['confidence']}`",
+        f"- Detector: `{finding['detector']}`",
+    ]
+    if finding["subject"]:
+        lines.append(f"- Target: `{finding['subject']}`")
+    if finding["request_ref"]:
+        lines.append(f"- Request: `{finding['request_ref']}`")
+    if finding["verification_method"]:
+        lines.append(f"- Verification: `{finding['verification_method']}`")
+    refs = ", ".join(f"`{src['path']}:{src['line']}`" for src in finding["sources"])
+    lines.append(f"- Evidence source: {refs}")
+    if finding["evidence"]:
+        lines.append(f"- Evidence: {'; '.join(finding['evidence'])}")
+    if finding["poc_paths"]:
+        poc_refs = ", ".join(f"`{path}`" for path in finding["poc_paths"])
+        lines.append(f"- PoC artifacts: {poc_refs}")
+    lines.append("")
+    return lines
 
 
 def render_markdown(
@@ -246,21 +301,7 @@ def render_markdown(
             continue
         lines.extend([f"## {severity.capitalize()}", ""])
         for finding in findings:
-            lines.append(f"### {finding['title']}")
-            lines.append("")
-            lines.append(f"- ID: `{finding['id']}`")
-            lines.append(f"- Category: `{finding['category']}`")
-            if finding["subject"]:
-                lines.append(f"- Target: `{finding['subject']}`")
-            refs = ", ".join(f"`{src['path']}:{src['line']}`" for src in finding["sources"])
-            lines.append(f"- Evidence source: {refs}")
-            if finding["evidence"]:
-                lines.append(f"- Evidence: {'; '.join(finding['evidence'])}")
-            if finding["poc_paths"]:
-                lines.append(
-                    f"- PoC artifacts: {', '.join(f'`{path}`' for path in finding['poc_paths'])}"
-                )
-            lines.append("")
+            lines.extend(_render_finding(finding))
     if not report["findings"]:
         lines.extend(["## Findings", "", "No consolidated findings were produced.", ""])
     return "\n".join(lines).rstrip() + "\n"

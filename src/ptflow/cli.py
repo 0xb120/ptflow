@@ -150,6 +150,16 @@ def main(argv: list[str] | None = None) -> int:
         help="also show each step's phase / scope / net / needs",
     )
 
+    evaluate = sub.add_parser(
+        "evaluate", help="compare a completed activity with a golden benchmark manifest",
+    )
+    evaluate.add_argument("activity", help="completed activity directory")
+    evaluate.add_argument("manifest", help="versioned benchmark manifest (JSON)")
+    evaluate.add_argument(
+        "-o", "--output", default=None, metavar="PATH",
+        help="machine report path (default: <activity>/reports/evaluation.json)",
+    )
+
     dast = sub.add_parser("dast", help="inspect and validate nuclei DAST packs")
     dast_sub = dast.add_subparsers(dest="dast_cmd", required=True)
     dast_validate = dast_sub.add_parser("validate", help="validate every enabled local DAST pack")
@@ -170,15 +180,16 @@ def main(argv: list[str] | None = None) -> int:
         return _run(args)
 
     if args.cmd == "doctor":
-        return _doctor(args.pipeline)
-
-    if args.cmd == "steps":
-        return _steps(args)
-
-    if args.cmd == "dast":
-        return _dast(args)
-
-    return 1
+        result = _doctor(args.pipeline)
+    elif args.cmd == "steps":
+        result = _steps(args)
+    elif args.cmd == "evaluate":
+        result = _evaluate(args)
+    elif args.cmd == "dast":
+        result = _dast(args)
+    else:
+        result = 1
+    return result
 
 
 def _doctor(pipeline_name: str) -> int:
@@ -219,6 +230,24 @@ def _steps(args: argparse.Namespace) -> int:
         return 2
     print(render_steps(pipeline, disabled, verbose=args.verbose))  # noqa: T201
     return 0
+
+
+def _evaluate(args: argparse.Namespace) -> int:
+    """Run the deterministic offline golden-set evaluator."""
+    from ptflow.core import evaluation  # noqa: PLC0415
+
+    activity = Path(args.activity).expanduser()
+    manifest = Path(args.manifest).expanduser()
+    output = Path(args.output).expanduser() if args.output else None
+    try:
+        result = evaluation.evaluate(activity, manifest, output=output)
+    except evaluation.EvaluationError as exc:
+        print(f"evaluation error: {exc}", file=sys.stderr)  # noqa: T201
+        return 2
+    destination = output or activity / "reports" / "evaluation.json"
+    print(evaluation.render_summary(result))  # noqa: T201
+    print(destination)  # noqa: T201
+    return 0 if result["status"] == "pass" else 1
 
 
 def _print_dast_selection(selection: DastSelection) -> None:

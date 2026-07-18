@@ -262,8 +262,8 @@ def test_pipeline_object_shape():
         "fetch_delta", "api_spec", "mine_responses", "request_catalog",
         "xref_catalog", "dast", "xss", "sqli", "cve_lookup",
         "wordlist", "tech_enum", "content_discovery", "recrawl", "cloud_assets",
-        "request_catalog_full", "param_fuzz", "dast_full", "xss_full", "sqli_full",
-        "cve_lookup_full", "tech_vulnscan",
+        "request_catalog_full", "cve_lookup_full", "tech_vulnscan",
+        "param_fuzz", "dast_full", "xss_full", "sqli_full",
     ]
     by_name = {s.name: s for s in PIPELINE.stages}
     assert set(by_name["subdomain_bruteforce"].needs) == {"expand", "provision_wl"}
@@ -399,7 +399,7 @@ def test_portscan_policy_timeout_preserves_partial_results(monkeypatch, tmp_path
 
 
 def test_pipeline_phase_wiring():
-    """The 4-phase surface-first/DAST-first per-app model: phase numbers + intra-phase `needs`
+    """The 5-phase surface-first/DAST-first per-app model: phase numbers + intra-phase `needs`
     (cross-phase ordering is the barrier, never `needs`)."""
     from ptflow.pipelines.external.pipeline import PIPELINE
 
@@ -441,17 +441,21 @@ def test_pipeline_phase_wiring():
     assert by_name["tech_enum"].needs == ("wordlist",)
     assert set(by_name["content_discovery"].needs) == {"wordlist", "tech_enum"}
     assert by_name["recrawl"].needs == ("content_discovery",)
-    # PHASE 4 = DAST the guessed surface (detailed): full catalog (requests_full.jsonl) → param_fuzz →
-    # dast_full (delta vs the surface catalog + param-injection requests).
-    # cve_lookup_full runs ∥ dast_full (same phase, no needs) over the EXPANDED enumeration, OFFLINE.
-    phase4 = ("request_catalog_full", "param_fuzz", "dast_full", "cve_lookup_full")
+    # PHASE 4 freezes every full catalog before cross-app budgets are calculated. Independent expanded
+    # CVE/technology scans can run in parallel.
+    phase4 = ("request_catalog_full", "cve_lookup_full", "tech_vulnscan")
     assert {by_name[n].phase for n in phase4} == {4}
     assert by_name["request_catalog_full"].net is False
     assert by_name["request_catalog_full"].needs == ()   # reads PHASE-1 + PHASE-3 across barriers
-    assert by_name["param_fuzz"].needs == ("request_catalog_full",)
-    assert set(by_name["dast_full"].needs) == {"request_catalog_full", "param_fuzz"}
     assert by_name["cve_lookup_full"].net is False
     assert by_name["cve_lookup_full"].needs == ()
+    # PHASE 5 consumes the globally complete catalogs: hidden params first, then deep scanners.
+    phase5 = ("param_fuzz", "dast_full", "xss_full", "sqli_full")
+    assert {by_name[n].phase for n in phase5} == {5}
+    assert by_name["param_fuzz"].needs == ()
+    assert by_name["dast_full"].needs == ("param_fuzz",)
+    assert by_name["xss_full"].needs == ("param_fuzz",)
+    assert by_name["sqli_full"].needs == ("param_fuzz",)
 
 
 def test_depth_pure_helpers():
@@ -1193,7 +1197,7 @@ def test_select_param_endpoints_scopes_dedups_caps():
         "https://app.x/search?q=1",                        # query stripped
     ]
     assert tasks.select_param_endpoints(urls, {"app.x"}, cap=10) == [
-        "https://app.x/user/1", "https://app.x/login", "https://app.x/search",
+        "https://app.x/login", "https://app.x/search", "https://app.x/user/1",
     ]
     many = [f"https://app.x/p{i}" for i in range(5)]
     assert tasks.select_param_endpoints(many, {"app.x"}, cap=2) == ["https://app.x/p0", "https://app.x/p1"]

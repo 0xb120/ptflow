@@ -1,0 +1,58 @@
+{
+  "findings": [
+    {
+      "category": "xss",
+      "class": "xss",
+      "confidence": "verified",
+      "control_evidence_refs": [
+        "poc/xss-negative-control.txt"
+      ],
+      "detector": "dalfox-browser-verifier",
+      "evidence_refs": [
+        "findings/xss.jsonl:1",
+        "poc/xss-browser.png"
+      ],
+      "finding_id": "fixture-xss-1",
+      "id": "fixture-xss-1",
+      "request_ref": "scans/fixture/raw/dalfox/request-1.txt",
+      "severity": "medium",
+      "target": "https://fixture.test/search",
+      "title": "reflected xss",
+      "verification_method": "browser-execution"
+    },
+    {
+      "category": "cve",
+      "class": "cve",
+      "confidence": "probable",
+      "control_evidence_refs": [],
+      "detector": "search-vulns",
+      "evidence_refs": [
+        "findings/cve.jsonl:1"
+      ],
+      "finding_id": "fixture-cve-1",
+      "id": "fixture-cve-1",
+      "request_ref": null,
+      "severity": "high",
+      "target": "https://fixture.test/",
+      "title": "CVE-2026-1000",
+      "verification_method": "version-correlation"
+    }
+  ],
+  "schema_version": 2,
+  "summary": {
+    "by_confidence": {
+      "lead": 0,
+      "probable": 1,
+      "verified": 1
+    },
+    "by_severity": {
+      "critical": 0,
+      "high": 1,
+      "info": 0,
+      "low": 0,
+      "medium": 1,
+      "unknown": 0
+    },
+    "total": 2
+  }
+}

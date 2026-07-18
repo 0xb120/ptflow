@@ -1,0 +1,70 @@
+{
+  "artifacts": {
+    "oast_callbacks": [
+      "oast/callbacks.jsonl"
+    ],
+    "report": "reports/report.json",
+    "requests": [
+      "scans/*/requests_full.jsonl"
+    ]
+  },
+  "benchmark": "m0-smoke",
+  "expected_findings": [
+    {
+      "class": "xss",
+      "id": "xss-browser-positive",
+      "minimum_confidence": "verified",
+      "target": "https://fixture.test/search"
+    },
+    {
+      "class": "cve",
+      "id": "cve-correlation-positive",
+      "minimum_confidence": "probable",
+      "target": "https://fixture.test/"
+    }
+  ],
+  "expected_oast_callbacks": [
+    {
+      "id": "oast-correlation-positive",
+      "marker": "external.dast.fixture.req-7.url.nonce-1",
+      "protocol": "dns"
+    }
+  ],
+  "expected_requests": [
+    {
+      "content_type": "application/json",
+      "id": "browser-json-request",
+      "method": "POST",
+      "source": "browser",
+      "url": "https://fixture.test/search"
+    },
+    {
+      "id": "crawl-get-request",
+      "method": "GET",
+      "source": "katana",
+      "url": "https://fixture.test/"
+    }
+  ],
+  "forbidden_actions": [
+    "delete-account",
+    "submit-payment",
+    "send-message"
+  ],
+  "negative_findings": [
+    {
+      "class": "xss",
+      "id": "xss-static-negative",
+      "target": "https://fixture.test/static/logo.svg"
+    },
+    {
+      "class": "cve",
+      "id": "cve-unversioned-negative",
+      "target": "https://fixture.test/unversioned"
+    }
+  ],
+  "schema_version": 1,
+  "target": {
+    "description": "Versioned offline fixture for the M0 evidence/evaluation contract",
+    "id": "m0-fixture"
+  }
+}

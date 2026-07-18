@@ -286,7 +286,7 @@ FLOWMETA: dict[str, StepMeta] = {
         summary="FASE 2 — DAST della SUPERFICIE ESPLORABILE (frutti bassi): nuclei -dast sul catalogo "
                 "superficie (requests.jsonl), fuzzando i parametri OSSERVATI (query/body/form/xhr che il "
                 "crawl ha visto). Findings veloci ad alto segnale PRIMA del fuzzing pesante; niente "
-                "scoperta di param nascosti (è guessing → FASE 4).",
+                "scoperta di param nascosti (è guessing → FASE 5).",
         commands=(
             "# input: requests.jsonl + requests_xref.jsonl; drop GET statici senza input; dedup per shape; cap 1500",
             "# tutti i template di tutti i pack abilitati; selezione esatta nel manifest",
@@ -451,7 +451,7 @@ FLOWMETA: dict[str, StepMeta] = {
                "candidati precision-first (set modesto), non una wordlist enorme · best-effort: salta senza httpx",
                "i datastore unauth (redis/mongo/elastic/…) li copre nuclei_scope, non questo step"),
     ),
-    # --- PHASE 4: DAST the guessed surface (detailed) ---
+    # --- PHASE 4: freeze complete catalogs; PHASE 5: risk-budgeted deep detection ---
     "request_catalog_full": StepMeta(
         summary="FASE 4 (testa) — ricostruisce il catalogo INCLUDENDO la superficie indovinata → "
                 "requests_full.jsonl. Stesso assembly di request_catalog ma aggiunge i record recrawl + "
@@ -468,22 +468,22 @@ FLOWMETA: dict[str, StepMeta] = {
         notes=("offline (net=False) · legge FASE 1 + FASE 3 oltre le barriere → vede il corpus COMPLETO",
                "raw HTTP/1.1 = path + Host (scheme-agnostic) → nuclei -im jsonl lo fuzza su ogni part",
                "dead-drop GET-only/body-less come request_catalog (qui anche gli hit del corpus indovinato)",
-               "alimenta param_fuzz + dast_full (la ricerca dettagliata)"),
+               "la barriera 4→5 congela tutti i cataloghi prima di riallocare i budget tra app"),
     ),
     "param_fuzz": StepMeta(
-        summary="FASE 4 — scoperta parametri nascosti su TUTTE le location (query · body · json · header), "
+        summary="FASE 5 — scoperta parametri nascosti su TUTTE le location (query · body · json · header), "
                 "non solo GET. Legge il catalogo COMPLETO (requests_full.jsonl) → sonda anche gli endpoint "
                 "trovati fuzzando; arjun (-m GET/POST/JSON) ∥ x8 (-X/--data-type/--headers).",
         commands=(
-            "# query: ogni shape (dedup path-template, cap 50) · body+json: endpoint con body (form/xhr/POST,",
-            "#   cap 25, + probe sui GET) · header: subset (cap 15, solo x8). wordlist params custom-first.",
+            "# ranking deterministico + quote host/metodo/location/source; cap base 50/25/15 riallocati tra app",
+            "# query: ogni shape (dedup path-template) · body+json: endpoint con body + probe sui GET · header: x8",
             "arjun -i targets_<loc>.txt -oJ <loc>.json -m GET|POST|JSON -t 5 -T 15 --rate-limit 20 -q [--headers auth]",
             "x8 -u targets_<loc>.txt -w params -O json -o <loc>.json [-X POST] [-t json] [--headers] [-H auth]",
             "# matrice (tool, location) in un pool cappato (PARAM_FANOUT=3); cap wall-clock per-tool 600s",
             "# collapse_global_params: un param trovato su ≥75% degli endpoint testati (≥5) = riflesso",
             "#   SITE-WIDE → 1 record host-level {scope:site-wide}, non sprayato su ogni endpoint",
         ),
-        outputs=("params.jsonl",),
+        outputs=("params.jsonl", "raw/ranking/param-*.jsonl", "raw/ranking/budget-param_*.json"),
         notes=(
             "merge per (url, param, LOCATION) → params.jsonl: query≠body sono punti d'iniezione distinti",
             "arjun -m: query→GET · body→POST · json→JSON (niente modo header → header solo x8)",
@@ -495,19 +495,20 @@ FLOWMETA: dict[str, StepMeta] = {
         ),
     ),
     "dast_full": StepMeta(
-        summary="FASE 4 — DAST della SUPERFICIE INDOVINATA (ricerca dettagliata): per non ripetere la "
+        summary="FASE 5 — DAST della SUPERFICIE INDOVINATA (ricerca dettagliata): per non ripetere la "
                 "FASE 2, fuzza solo il DELTA (le shape in requests_full non già in requests, per "
                 "request_key) + le richieste sintetizzate dai param nascosti (params.jsonl) — nuovi punti "
                 "d'iniezione anche su un endpoint della superficie. nuclei -dast fuzza query/path/header/cookie/BODY.",
         commands=(
             "# delta = shape in requests_full.jsonl NON già in requests.jsonl (request_key) + build_fuzz_requests(params)",
-            "# tutti i template dei pack abilitati; cap 1500 → input_full + template-selection-full.json",
+            "# risk ranking + quote; cap base 1500 riallocato tra app senza aumentare il budget totale",
             "nuclei -dast -im jsonl -l input_full.jsonl -t <pack>...",
             "       -fa high -fuzz-param-frequency 10000 -rl <profilo> -c <profilo>",
             "       -timeout 10 -retries 2 -j -silent -duc [-H auth]",
             "# dedup_dast_findings: 1 record per (template, host, path, fuzz position), come in dast",
         ),
-        outputs=("findings/dast_full.jsonl", "raw/dast/template-selection-full.json"),
+        outputs=("findings/dast_full.jsonl", "raw/dast/template-selection-full.json",
+                 "raw/ranking/dast-full.jsonl", "raw/ranking/budget-dast_full.json"),
         notes=(
             "nuclei costruisce la richiesta fuzzata dal campo `raw` → metodo/body/header arbitrari (POST/JSON)",
             "param scoperti iniettati in richieste concrete (build_fuzz_requests): query/body/json/header",
@@ -518,31 +519,31 @@ FLOWMETA: dict[str, StepMeta] = {
         ),
     ),
     "xss_full": StepMeta(
-        summary="FASE 4 — XSS dedicato (dalfox) sulla superficie INDOVINATA: il duale di dast_full. Fuzza "
+        summary="FASE 5 — XSS dedicato (dalfox) sulla superficie INDOVINATA: il duale di dast_full. Fuzza "
                 "solo il DELTA (catalogo full meno superficie, per request_key) + i request sintetizzati dai "
                 "param scoperti — non ri-scansiona ciò che la FASE 2 ha già coperto.",
         commands=(
             "# candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)",
             "dalfox file <raw> --rawdata --format jsonl --skip-bav -w 30 --timeout 10 [--http] [-H auth]",
         ),
-        outputs=("findings/xss_full.jsonl",),
-        notes=("needs request_catalog_full + param_fuzz · best-effort · cap wall-clock per-request",
+        outputs=("findings/xss_full.jsonl", "raw/ranking/xss_full*.jsonl"),
+        notes=("barriera full-catalog + needs param_fuzz · best-effort · cap wall-clock per-request",
                "stesso runner di xss (FASE 2), sul delta indovinato + param nascosti",
                "OAST opt-in (PTFLOW_OAST) anche qui: blind XSS via interactsh, callback per-request"),
     ),
     "sqli_full": StepMeta(
-        summary="FASE 4 — SQLi dedicato (sqlmap) sulla superficie INDOVINATA: il duale di dast_full. -r sul "
+        summary="FASE 5 — SQLi dedicato (sqlmap) sulla superficie INDOVINATA: il duale di dast_full. -r sul "
                 "`raw` del DELTA (full meno superficie) + i request dei param scoperti; --smart decide.",
         commands=(
             "# candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)",
             "sqlmap -r <raw> --batch --smart --level 1 --risk 1 --threads 4 --disable-coloring [-H auth]",
         ),
-        outputs=("findings/sqli_full.jsonl",),
-        notes=("needs request_catalog_full + param_fuzz · best-effort · cap wall-clock per-request",
+        outputs=("findings/sqli_full.jsonl", "raw/ranking/sqli_full*.jsonl"),
+        notes=("barriera full-catalog + needs param_fuzz · best-effort · cap wall-clock per-request",
                "stesso runner di sqli (FASE 2), sul delta indovinato + param nascosti"),
     ),
     "cve_lookup_full": StepMeta(
-        summary="FASE 4 — CVE NOTE sull'enumerazione ESPANSA (∥ dast_full). Il crawl di FASE 3 "
+        summary="FASE 4 — CVE NOTE sull'enumerazione ESPANSA. Il crawl di FASE 3 "
                 "(content_discovery/recrawl) fa crescere il corpus, quindi ri-mina le librerie e riporta "
                 "solo il DELTA: software non già coperto dalla passata di FASE 2 (raw/cve/seen.txt).",
         commands=(
@@ -630,7 +631,7 @@ _PIVOT = StepMeta(
 _FANIN = StepMeta(
     summary="Fan-in terminale DETERMINISTICO (consolidate): solleva i findings per-app in "
             "<activity>/findings/<tipo>.jsonl — un file per categoria, ogni record con app_id. cve e "
-            "dast uniscono superficie (fase 2) + deep (fase 4); CVE duplicate fondono sources/hosts e i "
+            "dast uniscono superficie (fase 2) + deep (fase 5); CVE duplicate fondono sources/hosts e i "
             "cloud asset condivisi fondono gli app_ids. takeover.txt → record. nuclei_scope è già a "
             "livello activity. Il seam dell'agente (StubProvider) resta dormiente accanto.",
     outputs=("findings/cve.jsonl", "findings/dast.jsonl", "findings/tilde_enum.jsonl",
@@ -646,7 +647,8 @@ SPEC = MapSpec(
            "la SUPERFICIE ESPLORABILE (OSINT/crawl) e il suo DAST (frutti bassi), poi il guessing/fuzzing "
            "(fixpoint di content discovery: fuzz → download → mine → fuzz) e il DAST della superficie indovinata.",
     steps=FLOWMETA,
-    phase_labels={1: "surface recon", 2: "DAST surface", 3: "fuzzing/guessing", 4: "DAST deep"},
+    phase_labels={1: "surface recon", 2: "DAST surface", 3: "fuzzing/guessing",
+                  4: "full catalog + CVE", 5: "risk-budgeted DAST deep"},
     pivot=("scans/<app_id>/", _PIVOT),
     fanin=("consolidate", _FANIN),
 )

@@ -23,7 +23,7 @@ _AI_STAGES = ai.per_app_stages()
 
 class ExternalPipeline:
     name = "external"
-    resume_epoch = 1
+    resume_epoch = 2
     stages: Sequence[Stage] = (
         # activity scope (whole-scope asset discovery)
         Stage("provision_wl", tasks.provision_wl, net=False),  # wordlist roles → wl_global/ (offline, ∥)
@@ -104,25 +104,23 @@ class ExternalPipeline:
         # cloud-storage exposure — mine the corpus for S3/GCS/Azure refs + probe apex-derived candidate
         # bucket names for public listability (∥ the rest of loop 3; reads the corpus, no needs).
         Stage("cloud_assets", tasks.cloud_assets, per_app=True, phase=3),
-        # ── per-app PHASE 4 — DAST the guessed surface (detailed) ───────────────────────────────────
-        # rebuild the catalog INCLUDING the guessed surface (requests_full.jsonl), discover hidden params,
-        # then DAST only the DELTA vs phase 2 + the param-injection requests (no re-DAST of the surface).
+        # ── per-app PHASE 4 — freeze the complete guessed-surface catalog ───────────────────────────
+        # Every app builds requests_full.jsonl before the phase-5 scanners calculate engagement-wide
+        # budgets. This barrier makes cross-app redistribution deterministic and race-free.
         Stage("request_catalog_full", tasks.request_catalog_full, per_app=True, phase=4, net=False),
-        Stage("param_fuzz", tasks.param_fuzz, needs=("request_catalog_full",), per_app=True, phase=4),
-        Stage("dast_full", tasks.dast_full, needs=("request_catalog_full", "param_fuzz"),
-              per_app=True, phase=4),
+        # CVE lookup over the EXPANDED enumeration — OFFLINE; independent of request budgeting.
+        Stage("cve_lookup_full", tasks.cve_lookup_full, per_app=True, phase=4, net=False),
+        # finding-only per-stack vuln scanners (gated on detected tech), also catalog-independent.
+        Stage("tech_vulnscan", tasks.tech_vulnscan, per_app=True, phase=4),
+        # ── per-app PHASE 5 — risk-budgeted deep detection ──────────────────────────────────────────
+        # Discover hidden params, then DAST only the DELTA vs phase 2 + param-injection requests. Caps
+        # are redistributed from small apps to rich apps using every completed full catalog.
+        Stage("param_fuzz", tasks.param_fuzz, per_app=True, phase=5),
+        Stage("dast_full", tasks.dast_full, needs=("param_fuzz",), per_app=True, phase=5),
         # dedicated vuln scanners over the GUESSED-surface delta + discovered params (the dalfox/sqlmap
         # analog of dast_full): fuzz only what phase 2 didn't already cover. Need the full catalog + params.
-        Stage("xss_full", tasks.xss_full, needs=("request_catalog_full", "param_fuzz"),
-              per_app=True, phase=4),
-        Stage("sqli_full", tasks.sqli_full, needs=("request_catalog_full", "param_fuzz"),
-              per_app=True, phase=4),
-        # CVE lookup over the EXPANDED enumeration (the phase-3 crawl grew the corpus) — OFFLINE, runs ∥
-        # dast_full; reports only the delta vs the phase-2 pass (raw/cve/seen.txt).
-        Stage("cve_lookup_full", tasks.cve_lookup_full, per_app=True, phase=4, net=False),
-        # finding-only per-stack vuln scanners (gated on detected tech) — runs ∥ the rest of loop 4.
-        # Today: wpprobe (WordPress plugin/theme → known-CVE) on WordPress groups → findings/wpprobe.jsonl.
-        Stage("tech_vulnscan", tasks.tech_vulnscan, per_app=True, phase=4),
+        Stage("xss_full", tasks.xss_full, needs=("param_fuzz",), per_app=True, phase=5),
+        Stage("sqli_full", tasks.sqli_full, needs=("param_fuzz",), per_app=True, phase=5),
         *(_AI_STAGES if _AI else ()),
     )
 
