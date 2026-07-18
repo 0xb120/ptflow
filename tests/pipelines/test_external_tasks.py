@@ -252,7 +252,9 @@ def test_pipeline_object_shape():
         "provision_wl", "expand", "subdomain_bruteforce", "resolve", "scope_gate", "portscan",
         "portscan_full", "httpx", "nerva",
     ]
-    assert spanning == ["portscan_exhaustive", "httpx_late", "nuclei_scope"]
+    assert spanning == [
+        "portscan_exhaustive", "httpx_late", "fingerprint_late", "cve_late", "nuclei_scope",
+    ]
     assert cluster_scope == ["screenshot"]  # batched screenshot, post-cluster ∥ the loops
     assert checkpoints == ["surface_checkpoint"]
     assert app == [
@@ -276,6 +278,11 @@ def test_pipeline_object_shape():
     assert by_name["portscan_exhaustive"].needs == ("portscan_full",)
     assert by_name["httpx_late"].spanning is True
     assert by_name["httpx_late"].needs == ("portscan_exhaustive",)
+    assert by_name["fingerprint_late"].spanning is True
+    assert by_name["fingerprint_late"].needs == ("httpx_late",)
+    assert by_name["cve_late"].spanning is True
+    assert by_name["cve_late"].needs == ("fingerprint_late",)
+    assert by_name["cve_late"].net is False
     # whole-scope nuclei is spanning: starts after httpx, runs ∥ cluster + per-app, joins at fan-in
     assert by_name["nuclei_scope"].spanning is True
     assert by_name["nuclei_scope"].needs == ("httpx",)
@@ -1567,6 +1574,104 @@ def test_httpx_late_probes_only_full_scan_delta_and_writes_incremental_scope(
     assert coverage["late_followup_ready"] is True
 
 
+def test_fingerprint_late_excludes_http_sockets_and_scans_only_non_http_delta(
+    monkeypatch, tmp_path,
+):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    calls: list[str] = []
+
+    def fake_run(_cmd, **kwargs):
+        calls.append(kwargs.get("stdin") or "")
+        return json.dumps({
+            "ip": "10.0.0.5", "port": 65000,
+            "metadata": {"banner": "SSH-2.0-OpenSSH_9.6p1"},
+        }) + "\n"
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    monkeypatch.setattr(tasks, "PORTSCAN_MODE", "exhaustive")
+    act = Activity.named("late-services", root=tmp_path).ensure()
+    canon = act.asset_discovery_canonical
+    tools.write_lines(canon("naabu_web.txt"), ["10.0.0.5:443"])
+    tools.write_lines(canon("naabu_full.txt"), ["10.0.0.5:22"])
+    tools.write_lines(canon("naabu_exhaustive.txt"), [
+        "10.0.0.5:22", "10.0.0.5:443", "10.0.0.5:8443", "10.0.0.5:65000",
+    ])
+    tools.write_jsonl(canon("httpx_late_metadata.jsonl"), [{
+        "url": "https://10.0.0.5:8443", "status_code": 200,
+    }])
+
+    tasks.fingerprint_late(act)
+
+    assert calls == ["10.0.0.5:65000"]
+    assert tools.read_lines(canon("late_nonhttp_sockets.txt")) == ["10.0.0.5:65000"]
+    [service] = tools.read_jsonl(canon("nerva_late_metadata.jsonl"))
+    assert service["port"] == 65000
+    coverage = json.loads(canon("portscan_coverage.json").read_text())
+    assert coverage["late_nonhttp_socket_candidates"] == 1
+    assert coverage["late_service_fingerprints"] == 1
+
+
+def test_cve_late_reuses_normalized_banner_inventory_and_writes_activity_finding(
+    monkeypatch, tmp_path,
+):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    captured: list[list[dict]] = []
+
+    def fake_query(inventory):
+        records = list(inventory)
+        captured.append(records)
+        return ([{
+            "cve": "CVE-2026-9999", "product": "OpenSSH", "version": "9.6",
+            "severity": "high", "hosts": ["10.0.0.5:65000"],
+        }], len(records))
+
+    monkeypatch.setattr(tasks, "PORTSCAN_MODE", "exhaustive")
+    monkeypatch.setattr(tasks.shutil, "which", lambda _name: "/usr/bin/search_vulns")
+    monkeypatch.setattr(tasks, "_query_software_cves", fake_query)
+    act = Activity.named("late-cve", root=tmp_path).ensure()
+    canon = act.asset_discovery_canonical
+    tools.write_jsonl(canon("nerva_late_metadata.jsonl"), [{
+        "ip": "10.0.0.5", "port": 65000,
+        "metadata": {"banner": "SSH-2.0-OpenSSH_9.6p1"},
+    }])
+
+    tasks.cve_late(act)
+
+    assert captured[0][0]["product"] == "OpenSSH"
+    assert captured[0][0]["version"] == "9.6"
+    assert captured[0][0]["where"] == ["10.0.0.5:65000"]
+    assert tools.read_jsonl(act.findings / "cve_late.jsonl")[0]["cve"] == "CVE-2026-9999"
+    coverage = json.loads(canon("portscan_coverage.json").read_text())
+    assert coverage["late_software_components"] == 1
+    assert coverage["late_queryable_components"] == 1
+    assert coverage["late_cve_findings"] == 1
+
+
+def test_balanced_late_non_http_stages_clear_stale_artifacts(monkeypatch, tmp_path):
+    from ptflow.core import tools
+    from ptflow.core.paths import Activity
+
+    monkeypatch.setattr(tasks, "PORTSCAN_MODE", "balanced")
+    act = Activity.named("late-balanced", root=tmp_path).ensure()
+    canon = act.asset_discovery_canonical
+    tools.write_lines(canon("late_nonhttp_sockets.txt"), ["10.0.0.5:65000"])
+    tools.write_jsonl(canon("nerva_late_metadata.jsonl"), [{"stale": True}])
+    tools.write_jsonl(canon("software_inventory_late.jsonl"), [{"stale": True}])
+    tools.write_jsonl(act.findings / "cve_late.jsonl", [{"stale": True}])
+
+    tasks.fingerprint_late(act)
+    tasks.cve_late(act)
+
+    assert tools.read_lines(canon("late_nonhttp_sockets.txt")) == []
+    assert tools.read_jsonl(canon("nerva_late_metadata.jsonl")) == []
+    assert tools.read_jsonl(canon("software_inventory_late.jsonl")) == []
+    assert tools.read_jsonl(act.findings / "cve_late.jsonl") == []
+
+
 def test_auth_headers_reach_remaining_http_target_tools(monkeypatch, tmp_path):
     from ptflow.core.paths import Activity
 
@@ -2706,10 +2811,10 @@ def test_surface_checkpoint_snapshots_only_mature_findings_and_replaces_stale(tm
     }
     assert tools.read_jsonl(checkpoint / "cve.jsonl")[0]["cve"] == "CVE-SURFACE"
     assert not (checkpoint / "wpprobe.jsonl").exists()
-    report = json.loads((act.base / "report-surface.json").read_text())
+    report = json.loads((act.reports / "report-surface.json").read_text())
     assert report["summary"]["total"] == 3
-    assert "CVE-DEEP" not in (act.base / "report-surface.md").read_text()
-    assert "still-spanning" not in (act.base / "report-surface.md").read_text()
+    assert "CVE-DEEP" not in (act.reports / "report-surface.md").read_text()
+    assert "still-spanning" not in (act.reports / "report-surface.md").read_text()
     assert not (act.findings / "cve.jsonl").exists()  # final fan-in namespace stays untouched
 
     tools.write_jsonl(app.findings / "cve.jsonl", [])
@@ -2717,7 +2822,7 @@ def test_surface_checkpoint_snapshots_only_mature_findings_and_replaces_stale(tm
     tools.write_lines(app.canonical("takeover.txt"), [])
     tasks.surface_checkpoint(act)
     assert list(checkpoint.glob("*.jsonl")) == []
-    assert json.loads((act.base / "report-surface.json").read_text())["summary"]["total"] == 0
+    assert json.loads((act.reports / "report-surface.json").read_text())["summary"]["total"] == 0
 
 
 def test_consolidate_lifts_per_app_findings_by_type(tmp_path):

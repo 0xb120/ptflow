@@ -48,16 +48,16 @@ def test_orchestrate_end_to_end(tmp_path):
     assert all(h["source"] == "stub" for h in hyp)
 
     # deterministic terminal deliverables + execution coverage
-    report = json.loads((base / "report.json").read_text())
+    report = json.loads((base / "reports" / "report.json").read_text())
     assert report["summary"]["total"] == 4
-    assert (base / "report.md").exists()
+    assert (base / "reports" / "report.md").exists()
     coverage = json.loads((base / "coverage.json").read_text())
     assert coverage["status"] == "completed"
     assert any(s["stage"] == "deterministic_report" and s["status"] == "success"
                for s in coverage["stages"])
 
     # standard activity dirs
-    for sub in ("poc", "tmp", "wl_global", "logs"):
+    for sub in ("reports", "poc", "tmp", "wl_global", "logs"):
         assert (base / sub).is_dir()
 
 
@@ -84,6 +84,60 @@ def test_cli_resume_reruns_cleanly(tmp_path):
     # a --resume rerun completes cleanly (skipping done stages) and keeps the outputs
     assert main(["run", "example", "acme", str(scope_file), "--root", root, "--resume"]) == 0
     assert (base / "findings" / "hypotheses.jsonl").exists()
+
+
+def test_cli_persists_followup_lineage_and_composed_report(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from ptflow.core import reporting
+    from ptflow.core.paths import Activity
+    from ptflow.core.stage import Followup
+
+    class ParentPipeline:
+        name = "parent"
+        stages = ()
+
+        @staticmethod
+        def followups(activity):
+            child_scope = activity.base / "child-scope.txt"
+            child_scope.write_text("https://late.example\n")
+            return [Followup("child", "late", str(child_scope))]
+
+    class ChildPipeline:
+        name = "child"
+        stages = ()
+
+    pipelines = {"parent": ParentPipeline(), "child": ChildPipeline()}
+
+    def fake_orchestrate(pipeline, activity_name, scope_file, *, root, **_kwargs):
+        activity = Activity.named(activity_name, Path(root)).ensure()
+        activity.scope.write_text(Path(scope_file).read_text())
+        severity = "high" if pipeline.name == "parent" else "critical"
+        tools.write_jsonl(activity.findings / f"{pipeline.name}.jsonl", [{
+            "template-id": f"{pipeline.name}-finding", "severity": severity,
+        }])
+        reporting.write_report(activity)
+        tools.write_text(activity.base / "coverage.json", json.dumps({
+            "run_id": f"{pipeline.name}-run", "started_at": "start", "finished_at": "finish",
+            "failures": [],
+        }))
+        return activity.base, 0
+
+    monkeypatch.setattr("ptflow.pipelines.load_pipeline", pipelines.__getitem__)
+    monkeypatch.setattr("ptflow.core.orchestrator.orchestrate", fake_orchestrate)
+    scope_file = _scope(tmp_path)
+
+    assert main([
+        "run", "parent", "demo", str(scope_file), "--root", str(tmp_path / "runs"),
+    ]) == 0
+
+    reports = tmp_path / "runs" / "demo" / "reports"
+    manifest = json.loads((reports / "composition.json").read_text())
+    assert manifest["followups"][0]["status"] == "completed"
+    assert manifest["followups"][0]["run_id"] == "child-run"
+    composed = json.loads((reports / "report-composed.json").read_text())
+    assert composed["summary"]["findings"] == 2
+    assert composed["summary"]["by_status"] == {"completed": 2}
 
 
 def test_cli_run_returns_nonzero_on_failure(tmp_path, monkeypatch):

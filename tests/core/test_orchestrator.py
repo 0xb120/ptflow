@@ -210,8 +210,8 @@ def test_terminal_fanin_isolates_agent_and_calls_report(tmp_path):
     orchestrator._terminal_fanin(P(), act, failures)
     assert "agent" in failures          # agent failure isolated, not raised
     assert called["report"] is True     # report hook still ran
-    assert (act.base / "report.md").exists()  # deterministic report is independent of the AI hook
-    assert (act.base / "report.json").exists()
+    assert (act.reports / "report.md").exists()  # deterministic report is independent of the AI hook
+    assert (act.reports / "report.json").exists()
 
 
 def test_enabled_stages_topo_tolerates_removed_dep():

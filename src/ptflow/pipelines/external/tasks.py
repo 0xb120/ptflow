@@ -2478,10 +2478,7 @@ def httpx_late(activity: Activity) -> None:
         manifest["late_followup_ready"] = False
         _write_portscan_coverage(activity, manifest)
         return
-    initial_sockets = set(tools.read_lines(canon("naabu_web.txt")))
-    initial_sockets.update(tools.read_lines(canon("naabu_full.txt")))
-    delta = [socket for socket in tools.read_lines(canon("naabu_exhaustive.txt"))
-             if socket not in initial_sockets]
+    delta = _late_socket_delta(activity)
     out = _run(
         "httpx",
         [HTTPX, "-silent", "-sc", "-cl", "-td", "-title", "-ip", "-hash", "sha256",
@@ -2505,6 +2502,112 @@ def httpx_late(activity: Activity) -> None:
     _write_portscan_coverage(activity, manifest)
     log.info("  → late web delta — %d socket(s), %d HTTP service(s), %d new target(s) → %s",
              len(delta), len(services), len(targets), LATE_WEB_SCOPE_FILE)
+
+
+def _late_socket_delta(activity: Activity) -> list[str]:
+    """Full-scan sockets absent from the pre-cluster curated/top-1000 union. Pure over disk inputs."""
+    canon = activity.asset_discovery_canonical
+    initial = set(tools.read_lines(canon("naabu_web.txt")))
+    initial.update(tools.read_lines(canon("naabu_full.txt")))
+    return tools.dedupe(
+        socket for socket in tools.read_lines(canon("naabu_exhaustive.txt"))
+        if socket not in initial
+    )
+
+
+def _socket_line_key(value: str) -> tuple[str, int | str] | None:
+    host, separator, raw_port = value.strip().rpartition(":")
+    if not separator or not host:
+        return None
+    try:
+        port: int | str = int(raw_port)
+    except ValueError:
+        port = raw_port
+    return host.strip("[]").lower(), port
+
+
+def fingerprint_late(activity: Activity) -> None:
+    """SPANNING exhaustive tail — nerva fingerprinting of late NON-HTTP sockets only.
+
+    ``httpx_late`` has already identified the web subset, so subtracting its physical sockets avoids
+    paying two protocol probes for those services. Balanced mode is a stable, stale-clearing no-op.
+    """
+    canon = activity.asset_discovery_canonical
+    sockets_path = canon("late_nonhttp_sockets.txt")
+    metadata_path = canon("nerva_late_metadata.jsonl")
+    raw_path = activity.asset_discovery_raw("nerva") / "late.jsonl"
+    tools.write_lines(sockets_path, [])
+    tools.write_jsonl(metadata_path, [])
+    tools.write_text(raw_path, "")
+    if PORTSCAN_MODE != "exhaustive":
+        return
+    web_sockets = {
+        socket for record in tools.read_jsonl(canon("httpx_late_metadata.jsonl"))
+        if (socket := _service_socket(record)) is not None
+    }
+    sockets = [
+        value for value in _late_socket_delta(activity)
+        if _socket_line_key(value) not in web_sockets
+    ]
+    tools.write_lines(sockets_path, sockets)
+    out = _run(
+        "nerva", ["nerva", "--json"], stdin="\n".join(sockets), dest=raw_path,
+        label="late-non-http",
+    )
+    records = _jsonl_str(out)
+    tools.write_jsonl(metadata_path, records)
+    manifest = _portscan_coverage(activity)
+    manifest.update({
+        "late_nonhttp_socket_candidates": len(sockets),
+        "late_service_fingerprints": len(records),
+    })
+    _write_portscan_coverage(activity, manifest)
+    log.info("  → late non-HTTP fingerprint — %d socket(s), %d service(s)",
+             len(sockets), len(records))
+
+
+def _late_service_inventory(records: Iterable[Mapping[str, Any]]) -> list[dict]:
+    """Version-pinned software from late nerva banners, using the normal external CVE inventory."""
+    services: list[tuple[str, str]] = []
+    for record in records:
+        metadata = record.get("metadata")
+        banner = metadata.get("banner") if isinstance(metadata, Mapping) else None
+        host = record.get("host") or record.get("ip")
+        port = record.get("port")
+        if banner and host:
+            services.append((f"{host}:{port}" if port is not None else str(host), str(banner)))
+    return collect_software(
+        tech=(), server=None, services=services, corpus_texts=(), app_hosts=(),
+    )
+
+
+def cve_late(activity: Activity) -> None:
+    """SPANNING/OFFLINE — known-CVE correlation for exhaustive late non-HTTP services."""
+    canon = activity.asset_discovery_canonical
+    inventory_path = canon("software_inventory_late.jsonl")
+    findings_path = activity.findings / "cve_late.jsonl"
+    tools.write_jsonl(inventory_path, [])
+    tools.write_jsonl(findings_path, [])
+    if PORTSCAN_MODE != "exhaustive":
+        return
+    inventory = _late_service_inventory(tools.read_jsonl(canon("nerva_late_metadata.jsonl")))
+    tools.write_jsonl(inventory_path, inventory)
+    findings: list[dict] = []
+    queryable = sum(component.get("queryable") is not False for component in inventory)
+    if shutil.which(SEARCH_VULNS) is None:
+        log.debug("  · skip cve_late (search_vulns not installed)")
+    else:
+        findings, queryable = _query_software_cves(inventory)
+        tools.write_jsonl(findings_path, findings)
+    manifest = _portscan_coverage(activity)
+    manifest.update({
+        "late_software_components": len(inventory),
+        "late_queryable_components": queryable,
+        "late_cve_findings": len(findings),
+    })
+    _write_portscan_coverage(activity, manifest)
+    log.info("  → cve_late — %d component(s), %d queryable → %d CVE(s)",
+             len(inventory), queryable, len(findings))
 
 
 def ingest_httpx(activity: Activity) -> None:
@@ -6249,6 +6352,33 @@ def dedup_cve_findings(records: Iterable[dict]) -> list[dict]:
     ))
 
 
+def _query_software_cves(software: Iterable[dict]) -> tuple[list[dict], int]:
+    """Correlate a normalized software inventory with the local DB, preserving occurrence evidence."""
+    queryable = [component for component in software if component.get("queryable") is not False]
+    findings: list[dict] = []
+    if queryable:
+        with ThreadPoolExecutor(max_workers=CVE_FANOUT) as pool:
+            futs = [
+                (component, telemetry.submit(
+                    pool, _search_vulns_query, component["product"], component["version"],
+                ))
+                for component in queryable
+            ]
+            for component, future in futs:
+                findings += [{
+                    **cve,
+                    "observed_component_id": component["component_id"],
+                    "observed_products": _string_union(
+                        cve.get("observed_products"), component.get("observed_products"),
+                    ),
+                    "ecosystem": component.get("ecosystem"),
+                    "package": component.get("package"),
+                    "sources": component["sources"],
+                    "hosts": component["where"],
+                } for cve in future.result()]
+    return dedup_cve_findings(findings), len(queryable)
+
+
 def _run_cve(ws: AppWorkspace, software: list[dict], *, out_name: str,
              seen_path: Path | None, label: str) -> None:
     """Query search_vulns for each enumerated (product, version) in a bounded pool (memoized), attach
@@ -6265,26 +6395,7 @@ def _run_cve(ws: AppWorkspace, software: list[dict], *, out_name: str,
             f"{component['component_id']}\t{component['canonical_version']}"
             for component in queryable
         ])
-    findings: list[dict] = []
-    if queryable:
-        with ThreadPoolExecutor(max_workers=CVE_FANOUT) as pool:
-            futs = [
-                (s, telemetry.submit(pool, _search_vulns_query, s["product"], s["version"]))
-                for s in queryable
-            ]
-            for s, fut in futs:
-                findings += [{
-                    **cve,
-                    "observed_component_id": s["component_id"],
-                    "observed_products": _string_union(
-                        cve.get("observed_products"), s.get("observed_products"),
-                    ),
-                    "ecosystem": s.get("ecosystem"),
-                    "package": s.get("package"),
-                    "sources": s["sources"],
-                    "hosts": s["where"],
-                } for cve in fut.result()]
-    findings = dedup_cve_findings(findings)
+    findings, _ = _query_software_cves(queryable)
     n = tools.write_jsonl(ws.findings / out_name, findings)
     hot = sum(1 for f in findings if f.get("exploited"))
     log.info("  → %s (%s) — %d component(s), %d queryable → %d CVE(s)%s → findings/%s",
@@ -6533,7 +6644,8 @@ def surface_checkpoint(activity: Activity) -> None:
         ),
     )
     log.info(
-        "  → surface checkpoint — %s · report-surface.md + report-surface.json (%d finding(s))",
+        "  → surface checkpoint — %s · reports/report-surface.md + "
+        "reports/report-surface.json (%d finding(s))",
         ", ".join(f"{kind} {count}" for kind, count in sorted(counts.items())) or "no findings",
         report["summary"]["total"],
     )

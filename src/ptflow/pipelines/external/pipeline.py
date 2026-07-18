@@ -40,11 +40,13 @@ class ExternalPipeline:
         Stage("httpx", tasks.httpx_fingerprint, needs=("portscan_full",)),
         Stage("nerva", tasks.nerva_fingerprint, needs=("portscan_full",)),
         # Exhaustive-only tail: the tasks are stable no-ops in balanced mode. The full scan runs ∥
-        # cluster/loops; httpx_late fingerprints only sockets absent from the pre-cluster set and the
-        # CLI hands genuinely new apps to a separate depth-only webscan run after the spanning join.
+        # cluster/loops; httpx_late identifies new web apps, then fingerprint_late + cve_late cover the
+        # remaining non-HTTP sockets before the CLI starts the depth-only webscan follow-up.
         Stage("portscan_exhaustive", tasks.portscan_exhaustive,
               needs=("portscan_full",), spanning=True),
         Stage("httpx_late", tasks.httpx_late, needs=("portscan_exhaustive",), spanning=True),
+        Stage("fingerprint_late", tasks.fingerprint_late, needs=("httpx_late",), spanning=True),
+        Stage("cve_late", tasks.cve_late, needs=("fingerprint_late",), spanning=True, net=False),
         # whole-scope nuclei — spanning: runs ∥ clustering + all per-app loops, joined at the fan-in
         Stage("nuclei_scope", tasks.nuclei_scope, needs=("httpx",), spanning=True),
         # post-cluster spanning — ONE batched screenshot run (1 host/group) → unified gallery, ∥ loops

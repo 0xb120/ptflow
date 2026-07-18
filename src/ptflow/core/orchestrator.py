@@ -282,7 +282,8 @@ def _terminal_fanin(
             activity, run_id, stage="deterministic_report", app_id=None, band="terminal",
             call=lambda: reporting.write_report(activity),
         )
-        log.info("  → report.md + report.json (%d finding(s))", report["summary"]["total"])
+        log.info("  → reports/report.md + reports/report.json (%d finding(s))",
+                 report["summary"]["total"])
     except Exception:  # reporting remains failure-isolated like the rest of the terminal fan-in
         log.exception("⚠ deterministic report failed")
         failures.append("deterministic_report")

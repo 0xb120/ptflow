@@ -315,6 +315,7 @@ def _run(args: argparse.Namespace) -> int:
         return 2
     runconfig.apply(resolved)
 
+    from ptflow.core import composition  # noqa: PLC0415 (after runconfig.apply)
     from ptflow.core.orchestrator import orchestrate  # noqa: PLC0415 (after runconfig.apply)
     from ptflow.core.paths import Activity  # noqa: PLC0415
     from ptflow.pipelines import load_pipeline  # noqa: PLC0415 (constants read PTFLOW_* at import)
@@ -343,12 +344,27 @@ def _run(args: argparse.Namespace) -> int:
     # nested Prefect subflow. Duck-typed like consolidate/preflight; absent by default.
     get_followups = getattr(pipeline, "followups", None)
     if callable(get_followups):
-        for fu in get_followups(Activity(Path(base))):
+        parent_activity = Activity(Path(base))
+        followups = list(get_followups(parent_activity))
+        composition_manifest = composition.begin(
+            parent_activity, parent_pipeline=pipeline.name, parent_failures=failures,
+            followups=followups,
+        ) if followups else {}
+        if not followups:
+            composition.clear(parent_activity)
+        for index, fu in enumerate(followups):
+            composition.update_followup(
+                parent_activity, composition_manifest, index, status="running",
+            )
             fu_pipeline = load_pipeline(fu.pipeline)
             try:
                 fu_disabled = runconfig.resolve_disabled_steps(
                     config, overrides, fu_pipeline.name, {s.name for s in fu_pipeline.stages})
             except runconfig.ConfigError as e:
+                composition.update_followup(
+                    parent_activity, composition_manifest, index, status="configuration-error",
+                    failure_count=1, error=str(e),
+                )
                 print(f"config error: {e}", file=sys.stderr)  # noqa: T201
                 return 2
             fu_base, fu_failures = orchestrate(
@@ -361,7 +377,16 @@ def _run(args: argparse.Namespace) -> int:
                                disabled_keys=[f"steps.{fu_pipeline.name}.{n}" for n in sorted(fu_disabled)])
             print(fu_base)  # noqa: T201
             if fu_failures < 0:
+                composition.update_followup(
+                    parent_activity, composition_manifest, index, status="interrupted",
+                    child_base=Path(fu_base),
+                )
                 return 130
+            composition.update_followup(
+                parent_activity, composition_manifest, index,
+                status="failed" if fu_failures else "completed",
+                failure_count=fu_failures, child_base=Path(fu_base),
+            )
             exit_code = exit_code or (1 if fu_failures else 0)
     return exit_code
 

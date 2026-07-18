@@ -126,7 +126,9 @@ class Followup(NamedTuple):
     The CLI runs each Followup as a SEPARATE top-level ``orchestrate()`` (a sub-activity nested under the
     parent activity dir), NOT as a nested Prefect subflow — so every pipeline stays a clean top-level flow
     with its own task-runner/teardown, and the files-as-only-state invariant holds (the parent hands off
-    via an on-disk scope artifact it wrote). Same DUCK-TYPED convention as ``consolidate``/``preflight``:
+    via an on-disk scope artifact it wrote). The CLI persists lineage/state under the parent's
+    ``reports/`` directory and maintains a summary-only composed report that links each authoritative
+    child report. Same DUCK-TYPED convention as ``consolidate``/``preflight``:
     a Pipeline MAY define ``followups(self, activity) -> list[Followup]``; it's read via ``getattr`` and
     absent by default, so it stays off the Protocol and the core stays pipeline-agnostic.
     """

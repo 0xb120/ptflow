@@ -241,7 +241,9 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                                                            #   httpx_full_metadata.jsonl, excluded_cdn.jsonl,
                                                            #   naabu_web.txt [fast/httpx], naabu_full.txt
                                                            #   [bounded policy], naabu_exhaustive.txt [spanning],
-                                                           #   httpx_late_metadata.jsonl + portscan_coverage.json,
+                                                           #   httpx_late_metadata.jsonl, late_nonhttp_sockets.txt,
+                                                           #   nerva_late_metadata.jsonl, software_inventory_late.jsonl,
+                                                           #   portscan_coverage.json,
                                                            #   nerva_full_metadata.jsonl, …)
                                                            #   scope_gate: inscope_{subdomains,tls_names,ips,
                                                            #   domain_ip_map}.txt (RoE-authorized set the active
@@ -283,11 +285,15 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                                          #   cve/dast fold surface+deep). nuclei_scope.jsonl is the whole-scope nuclei finding.
   findings/secrets_triage.jsonl          # CONSOLIDATE output — ai_secret_triage verdicts lifted by app_id (--ai; empty/absent when AI is off)
   findings/hypotheses.jsonl              # agent fan-in output (StubProvider by default; --ai revives it as ai_triage, correlating consolidated findings)
-  report.md  report.json                 # deterministic OFFLINE report: severity-normalized, deduped findings + evidence/PoC source paths
+  findings/cve_late.jsonl                # exhaustive-only activity-level CVEs from late non-HTTP service banners
   checkpoints/surface/findings/          # phase-2 snapshot: cve/dast/xss/sqli surface + takeover
-  report-surface.md  report-surface.json # early deterministic report, before guessing/deep DAST
+  reports/                               # every human/machine-readable report deliverable
+    report.md  report.json               # deterministic OFFLINE report: normalized/deduped findings + evidence paths
+    report-surface.md/.json              # early deterministic report, before guessing/deep DAST
+    report-ai.md                         # --ai narrative (separate; never overwrites deterministic report)
+    composition.json                     # parent/follow-up lineage + states + scope hashes
+    report-composed.md/.json             # summary-only portfolio; links authoritative parent/child reports
   coverage.json                          # per-run/stage coverage: status, deps, observed I/O, commands, caps/drops, requirements, limits
-  report-ai.md                           # --ai terminal narrative report (separate; never overwrites deterministic report)
   screenshots/screenshot/screenshot.html # UNIFIED gallery — one batched httpx run, 1 host/group (+ eyewitness/report.html)
   poc/  tmp/  logs/
   wl_global/                             # shared/global INPUT wordlists (SecLists & co.)
@@ -385,11 +391,13 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     (FAST: ~250 curated web ports `WEB_PORTS` → honeypot filter → `naabu_web.txt`) → `portscan_full`
     (legacy name; COMMON bounded top-1000 barrier, 900s deadline, partial output preserved) → `httpx` ∥
     `nerva` → `cluster` fan-out. In `exhaustive` mode, `portscan_exhaustive` (full 65535) → `httpx_late`
-    runs as a **spanning chain** ∥ cluster + main loops; it subtracts the pre-cluster socket set, drops
-    aliases using the main cluster's identity edges, and writes `late_web_targets.txt`. After the spanning
-    join the CLI automatically composes a nested depth-only `webscan` activity `late_web_recon/` for those
-    genuinely new apps. Balanced mode makes both tail stages stable no-ops. Actual coverage/status lives in
-    `portscan_coverage.json`. Plus `nuclei_scope` —
+    → `fingerprint_late` → `cve_late` runs as a **spanning chain** ∥ cluster + main loops. `httpx_late`
+    subtracts the pre-cluster socket set, drops aliases using the main cluster's identity edges, and writes
+    `late_web_targets.txt`; `fingerprint_late` subtracts those HTTP sockets and runs nerva only on the late
+    non-HTTP remainder; `cve_late` correlates its versioned banners against the local search_vulns DB into
+    activity-level `findings/cve_late.jsonl`. After the spanning join the CLI composes a nested depth-only
+    `webscan` activity `late_web_recon/` for the genuinely new web apps. Balanced mode makes all tail stages
+    stable stale-clearing no-ops. Actual coverage/status lives in `portscan_coverage.json`. Plus `nuclei_scope` —
     another **spanning** whole-scope full-template nuclei scan (one process, one global `-rl` over
     deduped subdomains + webapps) launched after `httpx`, running ∥ everything, joined at the fan-in
     (`findings/nuclei_scope.jsonl`). Template updates are explicit/out-of-band (`nuclei -ut` before the
@@ -428,8 +436,9 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     vuln scanners" below.
   - **Surface checkpoint** (`after_phase=2`, activity-scope, offline): after the global phase-2 barrier,
     `surface_checkpoint` consolidates only the mature phase-1/2 findings (CVE/DAST/XSS/SQLi surface +
-    takeover) into `checkpoints/surface/findings/<type>.jsonl` and publishes `report-surface.md` /
-    `report-surface.json`. It excludes phase-3/4 outputs and spanning stages that have not joined yet;
+    takeover) into `checkpoints/surface/findings/<type>.jsonl` and publishes
+    `reports/report-surface.md` / `reports/report-surface.json`. It excludes phase-3/4 outputs and
+    spanning stages that have not joined yet;
     the terminal report remains authoritative and later folds surface + deep findings.
   - **Loop 3 — guessing / surface expansion** (`phase=3`): `wordlist` (offline seed from JS/body/seed)
     → `tech_enum` (surface-generating per-stack scanners) → `content_discovery` — feroxbuster forced
@@ -507,6 +516,9 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     sub-activity** `<activity>/web_recon/`. The CLI runs each `Followup` as a **separate top-level
     `orchestrate()`**, NOT a nested Prefect subflow — so each pipeline stays a clean flow with its own
     runner/teardown and files-as-only-state holds (the hand-off crosses via the on-disk scope artifact).
+    Before the child starts, the CLI persists `reports/composition.json`; every pending/running/completed/
+    failed/interrupted transition refreshes it and the summary-only `reports/report-composed.{md,json}`.
+    The portfolio aggregates counts and links the authoritative reports without copying child findings.
     **OPT-IN** via `PTFLOW_INTERNAL_WEB_HANDOFF` (default OFF): a full web-depth scan per service is long.
     The aggregation artifact is always written; only the auto-run is gated.
 
@@ -527,7 +539,8 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
   pipeline.py`). It is the shared composition target for `internal`'s aggregated services and external
   exhaustive mode's late full-scan delta. Given known web services (`scheme://host[:port]`), it runs external's
   crawl → catalog → DAST → fuzz depth, **skipping** scope EXPANSION (`expand`/`resolve` — subdomain/DNS/
-  TLS/OSINT), active NETWORK scan (`portscan`/`portscan_full`/`nerva`/`nuclei_scope`), and per-app OSINT
+  TLS/OSINT), active NETWORK scan (`portscan`/`portscan_full`/`portscan_exhaustive`/`httpx_late`/
+  `fingerprint_late`/`cve_late`/`nerva`/`nuclei_scope`), and per-app OSINT
   (`passive_probe`/`subenum`/`takeover`/`fetch_delta` — gau/urlfinder/subfinder/DNS). **It REUSES external's
   task functions unchanged** — only the breadth is replaced by one `ingest` step
   (`external.tasks.ingest_httpx`: httpx over the target list with **`-nfs`** so the explicit http/https +
@@ -1025,7 +1038,7 @@ flow changed:
   `wl_custom/ai_seed.txt`, folded by
   `build_content_wordlist`), `ai_secret_triage` (phase 4 → sidecar `findings/secrets_triage.jsonl`),
   `ai_triage` (revives the agent seam → `findings/hypotheses.jsonl`, correlating consolidated findings),
-  `ai_report` (terminal `report()` hook → `report-ai.md`). Per-app AI stages are marked `net=False`
+  `ai_report` (terminal `report()` hook → `reports/report-ai.md`). Per-app AI stages are marked `net=False`
   because they make no target traffic; hosted providers still make outbound API calls. All are
   additive and failure-isolated. Remote providers receive redacted assessment evidence by default,
   so their use remains RoE/data-handling sensitive. `external` and `webscan` share all four AI

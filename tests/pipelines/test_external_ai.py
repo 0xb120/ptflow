@@ -73,7 +73,7 @@ def test_report_writes_markdown(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(ai, "make_client", lambda *_args: _FakeClient(json_out=output))
     ai.report(act)
-    text = (act.base / "report-ai.md").read_text(encoding="utf-8")
+    text = (act.reports / "report-ai.md").read_text(encoding="utf-8")
     assert "Prioritize the confirmed issue" in text
     assert finding["id"] in text
     assert "Evidence source" in text
@@ -84,7 +84,7 @@ def test_report_noop_when_client_none(tmp_path, monkeypatch):
     tools.write_jsonl(act.findings / "cve.jsonl", [{"app_id": "a", "cve": "CVE-1"}])
     monkeypatch.setattr(ai, "make_client", lambda *_args: None)
     ai.report(act)
-    assert not (act.base / "report-ai.md").exists()
+    assert not (act.reports / "report-ai.md").exists()
 
 
 def test_ai_wordlist_writes_seed(tmp_path, monkeypatch):

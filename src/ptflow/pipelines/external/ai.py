@@ -219,8 +219,8 @@ def _render_ai_report(output: AIReportOut, findings: Sequence[dict[str, Any]]) -
     lines = [
         "# AI-assisted assessment analysis",
         "",
-        "> This additive analysis is grounded in the deterministic findings. `report.md` and "
-        "`report.json` remain the source of truth.",
+        "> This additive analysis is grounded in the deterministic findings. `reports/report.md` and "
+        "`reports/report.json` remain the source of truth.",
         "",
         "## Executive summary",
         "",
@@ -258,7 +258,10 @@ def _render_ai_report(output: AIReportOut, findings: Sequence[dict[str, Any]]) -
 
 
 def report(activity: Activity) -> None:
-    """Write a validated, additive ``report-ai.md``; deterministic reports remain authoritative."""
+    """Write a validated, additive ``reports/report-ai.md``; deterministic reports remain authoritative."""
+    destination = activity.reports / "report-ai.md"
+    destination.unlink(missing_ok=True)
+    (activity.base / "report-ai.md").unlink(missing_ok=True)
     client = make_client("report", activity)
     if client is None:
         return
@@ -270,10 +273,11 @@ def report(activity: Activity) -> None:
     if result.value is None:
         return
     text = _render_ai_report(result.value, findings)
-    tools.write_text(activity.base / "report-ai.md", text)
+    tools.write_text(destination, text)
     valid_priorities = sum(1 for item in result.value.priorities
                            if item.finding_id in {finding["id"] for finding in findings})
-    log.info("  → report-ai.md (%d findings, %d validated priorities)", len(findings), valid_priorities)
+    log.info("  → reports/report-ai.md (%d findings, %d validated priorities)",
+             len(findings), valid_priorities)
 
 
 # --- contextual wordlist -------------------------------------------------------------------------

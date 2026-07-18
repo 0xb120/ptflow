@@ -5,7 +5,8 @@ aggregated web services, while external exhaustive mode hands it only late apps 
 scan. It takes an already-known list (`scheme://host[:port]`) and runs external's crawl → catalog → DAST
 → fuzz depth on them, **skipping**:
   - scope EXPANSION — `expand`/`subdomain_bruteforce`/`resolve` (subdomain/DNS/TLS/OSINT enumeration);
-  - active NETWORK scan — `portscan`/`portscan_full`/`nerva`/`nuclei_scope`;
+  - active NETWORK scan — `portscan`/`portscan_full`/`portscan_exhaustive`/`httpx_late`/
+    `fingerprint_late`/`cve_late`/`nerva`/`nuclei_scope`;
   - per-app OSINT — `passive_probe`/`subenum`/`takeover`/`fetch_delta` (gau/urlfinder/subfinder/DNS).
 
 It reuses external's task and AI functions unchanged — only the breadth is replaced by a single

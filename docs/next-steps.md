@@ -9,7 +9,7 @@ assessment.
 
 ### Principi
 
-- `report.md` e `report.json` deterministici restano la fonte di verità; l'AI produce solo artefatti
+- `reports/report.md` e `reports/report.json` deterministici restano la fonte di verità; l'AI produce solo artefatti
   additivi.
 - I risultati del modello devono citare gli ID stabili dei finding e vengono scartati quando citano
   evidenze inesistenti.

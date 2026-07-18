@@ -56,12 +56,12 @@ def test_write_report_is_byte_stable_and_keeps_source_references(tmp_path):
     )
 
     reporting.write_report(act)
-    first_json = (act.base / "report.json").read_bytes()
-    first_markdown = (act.base / "report.md").read_bytes()
+    first_json = (act.reports / "report.json").read_bytes()
+    first_markdown = (act.reports / "report.md").read_bytes()
     reporting.write_report(act)
 
-    assert (act.base / "report.json").read_bytes() == first_json
-    assert (act.base / "report.md").read_bytes() == first_markdown
+    assert (act.reports / "report.json").read_bytes() == first_json
+    assert (act.reports / "report.md").read_bytes() == first_markdown
     model = json.loads(first_json)
     assert model["findings"][0]["sources"] == [{"line": 1, "path": "findings/cve.jsonl"}]
     assert b"findings/cve.jsonl:1" in first_markdown
@@ -83,7 +83,7 @@ def test_empty_report_is_still_a_valid_deliverable(tmp_path):
     act = Activity.named("empty", root=tmp_path).ensure()
     report = reporting.write_report(act)
     assert report["summary"]["total"] == 0
-    assert "No consolidated findings were produced." in (act.base / "report.md").read_text()
+    assert "No consolidated findings were produced." in (act.reports / "report.md").read_text()
 
 
 def test_named_report_reads_isolated_findings_directory(tmp_path):
@@ -101,5 +101,18 @@ def test_named_report_reads_isolated_findings_directory(tmp_path):
     assert report["findings"][0]["sources"] == [
         {"path": "checkpoints/surface/findings/dast.jsonl", "line": 1},
     ]
-    assert (act.base / "report-surface.json").exists()
-    assert (act.base / "report-surface.md").read_text().startswith("# Surface checkpoint")
+    assert (act.reports / "report-surface.json").exists()
+    assert (act.reports / "report-surface.md").read_text().startswith("# Surface checkpoint")
+
+
+def test_write_report_removes_legacy_root_copies_after_success(tmp_path):
+    act = Activity.named("legacy", root=tmp_path).ensure()
+    (act.base / "report.json").write_text("stale")
+    (act.base / "report.md").write_text("stale")
+
+    reporting.write_report(act)
+
+    assert (act.reports / "report.json").exists()
+    assert (act.reports / "report.md").exists()
+    assert not (act.base / "report.json").exists()
+    assert not (act.base / "report.md").exists()

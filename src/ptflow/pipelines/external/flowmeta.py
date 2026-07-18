@@ -125,6 +125,27 @@ FLOWMETA: dict[str, StepMeta] = {
         outputs=("httpx_late_metadata.jsonl", "late_web_targets.txt", "portscan_coverage.json"),
         notes=("il target del follow-up è l'URL originario in-scope, mai il redirect finale terzo",),
     ),
+    "fingerprint_late": StepMeta(
+        summary="SPANNING, exhaustive — sottrae dal delta le socket HTTP identificate da httpx_late e "
+                "fingerprinta con nerva solo i servizi tardivi NON-HTTP.",
+        commands=(
+            "late_nonhttp = full-delta - socket(httpx_late_metadata)",
+            "nerva --json < late_nonhttp_sockets.txt",
+        ),
+        outputs=("late_nonhttp_sockets.txt", "nerva_late_metadata.jsonl", "portscan_coverage.json"),
+        notes=("balanced = no-op che pulisce gli artefatti; needs httpx_late",),
+    ),
+    "cve_late": StepMeta(
+        summary="SPANNING OFFLINE, exhaustive — estrae software versionato dai banner nerva tardivi e "
+                "lo correla con il DB locale search_vulns usando lo stesso matcher/dedup dei loop web.",
+        commands=(
+            "collect_software(services=nerva_late) → software_inventory_late.jsonl",
+            "search_vulns -q '<Prodotto Versione>' -f json --ignore-general-product-vulns "
+            "--use-created-product-ids",
+        ),
+        outputs=("software_inventory_late.jsonl", "findings/cve_late.jsonl", "portscan_coverage.json"),
+        notes=("net=False · cache CVE process-wide · balanced = no-op che pulisce gli artefatti",),
+    ),
     "nuclei_scope": StepMeta(
         summary="Un processo full-template su tutto lo scope deduplicato (subdomains + webapps), un "
                 "solo rate-limit globale — più gentile del per-app sui backend condivisi.",
@@ -589,8 +610,8 @@ FLOWMETA: dict[str, StepMeta] = {
             "# fan-in parziale offline: cve/dast/xss/sqli di superficie + takeover della fase 1",
             "# reporting.write_report(..., stem='report-surface')",
         ),
-        outputs=("checkpoints/surface/findings/<tipo>.jsonl", "report-surface.md",
-                 "report-surface.json"),
+        outputs=("checkpoints/surface/findings/<tipo>.jsonl", "reports/report-surface.md",
+                 "reports/report-surface.json"),
         notes=("activity-scope · after_phase=2 · net=False · awaited prima della FASE 3 · rigenerato su --resume",
                "esclude risultati fase 3/4 e spanning non ancora joinati; il report finale resta autoritativo",
                "lo snapshot isolato viene rigenerato per non contaminare findings/ finali"),

@@ -57,10 +57,13 @@ Every run initializes `coverage.json` under the activity directory with run/stag
 (resume/disabled/failure status, logical dependencies, observed artifact I/O, command outcomes,
 caps/drops, limits, and dependency inventory). After every app group completes the phase-2 surface
 DAST, the global `surface_checkpoint` writes an isolated snapshot under
-`checkpoints/surface/findings/` plus the early deterministic `report-surface.md` / `.json`, before the
-long guessing/deep loops start. The terminal fan-in later writes the authoritative `report.md` and
-`report.json` over all normalized/deduplicated findings. With `--ai`, the optional narrative remains
-separate in `report-ai.md`; it never overwrites either deterministic report.
+`checkpoints/surface/findings/` plus the early deterministic `reports/report-surface.md` / `.json`,
+before the long guessing/deep loops start. The terminal fan-in later writes the authoritative
+`reports/report.md` and `reports/report.json` over all normalized/deduplicated findings. With `--ai`,
+the optional narrative remains separate in `reports/report-ai.md`; it never overwrites either
+deterministic report. When a pipeline composes follow-up runs, the parent also writes
+`reports/composition.json` and a summary-only `reports/report-composed.md` / `.json`: these record
+parent/child lineage, state and aggregate counts while linking—never copying—the authoritative reports.
 
 ```bash
 # dry run with no external tools — exercises the scaffolding end to end
@@ -181,7 +184,7 @@ expert defaults in the code; `profile` is the bundle for the rate-sensitive ones
 |----------|------------------|--------------|
 | `PTFLOW_PROFILE` | `wide` (default) · `home` | Rate profile. `wide` = full bandwidth; `home` throttles the heavy hitters (naabu `-rate` 300 vs 1000, nuclei `-rl` 50 vs 150, feroxbuster `-t`/`-L`) to spare a domestic line/router. The active profile is logged at run start. |
 | `PTFLOW_NET_LIMIT` | integer · default `10` (or `4` when `PTFLOW_PROFILE=home`) | Global cap on concurrent **network** stages (per-app *and* spanning), so the aggregate uplink load stays bounded. In-process, no Prefect server needed. |
-| `PTFLOW_EXTERNAL_PORTSCAN_MODE` | `balanced` (default) · `exhaustive` | Both modes start with curated ~250 web ports + a bounded top-1000 barrier. `exhaustive` additionally runs full-65535 as a spanning pass, fingerprints only late sockets and automatically hands genuinely new web apps to a nested `webscan` activity. |
+| `PTFLOW_EXTERNAL_PORTSCAN_MODE` | `balanced` (default) · `exhaustive` | Both modes start with curated ~250 web ports + a bounded top-1000 barrier. `exhaustive` additionally runs full-65535 as a spanning pass: new web apps go to a nested `webscan`, while the remaining late non-HTTP sockets are fingerprinted with nerva and correlated against the local CVE DB. |
 | `PTFLOW_EXTERNAL_PORTSCAN_DEADLINE_SECONDS` | positive integer · default `900` | Hard wall-clock budget for the common pre-cluster top-1000 pass. Partial results are preserved on timeout and status is written to `asset_discovery/canonical/portscan_coverage.json`. The exhaustive spanning pass remains unbounded. |
 
 ### Auth & crawl behavior
@@ -203,7 +206,7 @@ explicitly. `--ai` is equivalent to `--set ai.enabled=on`, while a preset can en
 
 | Variable | Values / default | What it does |
 |----------|------------------|--------------|
-| `PTFLOW_AI` | truthy to enable · default off | Enables contextual wordlists, policy-gated CVE PoC interpretation, secret-lead triage, cross-finding hypotheses, and `report-ai.md` in `external` and `webscan`. |
+| `PTFLOW_AI` | truthy to enable · default off | Enables contextual wordlists, policy-gated CVE PoC interpretation, secret-lead triage, cross-finding hypotheses, and `reports/report-ai.md` in `external` and `webscan`. |
 | `PTFLOW_AI_PROVIDER` | `ollama` (default, local) · `ollama-cloud` · `openrouter` · `huggingface` · `openai-compatible` · legacy `openai` / `claude-code` | Selects the runtime backend. Named providers supply their standard endpoint. |
 | `PTFLOW_AI_MODEL` | required | Provider-specific model ID, kept explicit for reproducibility. |
 | `PTFLOW_AI_BASE_URL` | provider default | Overrides the endpoint; required for `openai-compatible`. |

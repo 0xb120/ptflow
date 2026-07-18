@@ -276,8 +276,16 @@ def write_report(
         msg = f"report stem must be a filename stem, got {stem!r}"
         raise ValueError(msg)
     report = build_report(activity, findings_dir=findings_dir)
+    activity.reports.mkdir(parents=True, exist_ok=True)
     tools.write_text(
-        activity.base / f"{stem}.json", json.dumps(report, indent=2, sort_keys=True) + "\n"
+        activity.reports / f"{stem}.json", json.dumps(report, indent=2, sort_keys=True) + "\n"
     )
-    tools.write_text(activity.base / f"{stem}.md", render_markdown(report, heading=heading, intro=intro))
+    tools.write_text(
+        activity.reports / f"{stem}.md", render_markdown(report, heading=heading, intro=intro)
+    )
+    # Generated reports used to live in the activity root. Remove those legacy copies only after both
+    # dedicated-directory outputs have been written successfully, so an upgraded existing workspace
+    # never exposes two conflicting sources of truth.
+    for suffix in ("json", "md"):
+        (activity.base / f"{stem}.{suffix}").unlink(missing_ok=True)
     return report
