@@ -92,6 +92,22 @@ def _validate_oast_cases(manifest: dict[str, Any], all_ids: set[str]) -> None:
         _nonempty_text(item, "marker", context=context)
 
 
+def _validate_detector_cases(manifest: dict[str, Any], all_ids: set[str]) -> None:
+    for index, item in enumerate(_object_list(manifest, "expected_detector_coverage")):
+        context = f"expected_detector_coverage[{index}]"
+        _register_case_id(item, context, all_ids)
+        _nonempty_text(item, "detector", context=context)
+        _nonempty_text(item, "location", context=context)
+        for key in ("minimum_attempted", "minimum_completed"):
+            value = item.get(key, 0)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                msg = f"{context}.{key} must be a non-negative integer"
+                raise EvaluationError(msg)
+        if not isinstance(item.get("allow_degraded", False), bool):
+            msg = f"{context}.allow_degraded must be a boolean"
+            raise EvaluationError(msg)
+
+
 def _validate_policy(manifest: dict[str, Any]) -> None:
     forbidden = manifest.get("forbidden_actions", [])
     if not isinstance(forbidden, list) or any(not isinstance(item, str) for item in forbidden):
@@ -147,6 +163,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
     _validate_finding_cases(manifest, all_ids)
     _validate_request_cases(manifest, all_ids)
     _validate_oast_cases(manifest, all_ids)
+    _validate_detector_cases(manifest, all_ids)
     _validate_policy(manifest)
     _validate_options(manifest)
     _validate_artifacts(manifest)
@@ -387,6 +404,58 @@ def _evaluate_oast(
     return {"matched": matched, "missed": missed, "observed": len(actual)}
 
 
+def _detector_coverage(activity: Path) -> list[dict[str, Any]]:
+    coverage_path = activity / "coverage.json"
+    coverage = _read_object(coverage_path, label="coverage") if coverage_path.is_file() else {}
+    raw_summary = coverage.get("summary")
+    summary: dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
+    raw_detectors = summary.get("detectors")
+    detectors: dict[str, Any] = raw_detectors if isinstance(raw_detectors, dict) else {}
+    matrix = detectors.get("matrix")
+    if isinstance(matrix, list) and all(isinstance(item, dict) for item in matrix):
+        return matrix
+    stages_value = coverage.get("stages")
+    raw_stages: list[Any] = stages_value if isinstance(stages_value, list) else []
+    records = [item for stage in raw_stages if isinstance(stage, dict)
+               for item in stage.get("detectors", []) if isinstance(item, dict)]
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for record in records:
+        groups.setdefault(
+            (str(record.get("detector") or "unknown"), str(record.get("location") or "request")),
+            [],
+        ).append(record)
+    return [{
+        "detector": detector,
+        "location": location,
+        "attempted": sum(int(item.get("attempted") or 0) for item in items),
+        "completed": sum(int(item.get("completed") or 0) for item in items),
+        "statuses": dict(Counter(str(item.get("status") or "unknown") for item in items)),
+    } for (detector, location), items in sorted(groups.items())]
+
+
+def _evaluate_detector_coverage(
+    expected: list[dict[str, Any]], actual: list[dict[str, Any]],
+) -> dict[str, Any]:
+    degraded = {"error", "incomplete", "missing", "nonzero", "timeout", "unavailable"}
+    matched: list[dict[str, Any]] = []
+    missed: list[dict[str, Any]] = []
+    for case in expected:
+        record = next((item for item in actual
+                       if item.get("detector") == case["detector"]
+                       and item.get("location") == case["location"]), None)
+        statuses = set((record or {}).get("statuses") or {})
+        satisfies = bool(record) and int(record.get("attempted") or 0) >= int(
+            case.get("minimum_attempted", 0)
+        ) and int(record.get("completed") or 0) >= int(case.get("minimum_completed", 0))
+        if not case.get("allow_degraded", False):
+            satisfies = satisfies and not statuses.intersection(degraded)
+        if not satisfies:
+            missed.append({**case, "observed": record})
+        else:
+            matched.append({"case_id": case["id"], "observed": record})
+    return {"matched": matched, "missed": missed, "observed": actual}
+
+
 def _seconds_between(start: Any, finish: Any) -> float | None:
     if not isinstance(start, str) or not isinstance(finish, str):
         return None
@@ -498,6 +567,9 @@ def evaluate(activity: Path, manifest_path: Path, *, output: Path | None = None)
     oast_results = _evaluate_oast(
         _object_list(manifest, "expected_oast_callbacks"), callbacks,
     )
+    detector_results = _evaluate_detector_coverage(
+        _object_list(manifest, "expected_detector_coverage"), _detector_coverage(activity),
+    )
 
     tp = len(matched)
     fn = len(missed)
@@ -508,6 +580,7 @@ def evaluate(activity: Path, manifest_path: Path, *, output: Path | None = None)
         or negative_violations
         or request_results["missed"]
         or oast_results["missed"]
+        or detector_results["missed"]
     )
     confidence_counts = Counter(item["confidence"] for item in actual)
     result = {
@@ -531,6 +604,10 @@ def evaluate(activity: Path, manifest_path: Path, *, output: Path | None = None)
             "requests_matched": len(request_results["matched"]),
             "expected_oast_callbacks": len(_object_list(manifest, "expected_oast_callbacks")),
             "oast_callbacks_matched": len(oast_results["matched"]),
+            "expected_detector_coverage": len(_object_list(
+                manifest, "expected_detector_coverage",
+            )),
+            "detector_coverage_matched": len(detector_results["matched"]),
         },
         "findings": {
             "matched": matched,
@@ -541,6 +618,7 @@ def evaluate(activity: Path, manifest_path: Path, *, output: Path | None = None)
         },
         "requests": request_results,
         "oast_callbacks": oast_results,
+        "detector_coverage": detector_results,
         "metrics": {
             "by_class": _class_metrics(
                 expected, actual, matched, missed, false_positive_indexes,
@@ -578,4 +656,6 @@ def render_summary(result: dict[str, Any]) -> str:
         f"recall={summary['recall']:.4f} · requests "
         f"{summary['requests_matched']}/{summary['expected_requests']} · OAST "
         f"{summary['oast_callbacks_matched']}/{summary['expected_oast_callbacks']}"
+        f" · detectors {summary['detector_coverage_matched']}/"
+        f"{summary['expected_detector_coverage']}"
     )

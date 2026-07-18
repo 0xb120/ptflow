@@ -87,7 +87,10 @@ def test_list_selection_keeps_configured_templates_omitted_by_engine_preview(tmp
 
     assert [item.template_id for item in selection.templates] == ["engine-omitted-rule"]
     assert [item.template_id for item in selection.engine_omitted] == ["engine-omitted-rule"]
-    assert selection.manifest()["engine_preview"]["listed_count"] == 0
+    manifest = selection.manifest()
+    assert manifest["configured_count"] == 1
+    assert manifest["effective_preview_count"] == 0
+    assert manifest["engine_preview"]["listed_count"] == 0
 
 
 def test_stamp_findings_adds_all_selection_and_revision(tmp_path):

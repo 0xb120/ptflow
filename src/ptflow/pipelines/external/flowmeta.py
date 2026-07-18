@@ -153,7 +153,8 @@ FLOWMETA: dict[str, StepMeta] = {
                   "nuclei -stats -nmhe -c 25 -bs 25 -rl 150 -timeout 10 -retries 2 -j -silent -duc"),
         outputs=("findings/nuclei_scope.jsonl",),
         notes=("-c / -rl = profilo (wide 25/150 · home 10/50) · subsume il vecchio scan takeover per-tag",
-               "nessun update in-run: nuclei -ut esplicito e validazione/pin prima dell'attività"),
+               "nessun update in-run: nuclei -ut esplicito e validazione/pin prima dell'attività",
+               "coverage per scope-target + stderr diagnostico: missing/non-zero non equivale a zero finding"),
     ),
     # --- post-cluster ∥ ---
     "screenshot": StepMeta(
@@ -456,7 +457,8 @@ FLOWMETA: dict[str, StepMeta] = {
         summary="FASE 4 (testa) — ricostruisce il catalogo INCLUDENDO la superficie indovinata → "
                 "requests_full.jsonl. Stesso assembly di request_catalog ma aggiunge i record recrawl + "
                 "gli hit 2xx di content_discovery + le SHAPE minate dal corpus ora esteso "
-                "(responses/discovered/, responses/recrawl/ — ri-estratto idempotente).",
+                "(responses/discovered/, responses/recrawl/ — ri-estratto idempotente). Conserva tutte "
+                "le sorgenti e gli status HTTP osservati anche per i fallback URL-only.",
         commands=(
             "# _assemble_catalog(include_guessed=True): requests_crawl/headless/api + requests_recrawl",
             "#   + shape minati dal corpus completo + endpoint URL-only (incl. content_discovery 2xx) come GET",
@@ -479,7 +481,8 @@ FLOWMETA: dict[str, StepMeta] = {
             "# query: ogni shape (dedup path-template) · body+json: endpoint con body + probe sui GET · header: x8",
             "arjun -i targets_<loc>.txt -oJ <loc>.json -m GET|POST|JSON -t 5 -T 15 --rate-limit 20 -q [--headers auth]",
             "x8 -u targets_<loc>.txt -w params -O json -o <loc>.json [-X POST] [-t json] [--headers] [-H auth]",
-            "# matrice (tool, location) in un pool cappato (PARAM_FANOUT=3); cap wall-clock per-tool 600s",
+            "# header: batch di 3 target, deadline separata 180s/batch; le altre location hanno cap 600s",
+            "# matrice (tool, location) in un pool cappato (PARAM_FANOUT=3); coverage attempted/completed/status",
             "# collapse_global_params: un param trovato su ≥75% degli endpoint testati (≥5) = riflesso",
             "#   SITE-WIDE → 1 record host-level {scope:site-wide}, non sprayato su ogni endpoint",
         ),

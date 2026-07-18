@@ -30,6 +30,10 @@ _CURRENT: contextvars.ContextVar[StageTrace | None] = contextvars.ContextVar(
 _SAFE_NAME = re.compile(r"[^a-zA-Z0-9_.-]+")
 _SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "HTTP_HEADER")
 _MAX_ERROR = 500
+_DEGRADED_COMMAND_STATUSES = frozenset({"error", "missing", "nonzero", "timeout"})
+_DEGRADED_DETECTOR_STATUSES = frozenset({
+    "error", "incomplete", "missing", "nonzero", "timeout", "unavailable",
+})
 
 
 def _now() -> str:
@@ -70,6 +74,7 @@ class StageTrace:
     reads: list[dict[str, Any]] = field(default_factory=list)
     writes: list[dict[str, Any]] = field(default_factory=list)
     commands: list[dict[str, Any]] = field(default_factory=list)
+    detectors: list[dict[str, Any]] = field(default_factory=list)
     caps: list[dict[str, Any]] = field(default_factory=list)
     selections: list[dict[str, Any]] = field(default_factory=list)
     drops: Counter[str] = field(default_factory=Counter)
@@ -78,6 +83,12 @@ class StageTrace:
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def finish(self, status: str, error: BaseException | None = None) -> dict[str, Any]:
+        if status == "success" and (
+            any(command.get("status") in _DEGRADED_COMMAND_STATUSES for command in self.commands)
+            or any(detector.get("status") in _DEGRADED_DETECTOR_STATUSES
+                   for detector in self.detectors)
+        ):
+            status = "degraded"
         self.status = status
         self.error = _error_summary(error) if error else None
         return {
@@ -94,6 +105,7 @@ class StageTrace:
             "reads": _coalesce_io(self.reads),
             "writes": _coalesce_io(self.writes),
             "commands": self.commands,
+            "detectors": self.detectors,
             "caps": self.caps,
             "selections": self.selections,
             "drops": dict(sorted(self.drops.items())),
@@ -197,6 +209,7 @@ def record_command(  # noqa: PLR0913
     duration: float,
     timeout: int | None = None,
     pipeline_length: int = 1,
+    diagnostic_path: Path | None = None,
 ) -> None:
     if trace := _trace():
         with trace.lock:
@@ -208,8 +221,38 @@ def record_command(  # noqa: PLR0913
                     "duration_seconds": round(duration, 3),
                     "timeout_seconds": timeout,
                     "pipeline_length": pipeline_length,
+                    **({"diagnostic_ref": _relative(diagnostic_path, trace.activity_root)}
+                       if diagnostic_path is not None else {}),
                 }
             )
+
+
+def record_detector(  # noqa: PLR0913
+    detector: str,
+    *,
+    location: str = "request",
+    attempted: int = 0,
+    completed: int | None = None,
+    status: str,
+    reason: str | None = None,
+    partial_results: int = 0,
+) -> None:
+    """Record detector/location coverage without request values or credentials.
+
+    ``completed=None`` means a timed-out/non-zero tool did not expose reliable progress. Findings
+    recovered from a partial artifact are counted separately and never presented as completed targets.
+    """
+    if trace := _trace():
+        with trace.lock:
+            trace.detectors.append({
+                "detector": detector,
+                "location": location,
+                "attempted": max(0, attempted),
+                "completed": completed if completed is None else max(0, completed),
+                "status": status,
+                "reason": reason,
+                "partial_results": max(0, partial_results),
+            })
 
 
 def record_missing_tools(names: Sequence[str]) -> None:
@@ -396,6 +439,7 @@ def finalize_run(  # noqa: PLR0913
             "reads": [],
             "writes": [],
             "commands": [],
+            "detectors": [],
             "caps": [],
             "selections": [],
             "drops": {},
@@ -411,15 +455,41 @@ def finalize_run(  # noqa: PLR0913
     )
     status_counts = Counter(record["status"] for record in records)
     commands = [command for record in records for command in record["commands"]]
+    detectors = [detector for record in records for detector in record.get("detectors", [])]
     caps = [cap for record in records for cap in record["caps"]]
     selections = [selection for record in records for selection in record["selections"]]
     drops = Counter()
     for record in records:
         drops.update(record["drops"])
+    detector_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for detector in detectors:
+        detector_groups.setdefault(
+            (str(detector.get("detector") or "unknown"),
+             str(detector.get("location") or "request")),
+            [],
+        ).append(detector)
+    detector_matrix = []
+    for (detector, location), items in sorted(detector_groups.items()):
+        completed_values = [item["completed"] for item in items
+                            if isinstance(item.get("completed"), int)]
+        detector_matrix.append({
+            "detector": detector,
+            "location": location,
+            "attempted": sum(int(item.get("attempted") or 0) for item in items),
+            "completed": sum(completed_values),
+            "unknown_completion_runs": sum(item.get("completed") is None for item in items),
+            "partial_results": sum(int(item.get("partial_results") or 0) for item in items),
+            "statuses": dict(sorted(Counter(str(item.get("status") or "unknown")
+                                             for item in items).items())),
+            "reasons": sorted({str(item["reason"]) for item in items if item.get("reason")}),
+        })
+    effective_status = status
+    if status == "completed" and any(record["status"] == "degraded" for record in records):
+        effective_status = "completed-degraded"
     manifest = {
         **trace.initial,
         "finished_at": _now(),
-        "status": status,
+        "status": effective_status,
         "failures": list(failures),
         "summary": {
             "stage_statuses": dict(sorted(status_counts.items())),
@@ -428,6 +498,12 @@ def finalize_run(  # noqa: PLR0913
                 "nonzero": sum(command["status"] == "nonzero" for command in commands),
                 "timed_out": sum(command["status"] == "timeout" for command in commands),
                 "missing": sum(command["status"] == "missing" for command in commands),
+            },
+            "detectors": {
+                "observed": len(detectors),
+                "degraded": sum(detector.get("status") in _DEGRADED_DETECTOR_STATUSES
+                                for detector in detectors),
+                "matrix": detector_matrix,
             },
             "caps": {
                 "observed": len(caps),

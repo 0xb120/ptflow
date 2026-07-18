@@ -568,9 +568,14 @@ def orchestrate(  # noqa: PLR0913
             failures=(type(exc).__name__,), disabled=disabled,
         )
         raise
-    telemetry.finalize_run(
+    coverage = telemetry.finalize_run(
         activity, run_trace, pipeline.stages,
         status="completed" if not failure_labels else "completed-with-failures",
         failures=failure_labels, disabled=disabled,
     )
+    if coverage["status"] == "completed-degraded":
+        log.warning(
+            "⚠ run completed with degraded detector coverage — inspect %s",
+            activity.base / "coverage.json",
+        )
     return activity.base, len(failure_labels)

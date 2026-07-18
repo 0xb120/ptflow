@@ -73,13 +73,16 @@ means the golden set passed, `1` means a finding/surface regression, and `2` mea
   scanner matches default to `lead`; high-confidence hints become `probable`; only explicit verified
   signals or verified finding categories become `verified`.
 - **Manifest v1 (`core/evaluation.py`):** declares a target, expected and negative findings, expected
-  request shapes, expected OAST markers, forbidden actions and relative artifact globs. All paths are
-  confined to the activity. Finding match supports class plus optional target/regex, detector,
-  request ref, title, stable finding ID and minimum confidence.
+  request shapes, expected OAST markers, expected detector/location coverage, forbidden actions and
+  relative artifact globs. All paths are confined to the activity. Finding match supports class plus
+  optional target/regex, detector, request ref, title, stable finding ID and minimum confidence.
+  Detector cases set minimum attempted/completed counts; degraded statuses fail unless
+  `allow_degraded=true` is explicit for that case.
 - **Metrics:** global/per-class TP, FP, FN, precision and recall; negative-case results; request/OAST
-  coverage; confidence counts; wall-clock/stage/command cost and applied caps. Unexpected findings
-  fail by default on a controlled target; `options.allow_unexpected_findings=true` makes them
-  informational while explicit negative-case violations still fail.
+  and detector/location coverage; confidence counts; wall-clock/stage/command cost and applied caps.
+  Unexpected findings fail by default on a controlled target;
+  `options.allow_unexpected_findings=true` makes them informational while explicit negative-case
+  violations still fail.
 - **Versioned smoke corpus:** `benchmarks/m0-smoke/` exercises positive/negative cases, full HTTP
   request shapes, OAST correlation and cost extraction without external services. It validates the
   contract, not the detector recall of a real vulnerable lab; future runnable benchmark targets must

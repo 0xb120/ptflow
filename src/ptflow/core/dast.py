@@ -80,7 +80,13 @@ class Selection:
                 "filters": [],
             },
             "packs": list(self.packs),
+            # ``configured_count`` is the local pack inventory. ``effective_preview_count`` is what
+            # the installed nuclei engine reports through ``-tl``. Keep ``selected_count`` as a
+            # compatibility alias for the configured set; consumers must not mistake it for proof
+            # that the engine loaded every template.
+            "configured_count": len(self.templates) + len(self.unresolved_paths),
             "selected_count": len(self.templates) + len(self.unresolved_paths),
+            "effective_preview_count": len(self.templates) - len(self.engine_omitted),
             "templates": [
                 {"id": item.template_id, "path": str(item.path), "pack": item.pack}
                 for item in self.templates

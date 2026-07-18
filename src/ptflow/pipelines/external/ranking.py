@@ -180,6 +180,8 @@ def _source_family(source: str) -> str:
         family = "form"
     elif value in {"jsluice", "xhr"}:
         family = "xhr"
+    elif value in {"crawl", "crawl-url", "crawley", "katana-recrawl"}:
+        family = "crawl"
     elif value in {"feroxbuster", "content-discovery", "param_fuzz"}:
         family = "guessed" if value != "param_fuzz" else "param-fuzz"
     else:

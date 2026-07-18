@@ -80,7 +80,7 @@ BAR5[["━━ BARRIERA: FASE 4 → FASE 5 ━━"]]
 P4 ==> BAR5
 subgraph P5["FASE 5 · hidden parameters"]
 direction TB
-param_fuzz["param_fuzz<br># ranking deterministico + quote host/metodo/location/source; cap base 50/25/15 riallocati tra app<br># query: ogni shape (dedup path-template) · body+json: endpoint con body + probe sui GET · header: x8<br>arjun -i targets_&lt;loc&gt;.txt -oJ &lt;loc&gt;.json -m GET|POST|JSON -t 5 -T 15 --rate-limit 20 -q [--headers auth]<br>x8 -u targets_&lt;loc&gt;.txt -w params -O json -o &lt;loc&gt;.json [-X POST] [-t json] [--headers] [-H auth]<br># matrice (tool, location) in un pool cappato (PARAM_FANOUT=3); cap wall-clock per-tool 600s<br># collapse_global_params: un param trovato su ≥75% degli endpoint testati (≥5) = riflesso<br>#   SITE-WIDE → 1 record host-level {scope:site-wide}, non sprayato su ogni endpoint"]
+param_fuzz["param_fuzz<br># ranking deterministico + quote host/metodo/location/source; cap base 50/25/15 riallocati tra app<br># query: ogni shape (dedup path-template) · body+json: endpoint con body + probe sui GET · header: x8<br>arjun -i targets_&lt;loc&gt;.txt -oJ &lt;loc&gt;.json -m GET|POST|JSON -t 5 -T 15 --rate-limit 20 -q [--headers auth]<br>x8 -u targets_&lt;loc&gt;.txt -w params -O json -o &lt;loc&gt;.json [-X POST] [-t json] [--headers] [-H auth]<br># header: batch di 3 target, deadline separata 180s/batch; le altre location hanno cap 600s<br># matrice (tool, location) in un pool cappato (PARAM_FANOUT=3); coverage attempted/completed/status<br># collapse_global_params: un param trovato su ≥75% degli endpoint testati (≥5) = riflesso<br>#   SITE-WIDE → 1 record host-level {scope:site-wide}, non sprayato su ogni endpoint"]
 end
 BAR5 ==> P5
 BAR6[["━━ BARRIERA: FASE 5 → FASE 6 ━━"]]

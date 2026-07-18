@@ -36,6 +36,13 @@ def _write_manifest(path, *, expected_url="https://example.test/search"):
         "expected_oast_callbacks": [
             {"id": "blind-callback", "marker": "m0.ssrf.123", "protocol": "dns"},
         ],
+        "expected_detector_coverage": [{
+            "id": "dalfox-query-coverage",
+            "detector": "dalfox",
+            "location": "query",
+            "minimum_attempted": 1,
+            "minimum_completed": 1,
+        }],
         "forbidden_actions": ["delete-account", "submit-payment"],
         "artifacts": {
             "report": "reports/report.json",
@@ -75,6 +82,15 @@ def _passing_activity(tmp_path):
             "duration_seconds": 3.0,
             "network": True,
             "commands": [{"duration_seconds": 2.0}],
+            "detectors": [{
+                "detector": "dalfox",
+                "location": "query",
+                "attempted": 1,
+                "completed": 1,
+                "partial_results": 1,
+                "status": "success",
+                "reason": None,
+            }],
             "caps": [{"applied": True}],
         }],
     }))
@@ -102,6 +118,8 @@ def test_evaluate_passes_and_writes_machine_metrics(tmp_path):
         "requests_matched": 1,
         "expected_oast_callbacks": 1,
         "oast_callbacks_matched": 1,
+        "expected_detector_coverage": 1,
+        "detector_coverage_matched": 1,
     }
     assert result["metrics"]["by_class"]["xss"]["recall"] == 1.0
     assert result["metrics"]["cost"] == {
@@ -136,6 +154,30 @@ def test_evaluate_fails_on_missed_positive_negative_violation_and_missing_surfac
     assert result["summary"]["negative_cases_passed"] == 0
     assert [item["id"] for item in result["requests"]["missed"]] == ["json-search-request"]
     assert [item["id"] for item in result["oast_callbacks"]["missed"]] == ["blind-callback"]
+    assert [item["id"] for item in result["detector_coverage"]["missed"]] == [
+        "dalfox-query-coverage",
+    ]
+
+
+def test_evaluate_fails_when_detector_is_degraded(tmp_path):
+    activity = _passing_activity(tmp_path)
+    coverage_path = activity.base / "coverage.json"
+    coverage = json.loads(coverage_path.read_text())
+    coverage["stages"][0]["detectors"][0].update({
+        "completed": 0,
+        "status": "timeout",
+        "reason": "deadline exceeded",
+    })
+    tools.write_text(coverage_path, json.dumps(coverage))
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(manifest_path)
+
+    result = evaluation.evaluate(activity.base, manifest_path)
+
+    assert result["status"] == "fail"
+    missed = result["detector_coverage"]["missed"]
+    assert [item["id"] for item in missed] == ["dalfox-query-coverage"]
+    assert missed[0]["observed"]["statuses"] == {"timeout": 1}
 
 
 def test_manifest_rejects_duplicate_ids_and_artifact_escape(tmp_path):

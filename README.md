@@ -51,11 +51,14 @@ Options:
 | `--set KEY=VALUE` | Override one config knob, repeatable — highest precedence (e.g. `--set oast=on --set profile=home`). |
 | `--ai` | Enable the optional LLM layer; equivalent to `--set ai.enabled=on`. Select a provider/model in `[ai]` or use a preset from [`configs/ai/`](configs/ai/). |
 
-Exit codes: **`0`** all stages OK · **`1`** one or more stages failed (CI/automation signal) · **`130`** interrupted with Ctrl-C — partial results are saved; resume with `--resume`.
+Exit codes: **`0`** pipeline completed (including `completed-degraded`; inspect `coverage.json`) ·
+**`1`** one or more stages raised an error · **`130`** interrupted with Ctrl-C — partial results are
+saved; resume with `--resume`.
 
 Every run initializes `coverage.json` under the activity directory with run/stage coverage
 (resume/disabled/failure status and invalidation reason, config/pipeline hashes, logical dependencies,
-observed artifact I/O, command outcomes,
+observed artifact I/O, command outcomes and diagnostic stderr references, detector coverage by
+location (attempted/completed/partial results, status and degradation reason),
 caps/drops, risk-selection distributions (source, method, authority, content type and parameter
 location), limits, and dependency inventory). Safe per-request ranking audits live under each app's
 `raw/ranking/`; they contain shapes and reasons, never header/body/query values. After every app group completes the phase-2 surface
@@ -120,9 +123,12 @@ uv run ptflow evaluate <activity-dir> <manifest.json> [--output PATH]
 ```
 
 Compares a completed activity with a versioned benchmark manifest, entirely offline. It evaluates
-expected and negative findings, HTTP request shapes and correlated OAST callbacks, then writes
+expected and negative findings, HTTP request shapes, correlated OAST callbacks and expected detector
+coverage, then writes
 `<activity>/reports/evaluation.json` by default. The machine report includes TP/FP/FN, precision and
-recall globally and per class, confidence distribution, surface coverage and observed run cost.
+recall globally and per class, confidence distribution, surface/detector coverage and observed run
+cost. Detector expectations can require minimum attempted/completed targets per location; degraded
+statuses fail the gate unless the individual case explicitly allows them.
 
 Exit codes: **`0`** benchmark passed · **`1`** detection/coverage regression · **`2`** invalid manifest
 or missing input. The versioned contract smoke test can be run with:

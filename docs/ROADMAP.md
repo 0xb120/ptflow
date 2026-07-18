@@ -155,6 +155,32 @@ L'implementazione di M1 è completa:
 La validazione su target reali crescerà insieme al golden corpus di M0; ogni nuova classe aggiunta alle
 milestone successive dovrà continuare a dimostrare recall non regressiva a parità di budget.
 
+### M1.1 — Hardening della qualità di detection
+
+Implementata il 18 luglio 2026 come consolidamento di M1 prima di ampliare la superficie con M2:
+
+- il catalogo conserva provenienza multi-sorgente e status HTTP osservati anche quando una request
+  nasce da URL di fallback; il merge preferisce uno status live senza perdere gli altri status;
+- `coverage.json` espone una matrice per detector e location con target tentati/completati, risultati
+  parziali, status e motivi di degradazione; timeout, binary/wordlist mancanti e non-zero exit non
+  possono più apparire come una scansione vuota ma sana;
+- gli stderr diagnostici dei detector principali sono persistiti e referenziati dalla telemetria;
+- il fuzzing degli header viene eseguito in batch piccoli con deadline separata, così un singolo x8
+  lento non consuma l'intero budget della location;
+- la selezione Nuclei distingue il numero configurato dal numero effettivamente selezionato e misura
+  separatamente copertura del catalogo template e copertura delle request;
+- confidence e verification method derivano anche dalle evidenze native di SQLmap, Dalfox, Nuclei e
+  OAST, mantenendo conservativi i match non verificati;
+- il report deduplica semanticamente la stessa injection tra detector/payload/tecniche, ma conserva
+  tutte le osservazioni native, i detector e le categorie che hanno contribuito;
+- il manifest benchmark può dichiarare `expected_detector_coverage`: un detector degradato o una
+  copertura inferiore alle soglie fallisce il quality gate anche quando non genera finding.
+
+Validazione di M1.1: test unitari e di integrazione sui contratti di catalogo, telemetria, detector,
+confidence, dedup e benchmark; il corpus `m0-smoke` include ora anche un'aspettativa di copertura del
+detector. La successiva validazione dinamica deve confrontare queste metriche con Gin & Juice e poi
+promuovere i casi stabili nel golden set.
+
 ### Obiettivo
 
 Aumentare la probabilità di finding senza aumentare indiscriminatamente il traffico. I cap attuali
@@ -697,6 +723,8 @@ Queste attività restano fuori dal percorso detection-first e vanno affrontate d
 M0  benchmark ed evidenze
  ↓
 M1  ranking e budget
+ ↓
+M1.1 hardening qualità detection
  ↓
 M2  traffic import + browser
  ↓

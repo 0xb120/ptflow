@@ -1224,6 +1224,13 @@ def test_parse_x8_normalizes():
     assert tasks.parse_x8("not json") == []
 
 
+def test_header_parameter_targets_are_split_into_bounded_batches():
+    targets = [f"https://x/p{index}" for index in range(8)]
+    assert tasks._target_batches(targets, size=3) == [
+        targets[0:3], targets[3:6], targets[6:8],
+    ]
+
+
 def test_merge_params_dedups_across_tools():
     recs = [
         {"url": "https://x/c", "param": "id", "method": "GET", "sources": ["arjun"], "reason": None},
@@ -1357,12 +1364,16 @@ def test_request_params_by_location():
 
 def test_parse_katana_requests_reuses_raw_and_records_method_and_body_params():
     import json
-    line = json.dumps({"request": {"endpoint": "https://a/api", "method": "POST",
-                                   "body": "x=1", "raw": "POST /api HTTP/1.1\r\nHost: a\r\n\r\nx=1"}})
+    line = json.dumps({
+        "request": {"endpoint": "https://a/api", "method": "POST",
+                    "body": "x=1", "raw": "POST /api HTTP/1.1\r\nHost: a\r\n\r\nx=1"},
+        "response": {"status_code": 201},
+    })
     [rec] = tasks.parse_katana_requests(line)
     assert rec["method"] == "POST"
     assert rec["url"] == "https://a/api"
     assert rec["raw"].startswith("POST /api HTTP/1.1")    # katana's own raw reused verbatim
+    assert rec["status"] == 201
     assert {("x", "body")} == {(p["name"], p["loc"]) for p in rec["params"]}
 
 
@@ -1403,6 +1414,19 @@ def test_merge_requests_dedups_by_shape_and_unions_sources_and_params():
     [merged] = tasks.merge_requests([a, b])                # same (GET, /user/*) shape → one record
     assert merged["sources"] == ["katana", "katana-headless"]
     assert {("id", "query"), ("ref", "query")} == {(p["name"], p["loc"]) for p in merged["params"]}
+
+
+def test_merge_requests_preserves_all_statuses_and_prefers_live_observation():
+    records = [
+        {"method": "GET", "url": "https://a/admin", "sources": ["url"], "status": 404},
+        {"method": "GET", "url": "https://a/admin", "sources": ["content-discovery"],
+         "status": 200},
+        {"method": "GET", "url": "https://a/admin", "sources": ["browser"], "status": 403},
+    ]
+    [merged] = tasks.merge_requests(records)
+    assert merged["status"] == 200
+    assert merged["statuses"] == [200, 403, 404]
+    assert merged["sources"] == ["browser", "content-discovery", "url"]
 
 
 def test_request_params_captures_observed_values():
@@ -1723,6 +1747,45 @@ def test_auth_headers_reach_remaining_http_target_tools(monkeypatch, tmp_path):
         assert _has_header_flags(cmd, "-H")
 
 
+def test_nuclei_scope_preserves_partial_output_and_records_degradation(monkeypatch, tmp_path):
+    import subprocess
+
+    from ptflow.core import telemetry, tools
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("nuclei-partial", root=tmp_path).ensure()
+    tools.write_lines(
+        act.asset_discovery_canonical("unique_webapps.txt"), ["https://example.test"],
+    )
+    partial = json.dumps({
+        "template-id": "partial-result", "matched-at": "https://example.test/",
+    }) + "\n"
+
+    def fail(command, **_kwargs):
+        raise subprocess.CalledProcessError(2, command, output=partial)
+
+    monkeypatch.setattr(tasks.tools, "run", fail)
+    telemetry.trace_call(
+        act, "run-1", stage="nuclei_scope", app_id=None, band="spanning", net=True,
+        call=lambda: tasks.nuclei_scope(act),
+    )
+
+    fragment = json.loads(next((act.state / "coverage" / "run-1").glob("*.json")).read_text())
+    assert fragment["status"] == "degraded"
+    assert fragment["detectors"] == [{
+        "detector": "nuclei-scope",
+        "location": "scope-target",
+        "attempted": 1,
+        "completed": None,
+        "status": "nonzero",
+        "reason": "exit-2",
+        "partial_results": 1,
+    }]
+    assert tools.read_jsonl(act.findings / "nuclei_scope.jsonl")[0]["template-id"] == (
+        "partial-result"
+    )
+
+
 def test_auth_headers_reach_feroxbuster_and_crawley(monkeypatch, tmp_path):
     from ptflow.core import workspace
     from ptflow.core.paths import AppWorkspace
@@ -1796,6 +1859,18 @@ def test_url_to_get_request_shape():
     assert r["sources"] == ["passive"]
     assert {("id", "query")} == {(p["name"], p["loc"]) for p in r["params"]}
     assert r["raw"].startswith("GET /x?id=1 HTTP/1.1")
+
+
+def test_catalog_records_preserves_url_fallback_provenance_and_status():
+    [record] = tasks.catalog_records(
+        [],
+        [{"url": "https://a/hidden", "sources": ["content-discovery"], "status": 200}],
+        in_scope={"a"},
+        schemes={"a": "https"},
+    )
+    assert record["sources"] == ["content-discovery"]
+    assert record["status"] == 200
+    assert record["statuses"] == [200]
 
 
 def test_catalog_records_folds_urls_reschemes_and_filters_scope():

@@ -178,10 +178,12 @@ def run(  # noqa: PLR0913
     cwd: Path | None = None,
     stream_stderr: bool = False,
     reap_group: bool = False,
+    stderr_path: Path | None = None,
 ) -> str:
     """Run a command, return stdout. When `stream_stderr` is set, the tool's
     stderr is inherited (printed live to the terminal) instead of suppressed —
-    used by verbose mode to surface tool progress/logs.
+    used by verbose mode to surface tool progress/logs. When `stderr_path` is set,
+    stderr is persisted there instead and the path is attached to command telemetry.
 
     `stdin_tty` hands the child a pty slave as stdin (mutually exclusive with `stdin`):
     some tools gate behaviour on `os.isatty(0)` and, finding a plain pipe, silently
@@ -203,56 +205,64 @@ def run(  # noqa: PLR0913
         msg = f"aborted before spawning: {cmd_str}"
         raise AbortedError(msg)
     log.debug("$ %s", cmd_str)
-    with _stdin_channel(stdin, stdin_tty=stdin_tty) as (stdin_arg, input_data):
-        try:
-            proc = subprocess.Popen(
-                list(cmd),
-                stdin=stdin_arg,
-                stdout=subprocess.PIPE,
-                stderr=None if stream_stderr else subprocess.DEVNULL,
-                text=True,
-                errors="replace",  # a stray non-UTF-8 byte (e.g. a Windows-1252 quote in urlfinder/gau
-                                   # OSINT output) → U+FFFD, never a UnicodeDecodeError that kills the stage
-                cwd=cwd,
-                start_new_session=True,  # own process group → killpg reaches grandchildren
-            )
-        except OSError:
-            telemetry.record_command(
-                tool=tool, status="missing" if shutil.which(cmd[0]) is None else "error",
-                return_code=None, duration=time.monotonic() - started, timeout=timeout,
-            )
-            raise
-        _register(proc)
-        try:
-            out, _ = proc.communicate(input=input_data, timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            _kill_group(proc, signal.SIGKILL)
-            # ``communicate`` retains the bytes/text collected before the timeout across calls.  Keep
-            # that complete partial stdout on the exception so a bounded scanner can persist useful
-            # findings instead of discarding everything produced before its wall-clock budget expired.
-            out, _ = proc.communicate()  # reap the killed group
-            exc.output = out
-            telemetry.record_command(
-                tool=tool, status="timeout", return_code=None,
-                duration=time.monotonic() - started, timeout=timeout,
-            )
-            raise
-        finally:
-            _unregister(proc)
-            if reap_group:  # sweep stragglers (e.g. headless chrome) even on a clean exit; pgid == pid
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.ExitStack() as stack:
+        stderr_file = None
+        if stderr_path is not None:
+            stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_file = stack.enter_context(stderr_path.open("w", encoding="utf-8"))
+        with _stdin_channel(stdin, stdin_tty=stdin_tty) as (stdin_arg, input_data):
+            try:
+                proc = subprocess.Popen(
+                    list(cmd),
+                    stdin=stdin_arg,
+                    stdout=subprocess.PIPE,
+                    stderr=(stderr_file if stderr_file is not None
+                            else None if stream_stderr else subprocess.DEVNULL),
+                    text=True,
+                    errors="replace",  # a stray non-UTF-8 byte (e.g. a Windows-1252 quote in urlfinder/gau
+                                       # OSINT output) → U+FFFD, never a UnicodeDecodeError that kills the stage
+                    cwd=cwd,
+                    start_new_session=True,  # own process group → killpg reaches grandchildren
+                )
+            except OSError:
+                telemetry.record_command(
+                    tool=tool, status="missing" if shutil.which(cmd[0]) is None else "error",
+                    return_code=None, duration=time.monotonic() - started, timeout=timeout,
+                    diagnostic_path=stderr_path,
+                )
+                raise
+            _register(proc)
+            try:
+                out, _ = proc.communicate(input=input_data, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                _kill_group(proc, signal.SIGKILL)
+                # ``communicate`` retains the bytes/text collected before the timeout across calls. Keep
+                # that complete partial stdout on the exception so a bounded scanner can persist useful
+                # findings instead of discarding everything produced before its wall-clock budget expired.
+                out, _ = proc.communicate()  # reap the killed group
+                exc.output = out
+                telemetry.record_command(
+                    tool=tool, status="timeout", return_code=None,
+                    duration=time.monotonic() - started, timeout=timeout,
+                    diagnostic_path=stderr_path,
+                )
+                raise
+            finally:
+                _unregister(proc)
+                if reap_group:  # sweep stragglers even on clean exit; pgid == pid
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        os.killpg(proc.pid, signal.SIGKILL)
     rc = proc.returncode
     telemetry.record_command(
         tool=tool, status="success" if rc == 0 else "nonzero", return_code=rc,
-        duration=time.monotonic() - started, timeout=timeout,
+        duration=time.monotonic() - started, timeout=timeout, diagnostic_path=stderr_path,
     )
-    if check and rc != 0:
-        raise subprocess.CalledProcessError(rc, list(cmd), output=out)
     if rc != 0:
         # surface non-zero exits so a broken tool (bad flag, crash) can't masquerade
         # as a clean empty result — WARNING reaches the console even without --verbose
         log.warning("⚠ command exited %d: %s", rc, cmd_str)
+    if check and rc != 0:
+        raise subprocess.CalledProcessError(rc, list(cmd), output=out)
     return out or ""
 
 

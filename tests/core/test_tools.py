@@ -103,6 +103,15 @@ def test_run_stream_stderr_returns_stdout():
     assert tools.run(["printf", "hi"], stream_stderr=True) == "hi"
 
 
+def test_run_persists_stderr_diagnostic(tmp_path):
+    diagnostic = tmp_path / "tool.stderr.log"
+    output = tools.run(
+        ["sh", "-c", "printf stdout; printf diagnostic >&2"], stderr_path=diagnostic,
+    )
+    assert output == "stdout"
+    assert diagnostic.read_text(encoding="utf-8") == "diagnostic"
+
+
 def test_run_timeout_retains_partial_stdout():
     import subprocess
     import sys

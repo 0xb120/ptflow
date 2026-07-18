@@ -255,6 +255,8 @@ PARAM_MAX_ENDPOINTS = 50   # cap distinct endpoint shapes fuzzed per app (logged
 PARAM_MAX_BODY_ENDPOINTS = 25    # body + json discovery cap (POST/PUT/PATCH or body-bearing endpoints)
 PARAM_MAX_HEADER_ENDPOINTS = 15  # header discovery cap (x8 only — arjun has no header-discovery mode)
 PARAM_FANOUT = 3                 # concurrent (tool, location) param jobs per app
+PARAM_HEADER_BATCH_SIZE = 3      # isolate slow header probes; one endpoint family cannot stall all 15
+PARAM_HEADER_BATCH_TIMEOUT = 180  # seconds per x8 header batch (aggregate bounded by fan-out)
 # a param reflection-discovered on ~EVERY tested endpoint for its location is a SITE-WIDE reflection
 # artifact (e.g. a target that echoes any `?p=` into a Set-Cookie on every path), not N distinct hidden
 # params — collapse it to one host-level record instead of spraying a fuzz request onto each endpoint.
@@ -1762,6 +1764,7 @@ def parse_katana_requests(out: str, *, source: str = "katana") -> list[dict]:
     records: list[dict] = []
     for rec in _jsonl_str(out):
         req = rec.get("request") or {}
+        response = rec.get("response") or {}
         endpoint = req.get("endpoint")
         if endpoint:
             method = (req.get("method") or "GET").upper()
@@ -1774,6 +1777,8 @@ def parse_katana_requests(out: str, *, source: str = "katana") -> list[dict]:
                 "params": request_params(endpoint, body, ct),
                 "raw": req.get("raw") or build_raw_request(method, endpoint, headers, body),
                 "sources": [source],
+                **({"status": response["status_code"]}
+                   if isinstance(response.get("status_code"), int) else {}),
             })
         records += _katana_forms(rec, endpoint or "")
     return records
@@ -1795,12 +1800,20 @@ def merge_requests(records: Iterable[dict]) -> list[dict]:
     by_key: dict[tuple, dict] = {}
     for r in records:
         key = request_key(r)
+        raw_statuses = [r.get("status"), r.get("status_code"), *(r.get("statuses") or [])]
+        statuses = sorted({status for status in raw_statuses if isinstance(status, int)})
         if key not in by_key:
             by_key[key] = {**r, "sources": sorted(set(r.get("sources") or [])),
-                           "params": [dict(p) for p in (r.get("params") or [])]}
+                           "params": [dict(p) for p in (r.get("params") or [])],
+                           **({"status": _preferred_status(statuses), "statuses": statuses}
+                              if statuses else {})}
             continue
         cur = by_key[key]
         cur["sources"] = sorted(set(cur["sources"]) | set(r.get("sources") or []))
+        merged_statuses = sorted({*(cur.get("statuses") or []), *statuses})
+        if merged_statuses:
+            cur["statuses"] = merged_statuses
+            cur["status"] = _preferred_status(merged_statuses)
         idx = {(p.get("name"), p.get("loc")): p for p in cur["params"]}
         for p in r.get("params") or []:
             k = (p.get("name"), p.get("loc"))
@@ -1814,14 +1827,35 @@ def merge_requests(records: Iterable[dict]) -> list[dict]:
             sorted(by_key.values(), key=lambda r: (r.get("url") or "", r.get("method") or ""))]
 
 
-def _url_to_get_request(url: str, source: str) -> dict:
+def _preferred_status(statuses: Iterable[int]) -> int:
+    """Choose the most useful observed HTTP status for ranking while retaining ``statuses`` too."""
+    def rank(status: int) -> tuple[int, int]:
+        if 200 <= status < 300:  # noqa: PLR2004
+            return 0, status
+        if 300 <= status < 400:  # noqa: PLR2004
+            return 1, status
+        return (2 if status in {401, 403} else 3), status
+
+    values = list(statuses)
+    return min(values, key=rank)
+
+
+def _url_to_get_request(
+    url: str, source: str, *, sources: Iterable[str] | None = None, status: int | None = None,
+) -> dict:
     """A URL-only discovery (passive/crawley/feroxbuster/jsluice) as a GET catalog request — its query
-    string becomes its known params. Pure."""
-    return {"method": "GET", "url": url, "headers": {}, "body": "",
-            "params": request_params(url), "raw": build_raw_request("GET", url), "sources": [source]}
+    string becomes its known params. Provenance and observed response status survive the fallback.
+    Pure."""
+    provenance = sorted(set(sources or (source,)))
+    return {
+        "method": "GET", "url": url, "headers": {}, "body": "",
+        "params": request_params(url), "raw": build_raw_request("GET", url),
+        "sources": provenance,
+        **({"status": status, "statuses": [status]} if isinstance(status, int) else {}),
+    }
 
 
-def catalog_records(request_recs: Iterable[dict], get_urls: Iterable[str], in_scope: set[str],
+def catalog_records(request_recs: Iterable[dict], get_urls: Iterable[str | dict], in_scope: set[str],
                     schemes: dict[str, str], *, get_source: str = "url") -> list[dict]:
     """Assemble the per-app request catalog: the full request records (crawl/headless/API spec) plus
     the URL-only sources folded in as GET requests — every url scheme-normalized to the reachable
@@ -1835,10 +1869,15 @@ def catalog_records(request_recs: Iterable[dict], get_urls: Iterable[str], in_sc
         u = force_scheme(r.get("url") or "", schemes)
         if keep(u):
             recs.append({**r, "url": u})
-    for raw_url in get_urls:
+    for item in get_urls:
+        raw_url = str(item.get("url") or "") if isinstance(item, dict) else str(item)
         u = force_scheme(raw_url, schemes)
         if keep(u):
-            recs.append(_url_to_get_request(u, get_source))
+            sources = item.get("sources") if isinstance(item, dict) else None
+            status = (item.get("status") or item.get("status_code")) if isinstance(item, dict) else None
+            recs.append(_url_to_get_request(
+                u, get_source, sources=sources, status=status if isinstance(status, int) else None,
+            ))
     return merge_requests(recs)
 
 
@@ -2679,12 +2718,39 @@ def nuclei_scope(activity: Activity) -> None:
                             *tools.read_lines(canon("unique_webapps.txt"))])
     if not targets:
         log.debug("  · skip nuclei_scope (no targets)")
+        telemetry.record_detector(
+            "nuclei-scope", location="scope-target", attempted=0, completed=0,
+            status="not-applicable", reason="no-eligible-targets",
+        )
         return
-    _run("nuclei",
-         ["nuclei", "-stats", "-nmhe", "-c", NUCLEI_CONC, "-bs", NUCLEI_BULK, "-rl", NUCLEI_RL,
-          "-timeout", NUCLEI_TIMEOUT, "-retries", NUCLEI_RETRIES, "-j", "-silent", "-duc",
-          *_header_flags("-H")],
-         stdin="\n".join(targets), dest=activity.findings / "nuclei_scope.jsonl", label="scope")
+    cmd = [
+        "nuclei", "-stats", "-nmhe", "-c", NUCLEI_CONC, "-bs", NUCLEI_BULK, "-rl", NUCLEI_RL,
+        "-timeout", NUCLEI_TIMEOUT, "-retries", NUCLEI_RETRIES, "-j", "-silent", "-duc",
+        *_header_flags("-H"),
+    ]
+    status, reason = "success", None
+    log.info("  → nuclei (scope) — %d input(s)", len(targets))
+    try:
+        out = tools.run(
+            cmd, stdin="\n".join(targets), check=True, stream_stderr=is_verbose(),
+            stderr_path=activity.asset_discovery_raw("nuclei") / "scope.stderr.log",
+        )
+    except subprocess.CalledProcessError as exc:
+        status, reason = "nonzero", f"exit-{exc.returncode}"
+        out = _exception_stdout(exc)
+    except OSError:
+        binary_missing = shutil.which("nuclei") is None
+        status = "missing" if binary_missing else "error"
+        reason, out = ("binary-not-found" if binary_missing else "execution-error"), ""
+    destination = activity.findings / "nuclei_scope.jsonl"
+    tools.write_text(destination, out)
+    result_count = len(_jsonl_str(out))
+    telemetry.record_detector(
+        "nuclei-scope", location="scope-target", attempted=len(targets),
+        completed=len(targets) if status == "success" else None,
+        status=status, reason=reason, partial_results=result_count,
+    )
+    log.info("    nuclei (scope) → %d finding(s) → %s [%s]", result_count, destination.name, status)
 
 
 # --- clustering (surfagr.sh port) ---
@@ -4556,6 +4622,11 @@ def _effective_params_wl(ws: AppWorkspace, glob: Path | None) -> Path | None:
     return dest
 
 
+def _target_batches(targets: list[str], *, size: int) -> list[list[str]]:
+    """Stable non-empty target chunks for bounded per-batch detector timeouts."""
+    return [targets[index:index + size] for index in range(0, len(targets), size)]
+
+
 # location → the arjun request method (-m) that injects params there. arjun has no header-discovery
 # mode, so "header" is x8-only (absent here).
 _ARJUN_METHOD = {"query": "GET", "body": "POST", "json": "JSON"}
@@ -4576,34 +4647,63 @@ def _run_arjun(targets_file: Path, out_file: Path, params_wl: Path | None, app_i
     method = _ARJUN_METHOD.get(loc)
     if method is None:
         return []
+    target_count = len(tools.read_lines(targets_file))
     if shutil.which(ARJUN) is None:
         log.debug("  · skip arjun (not installed) for %s", app_id)
+        telemetry.record_detector(
+            "arjun", location=loc, attempted=target_count, completed=0,
+            status="missing", reason="binary-not-found",
+        )
         return []
     out_file.parent.mkdir(parents=True, exist_ok=True)
     cmd = [ARJUN, "-i", str(targets_file), "-oJ", str(out_file), "-m", method, "-t", ARJUN_THREADS,
            "-T", ARJUN_TIMEOUT, "--rate-limit", ARJUN_RATE, "-q", *_arjun_header_flags()]
     if params_wl is not None:
         cmd += ["-w", str(params_wl)]
+    status, reason = "success", None
     try:
-        tools.run(cmd, timeout=PARAM_TOOL_TIMEOUT, stream_stderr=is_verbose())
+        tools.run(
+            cmd, timeout=PARAM_TOOL_TIMEOUT, check=True, stream_stderr=is_verbose(),
+            stderr_path=out_file.with_suffix(".stderr.log"),
+        )
+    except subprocess.CalledProcessError as exc:
+        status, reason = "nonzero", f"exit-{exc.returncode}"
     except subprocess.TimeoutExpired:
+        status, reason = "timeout", f"wall-clock-{PARAM_TOOL_TIMEOUT}s"
         log.warning("⚠ arjun(%s) hit the %ds cap for %s — keeping partial results",
                     loc, PARAM_TOOL_TIMEOUT, app_id)
     text = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
-    return parse_arjun(text, loc=loc)
+    findings = parse_arjun(text, loc=loc)
+    telemetry.record_detector(
+        "arjun", location=loc, attempted=target_count,
+        completed=target_count if status == "success" else None,
+        status=status, reason=reason, partial_results=len(findings),
+    )
+    return findings
 
 
-def _run_x8(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: str,
-            *, mode: str = "query") -> list[dict]:
+def _run_x8(  # noqa: PLR0913
+    targets_file: Path, out_file: Path, params_wl: Path | None, app_id: str,
+    *, mode: str = "query", timeout: int = PARAM_TOOL_TIMEOUT,
+) -> list[dict]:
     """x8 over the targets file for ONE location (best-effort). mode picks where x8 injects: query
     (default), body (-X POST), json (-X POST -t json), header (--headers). Writes JSON to -o (bypasses
     _run). Needs a params wordlist (skipped if the role is unresolved). --one-worker-per-host is the
     politeness lever."""
+    target_count = len(tools.read_lines(targets_file))
     if shutil.which(X8) is None:
         log.debug("  · skip x8 (not installed) for %s", app_id)
+        telemetry.record_detector(
+            "x8", location=mode, attempted=target_count, completed=0,
+            status="missing", reason="binary-not-found",
+        )
         return []
     if params_wl is None:
         log.debug("  · skip x8 (no params wordlist) for %s", app_id)
+        telemetry.record_detector(
+            "x8", location=mode, attempted=target_count, completed=0,
+            status="unavailable", reason="parameter-wordlist-missing",
+        )
         return []
     out_file.parent.mkdir(parents=True, exist_ok=True)
     cmd = [X8, "-u", str(targets_file), "-w", str(params_wl), "-O", "json", "-o", str(out_file),
@@ -4616,13 +4716,26 @@ def _run_x8(targets_file: Path, out_file: Path, params_wl: Path | None, app_id: 
     elif mode == "header":
         cmd += ["--headers"]
     cmd += ["-H", *_auth_headers()] if _auth_headers() else []
+    status, reason = "success", None
     try:
-        tools.run(cmd, timeout=PARAM_TOOL_TIMEOUT, stream_stderr=is_verbose())
+        tools.run(
+            cmd, timeout=timeout, check=True, stream_stderr=is_verbose(),
+            stderr_path=out_file.with_suffix(".stderr.log"),
+        )
+    except subprocess.CalledProcessError as exc:
+        status, reason = "nonzero", f"exit-{exc.returncode}"
     except subprocess.TimeoutExpired:
+        status, reason = "timeout", f"wall-clock-{timeout}s"
         log.warning("⚠ x8(%s) hit the %ds cap for %s — keeping partial results",
-                    mode, PARAM_TOOL_TIMEOUT, app_id)
+                    mode, timeout, app_id)
     text = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
-    return parse_x8(text, loc=mode)
+    findings = parse_x8(text, loc=mode)
+    telemetry.record_detector(
+        "x8", location=mode, attempted=target_count,
+        completed=target_count if status == "success" else None,
+        status=status, reason=reason, partial_results=len(findings),
+    )
+    return findings
 
 
 def _working_schemes(ws: AppWorkspace) -> dict[str, str]:
@@ -4752,7 +4865,9 @@ def _cross_group_surface(activity: Activity, ws: AppWorkspace) -> list[dict]:
     return out
 
 
-def _finalize_catalog(ws: AppWorkspace, request_recs: list[dict], get_urls: list[str]) -> tuple[list[dict], int]:
+def _finalize_catalog(
+    ws: AppWorkspace, request_recs: list[dict], get_urls: list[str | dict],
+) -> tuple[list[dict], int]:
     """Turn assembled request records + URL-only GETs into the final per-app catalog: scheme-normalize
     to the empirically-reachable scheme (_working_schemes), in-scope-filter to ws.hosts, dedup by shape
     (catalog_records), then DROP GET shapes whose path the corpus only ever saw as 404/410 (dead_url_keys
@@ -4800,14 +4915,26 @@ def _assemble_catalog(activity: Activity, ws: AppWorkspace, *, include_guessed: 
                     *tools.read_jsonl(ws.canonical("requests_headless.jsonl")),
                     *tools.read_jsonl(ws.canonical("requests_api.jsonl")),
                     *mined]
-    get_urls = [*tools.read_lines(ws.canonical("endpoints.txt")),
-                *tools.read_lines(ws.canonical("endpoints_js.txt")),
-                *tools.read_lines(ws.canonical("endpoints_headless.txt"))]
+    get_urls: list[str | dict] = [
+        *({"url": url, "sources": ["crawl-url"]}
+          for url in tools.read_lines(ws.canonical("endpoints.txt"))),
+        *({"url": url, "sources": ["jsluice"]}
+          for url in tools.read_lines(ws.canonical("endpoints_js.txt"))),
+        *({"url": url, "sources": ["browser"]}
+          for url in tools.read_lines(ws.canonical("endpoints_headless.txt"))),
+    ]
     if include_guessed:
         request_recs += tools.read_jsonl(ws.canonical("requests_recrawl.jsonl"))  # re-seed crawl (if on)
         request_recs += _cross_group_surface(activity, ws)  # endpoints discovered in OTHER in-scope groups
-        get_urls += [r["url"] for r in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
-                     if r.get("url") and 200 <= (r.get("status") or 0) < 300]  # noqa: PLR2004
+        get_urls += [
+            {
+                "url": record["url"],
+                "sources": record.get("sources") or ["content-discovery"],
+                "status": record.get("status"),
+            }
+            for record in tools.read_jsonl(ws.canonical("content_discovery.jsonl"))
+            if record.get("url") and 200 <= (record.get("status") or 0) < 300  # noqa: PLR2004
+        ]
     kept, n_dead = _finalize_catalog(ws, request_recs, get_urls)
     return kept, len(mined), n_dead
 
@@ -4943,6 +5070,10 @@ def param_fuzz(activity: Activity, app_id: str) -> None:
     with ThreadPoolExecutor(max_workers=PARAM_FANOUT) as pool:
         futs = []
         for loc, targets in jobs:
+            target_batches = (
+                _target_batches(targets, size=PARAM_HEADER_BATCH_SIZE)
+                if loc == "header" else [targets]
+            )
             tf = ws.raw("param_fuzz") / f"targets_{loc}.txt"
             tools.write_lines(tf, targets)
             if loc in _ARJUN_METHOD:
@@ -4950,9 +5081,21 @@ def param_fuzz(activity: Activity, app_id: str) -> None:
                     pool, _run_arjun, tf, ws.raw("arjun") / f"{loc}.json",
                     params_wl, app_id, loc=loc,
                 ))
-            futs.append(telemetry.submit(
-                pool, _run_x8, tf, ws.raw("x8") / f"{loc}.json", params_wl, app_id, mode=loc,
-            ))
+            for batch_index, batch in enumerate(target_batches):
+                batch_suffix = f"_{batch_index}" if len(target_batches) > 1 else ""
+                batch_file = (ws.raw("param_fuzz") / f"targets_{loc}{batch_suffix}.txt")
+                if batch_file != tf:
+                    tools.write_lines(batch_file, batch)
+                futs.append(telemetry.submit(
+                    pool,
+                    _run_x8,
+                    batch_file,
+                    ws.raw("x8") / f"{loc}{batch_suffix}.json",
+                    params_wl,
+                    app_id,
+                    mode=loc,
+                    timeout=(PARAM_HEADER_BATCH_TIMEOUT if loc == "header" else PARAM_TOOL_TIMEOUT),
+                ))
         for fut in futs:
             records += fut.result()
     merged = merge_params(records)
@@ -5070,11 +5213,19 @@ def _run_dast(  # noqa: PLR0913
     Best-effort: skips if nuclei, every configured pack, the selected templates, or the request set is
     absent. Provenance includes the input and exact all-pack template manifest in raw/dast/."""
     stage = out_name.removesuffix(".jsonl")
-    if shutil.which("nuclei") is None:
-        log.debug("  · skip %s (nuclei not installed) for %s", stage, label)
-        return
     if not requests_:
         log.debug("  · skip %s (no requests) for %s", stage, label)
+        telemetry.record_detector(
+            "nuclei-dast", location="request", attempted=0, completed=0,
+            status="not-applicable", reason="no-eligible-requests",
+        )
+        return
+    if shutil.which("nuclei") is None:
+        log.debug("  · skip %s (nuclei not installed) for %s", stage, label)
+        telemetry.record_detector(
+            "nuclei-dast", location="request", attempted=len(requests_), completed=0,
+            status="missing", reason="binary-not-found",
+        )
         return
     try:
         settings = _dast_settings()
@@ -5089,10 +5240,31 @@ def _run_dast(  # noqa: PLR0913
             "selection": "all",
             "error": str(exc),
         })
+        telemetry.record_detector(
+            "nuclei-dast", location="template-catalog", attempted=0, completed=0,
+            status="unavailable", reason="invalid-configuration",
+        )
         log.warning("⚠ skip %s for %s: invalid DAST configuration: %s", stage, label, exc)
         return
     manifest = selection.manifest()
     _write_dast_selection(ws, selection_name, manifest)
+    configured_templates = int(manifest["configured_count"])
+    effective_templates = int(manifest["effective_preview_count"])
+    template_status = (
+        "unavailable" if configured_templates == 0
+        else "success" if configured_templates == effective_templates
+        else "incomplete"
+    )
+    template_reason = (
+        "no-templates-selected" if configured_templates == 0
+        else None if configured_templates == effective_templates
+        else "engine-preview-omitted-configured-templates"
+    )
+    telemetry.record_detector(
+        "nuclei-dast", location="template-catalog", attempted=configured_templates,
+        completed=effective_templates,
+        status=template_status, reason=template_reason,
+    )
     if manifest["selected_count"] == 0:
         log.info("  · skip %s (no templates available in enabled packs) for %s", stage, label)
         return
@@ -5102,7 +5274,7 @@ def _run_dast(  # noqa: PLR0913
     log.info(
         "  → %s (%s) — nuclei -dast over %d request(s), %d template(s) "
         "[all templates · -fa %s]",
-        stage, label, len(requests_), manifest["selected_count"], selection.aggression,
+        stage, label, len(requests_), manifest["configured_count"], selection.aggression,
     )
     cmd = [
         "nuclei", "-dast", "-im", "jsonl", "-l", str(input_file),
@@ -5116,11 +5288,24 @@ def _run_dast(  # noqa: PLR0913
         cmd.extend(("-iserver", OAST_SERVER))
     if OAST_TOKEN:
         cmd.extend(("-itoken", OAST_TOKEN))
-    out = tools.run(cmd, stream_stderr=is_verbose())
+    command_status, command_reason = "success", None
+    try:
+        out = tools.run(
+            cmd, check=True, stream_stderr=is_verbose(),
+            stderr_path=ws.raw("dast") / f"{stage}.stderr.log",
+        )
+    except subprocess.CalledProcessError as exc:
+        command_status, command_reason = "nonzero", f"exit-{exc.returncode}"
+        out = str(exc.output or "")
     findings = _jsonl_str(out)
     deduped = dedup_dast_findings(findings)
     stamped = dastconfig.stamp_findings(deduped, selection)
     n = tools.write_jsonl(ws.findings / out_name, stamped)
+    telemetry.record_detector(
+        "nuclei-dast", location="request", attempted=len(requests_),
+        completed=len(requests_) if command_status == "success" else None,
+        status=command_status, reason=command_reason, partial_results=n,
+    )
     extra = f" (deduped from {len(findings)})" if len(findings) != n else ""
     log.info("    %s (%s) → %d finding(s)%s → findings/%s", stage, label, n, extra, out_name)
 
@@ -5229,6 +5414,17 @@ def _has_params(r: dict) -> bool:
     """A request worth handing to dalfox/sqlmap — it has something to fuzz: enumerated params, a query
     string, or a body. A bare param-less GET is useless to either tool."""
     return bool(r.get("params")) or "?" in (r.get("url") or "") or bool(r.get("body"))
+
+
+def _detector_locations(record: dict) -> tuple[str, ...]:
+    """Non-secret parameter-location strata for detector coverage telemetry."""
+    locations = {str(param.get("loc") or "query") for param in record.get("params") or []
+                 if isinstance(param, dict)}
+    if not locations and "?" in str(record.get("url") or ""):
+        locations.add("query")
+    if not locations and record.get("body"):
+        locations.add("body")
+    return tuple(sorted(locations or {"request"}))
 
 
 def _budget_catalog(
@@ -5465,18 +5661,30 @@ def _oast_drain(oast: tuple[subprocess.Popen, str, Path], marker_map: dict[str, 
     return correlate_oast(tools.read_jsonl(jsonl), marker_map, unique_id=domain.split(".", 1)[0])
 
 
-def _run_dalfox(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label: str) -> None:
+def _run_dalfox(  # noqa: C901
+    ws: AppWorkspace, requests_: list[dict], *, out_name: str, label: str,
+) -> None:
     """Run dalfox over each candidate request's `raw` (file --rawdata), one process per request so body/
     json/header params are tested too. JSONL PoCs parsed from stdout → findings/<out_name>. With PTFLOW_OAST
     on, an interactsh-client runs alongside and each request gets a unique callback subdomain (dalfox -b)
     so a SYNCHRONOUS blind-XSS callback correlates back to its request. Best-effort: skips if dalfox is
     absent or there are no parameterized requests."""
     stage = out_name.removesuffix(".jsonl")
-    if shutil.which(DALFOX) is None:
-        log.debug("  · skip %s (dalfox not installed) for %s", stage, label)
-        return
     if not requests_:
         log.debug("  · skip %s (no parameterized requests) for %s", stage, label)
+        telemetry.record_detector(
+            "dalfox", attempted=0, completed=0, status="not-applicable",
+            reason="no-eligible-requests",
+        )
+        return
+    if shutil.which(DALFOX) is None:
+        log.debug("  · skip %s (dalfox not installed) for %s", stage, label)
+        for location in sorted({loc for record in requests_ for loc in _detector_locations(record)}):
+            attempted = sum(location in _detector_locations(record) for record in requests_)
+            telemetry.record_detector(
+                "dalfox", location=location, attempted=attempted, completed=0,
+                status="missing", reason="binary-not-found",
+            )
         return
     reqdir = ws.raw("dalfox")
     reqdir.mkdir(parents=True, exist_ok=True)
@@ -5487,7 +5695,7 @@ def _run_dalfox(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
     log.info("  → %s (%s) — dalfox over %d parameterized request(s)%s", stage, label, len(requests_),
              " [+OAST]" if domain else "")
 
-    def one(i_r: tuple[int, dict]) -> list[dict]:
+    def one(i_r: tuple[int, dict]) -> tuple[str, str | None, list[dict]]:
         i, r = i_r
         reqfile = reqdir / f"{stage}_{i}.txt"
         reqfile.write_text(r.get("raw") or "", encoding="utf-8")
@@ -5500,17 +5708,32 @@ def _run_dalfox(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
         if (r.get("url") or "").startswith("http://"):
             cmd.append("--http")          # raw mode defaults to https; force http where that's the scheme
         try:
-            return parse_dalfox(tools.run(cmd, stdin="", timeout=VULN_TOOL_TIMEOUT,
-                                          stream_stderr=is_verbose()))
-        except subprocess.TimeoutExpired:
+            output = tools.run(
+                cmd, stdin="", timeout=VULN_TOOL_TIMEOUT, check=True,
+                stream_stderr=is_verbose(), stderr_path=reqdir / f"{stage}_{i}.stderr.log",
+            )
+            return "success", None, parse_dalfox(output)
+        except subprocess.CalledProcessError as exc:
+            return "nonzero", f"exit-{exc.returncode}", parse_dalfox(str(exc.output or ""))
+        except subprocess.TimeoutExpired as exc:
             log.warning("⚠ %s: dalfox hit the %ds cap on %s", stage, VULN_TOOL_TIMEOUT, r.get("url"))
-            return []
+            return "timeout", f"wall-clock-{VULN_TOOL_TIMEOUT}s", parse_dalfox(str(exc.output or ""))
 
     findings: list[dict] = []
     with ThreadPoolExecutor(max_workers=VULN_FANOUT) as pool:
-        futures = [telemetry.submit(pool, one, item) for item in enumerate(requests_)]
-        for future in futures:
-            findings += future.result()
+        futures = [
+            (record, telemetry.submit(pool, one, (index, record)))
+            for index, record in enumerate(requests_)
+        ]
+        for record, future in futures:
+            status, reason, partial = future.result()
+            findings += partial
+            for location in _detector_locations(record):
+                telemetry.record_detector(
+                    "dalfox", location=location, attempted=1,
+                    completed=1 if status == "success" else None,
+                    status=status, reason=reason, partial_results=len(partial),
+                )
     blind = _oast_drain(oast, marker_map) if oast else []
     findings += blind
     n = tools.write_jsonl(ws.findings / out_name, findings)
@@ -5518,7 +5741,9 @@ def _run_dalfox(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
              f" ({len(blind)} blind via OAST)" if blind else "", out_name)
 
 
-def _run_sqlmap(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label: str) -> None:
+def _run_sqlmap(  # noqa: C901
+    ws: AppWorkspace, requests_: list[dict], *, out_name: str, label: str,
+) -> None:
     """Run sqlmap over each candidate request's `raw` (-r), one process per request. --text-only (NOT
     --smart): --smart's basic heuristic only fires on a reflected DBMS error, so it skips a boolean/UNION
     SQLi that leaks none (ginandjuice `category`); --text-only compares visible text so detection holds on
@@ -5526,18 +5751,28 @@ def _run_sqlmap(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
     Best-effort: skips if the sqlmap script or parameterized requests are absent. On the per-request
     timeout that request yields nothing (sqlmap prints its result block at the end)."""
     stage = out_name.removesuffix(".jsonl")
-    if not Path(_SQLMAP_SCRIPT).exists():
-        log.debug("  · skip %s (sqlmap not found at %s) for %s", stage, _SQLMAP_SCRIPT, label)
-        return
     if not requests_:
         log.debug("  · skip %s (no parameterized requests) for %s", stage, label)
+        telemetry.record_detector(
+            "sqlmap", attempted=0, completed=0, status="not-applicable",
+            reason="no-eligible-requests",
+        )
+        return
+    if not Path(_SQLMAP_SCRIPT).exists():
+        log.debug("  · skip %s (sqlmap not found at %s) for %s", stage, _SQLMAP_SCRIPT, label)
+        for location in sorted({loc for record in requests_ for loc in _detector_locations(record)}):
+            attempted = sum(location in _detector_locations(record) for record in requests_)
+            telemetry.record_detector(
+                "sqlmap", location=location, attempted=attempted, completed=0,
+                status="missing", reason="binary-not-found",
+            )
         return
     reqdir = ws.raw("sqlmap")
     reqdir.mkdir(parents=True, exist_ok=True)
     auth = _auth_headers()
     log.info("  → %s (%s) — sqlmap over %d parameterized request(s)", stage, label, len(requests_))
 
-    def one(i_r: tuple[int, dict]) -> list[dict]:
+    def one(i_r: tuple[int, dict]) -> tuple[str, str | None, list[dict]]:
         i, r = i_r
         reqfile = reqdir / f"{stage}_{i}.txt"
         reqfile.write_text(r.get("raw") or "", encoding="utf-8")
@@ -5556,17 +5791,34 @@ def _run_sqlmap(ws: AppWorkspace, requests_: list[dict], *, out_name: str, label
             # from STDIN and IGNORES `-r` (tests nothing). A pty slave keeps -r honoured; --batch means
             # it never blocks reading it. Default verbosity (NOT -v 0, which suppresses the injection
             # block parse_sqlmap keys on).
-            return parse_sqlmap(tools.run(cmd, stdin_tty=True, timeout=VULN_TOOL_TIMEOUT,
-                                          stream_stderr=is_verbose()), url=r.get("url"))
-        except subprocess.TimeoutExpired:
+            output = tools.run(
+                cmd, stdin_tty=True, timeout=VULN_TOOL_TIMEOUT, check=True,
+                stream_stderr=is_verbose(), stderr_path=reqdir / f"{stage}_{i}.stderr.log",
+            )
+            return "success", None, parse_sqlmap(output, url=r.get("url"))
+        except subprocess.CalledProcessError as exc:
+            parsed = parse_sqlmap(str(exc.output or ""), url=r.get("url"))
+            return "nonzero", f"exit-{exc.returncode}", parsed
+        except subprocess.TimeoutExpired as exc:
             log.warning("⚠ %s: sqlmap hit the %ds cap on %s", stage, VULN_TOOL_TIMEOUT, r.get("url"))
-            return []
+            parsed = parse_sqlmap(str(exc.output or ""), url=r.get("url"))
+            return "timeout", f"wall-clock-{VULN_TOOL_TIMEOUT}s", parsed
 
     findings: list[dict] = []
     with ThreadPoolExecutor(max_workers=VULN_FANOUT) as pool:
-        futures = [telemetry.submit(pool, one, item) for item in enumerate(requests_)]
-        for future in futures:
-            findings += future.result()
+        futures = [
+            (record, telemetry.submit(pool, one, (index, record)))
+            for index, record in enumerate(requests_)
+        ]
+        for record, future in futures:
+            status, reason, partial = future.result()
+            findings += partial
+            for location in _detector_locations(record):
+                telemetry.record_detector(
+                    "sqlmap", location=location, attempted=1,
+                    completed=1 if status == "success" else None,
+                    status=status, reason=reason, partial_results=len(partial),
+                )
     n = tools.write_jsonl(ws.findings / out_name, findings)
     log.info("    %s (%s) → %d finding(s) → findings/%s", stage, label, n, out_name)
 

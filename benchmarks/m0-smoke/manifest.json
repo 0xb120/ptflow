@@ -30,6 +30,15 @@
       "protocol": "dns"
     }
   ],
+  "expected_detector_coverage": [
+    {
+      "detector": "fixture-scanner",
+      "id": "fixture-request-coverage",
+      "location": "request",
+      "minimum_attempted": 2,
+      "minimum_completed": 2
+    }
+  ],
   "expected_requests": [
     {
       "content_type": "application/json",

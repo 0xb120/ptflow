@@ -61,7 +61,7 @@ def test_trace_collects_io_commands_and_malformed_drops_without_argv(tmp_path):
     )
     fragment = json.loads(next((act.state / "coverage" / run_id).glob("*.json")).read_text())
 
-    assert fragment["status"] == "success"
+    assert fragment["status"] == "degraded"
     assert fragment["reads"] == [
         {"count": 1, "kind": "jsonl", "path": "data.jsonl", "present": True}
     ]
@@ -164,3 +164,41 @@ def test_finalize_manifest_includes_limits_disabled_and_stage_summary(tmp_path):
     assert disabled["stage"] == "scan"
     assert disabled["scope"] == "all-apps"
     assert json.loads((act.base / "coverage.json").read_text()) == manifest
+
+
+def test_finalize_marks_run_completed_degraded_and_aggregates_detector_matrix(tmp_path):
+    act = Activity.named("degraded", root=tmp_path).ensure()
+    run = telemetry.begin_run(
+        act, _Pipeline(), scope_text="example.com\n", resume_requested=False,
+        resume_effective=False, disabled=(), fanout=1, net_limit=1,
+    )
+
+    def scan():
+        telemetry.record_detector(
+            "x8", location="header", attempted=3, completed=None,
+            status="timeout", reason="wall-clock-180s", partial_results=1,
+        )
+
+    telemetry.trace_call(
+        act, run.run_id, stage="collect", app_id=None, band="breadth", net=True, call=scan,
+    )
+    manifest = telemetry.finalize_run(
+        act, run, _Pipeline.stages, status="completed", failures=(), disabled=(),
+    )
+
+    assert manifest["status"] == "completed-degraded"
+    assert manifest["summary"]["stage_statuses"] == {"degraded": 1}
+    assert manifest["summary"]["detectors"] == {
+        "observed": 1,
+        "degraded": 1,
+        "matrix": [{
+            "detector": "x8",
+            "location": "header",
+            "attempted": 3,
+            "completed": 0,
+            "unknown_completion_runs": 1,
+            "partial_results": 1,
+            "statuses": {"timeout": 1},
+            "reasons": ["wall-clock-180s"],
+        }],
+    }

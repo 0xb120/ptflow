@@ -54,3 +54,41 @@ def test_specific_native_type_becomes_class_but_generic_transport_does_not():
     assert smb.detector == "smb"
     assert generic.class_name == "dast"
     assert generic.detector == "nuclei"
+
+
+def test_detector_native_evidence_maps_to_meaningful_confidence():
+    sqlmap = evidence.normalize_finding(
+        finding_id="sql-1", category="sqli",
+        record={"technique": "boolean-based blind", "payload": "id=1 AND 1=1"},
+        target="https://example.test/item?id=",
+    )
+    reflected = evidence.normalize_finding(
+        finding_id="xss-1", category="xss", record={"poc_kind": "R"},
+        target="https://example.test/search?q=",
+    )
+    nuclei = evidence.normalize_finding(
+        finding_id="xss-2", category="dast",
+        record={
+            "template-id": "reflected-xss", "matcher-status": True,
+            "info": {"metadata": {"verified": True}},
+        },
+        target="https://example.test/search?q=",
+    )
+    nuclei_full = evidence.normalize_finding(
+        finding_id="xss-3", category="dast_full",
+        record={"template-id": "reflected-xss", "is_fuzzing_result": True},
+        target="https://example.test/search?q=",
+    )
+
+    assert (sqlmap.confidence, sqlmap.verification_method) == (
+        "verified", "sqlmap-confirmed-injection",
+    )
+    assert (reflected.confidence, reflected.verification_method) == (
+        "probable", "dalfox-reflection-poc",
+    )
+    assert (nuclei.confidence, nuclei.verification_method) == (
+        "verified", "verified-nuclei-template",
+    )
+    assert (nuclei_full.confidence, nuclei_full.verification_method) == (
+        "probable", "nuclei-matcher",
+    )

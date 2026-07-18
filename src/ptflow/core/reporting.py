@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from ptflow.core import evidence, tools
 
@@ -71,6 +72,11 @@ _EVIDENCE_KEYS = (
 _VOLATILE_KEYS = frozenset({"timestamp", "time", "duration", "duration_ms", "curl-command"})
 _SPACE_RE = re.compile(r"\s+")
 _MAX_INLINE = 500
+_SEMANTIC_CLASSES = frozenset({
+    "command-injection", "crlf", "open-redirect", "path-traversal", "sqli", "ssrf", "ssti",
+    "xss", "xxe",
+})
+_PARAMETER_KEYS = ("param", "parameter", "fuzzing_parameter", "fuzzing-parameter")
 
 
 def normalize_severity(record: dict[str, Any]) -> str:
@@ -104,7 +110,67 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
 
 
+def _request_url(record: dict[str, Any]) -> str | None:
+    for key in ("url", "matched-at", "matched_at", "endpoint"):
+        value = record.get(key)
+        if value and "://" in str(value):
+            return str(value)
+    return None
+
+
+def _parameter_identity(record: dict[str, Any]) -> tuple[str, ...]:
+    values = [str(record[key]) for key in _PARAMETER_KEYS if record.get(key)]
+    values.extend(
+        str(parameter["name"])
+        for parameter in record.get("params") or []
+        if isinstance(parameter, dict) and parameter.get("name")
+    )
+    return tuple(sorted({value.casefold() for value in values if value.strip()}))
+
+
+def _location_identity(record: dict[str, Any]) -> tuple[str, ...]:
+    values = [str(parameter.get("loc")) for parameter in record.get("params") or []
+              if isinstance(parameter, dict) and parameter.get("loc")]
+    if record.get("fuzzing_position"):
+        values.append(str(record["fuzzing_position"]))
+    raw = str(record.get("location") or "").casefold()
+    if raw:
+        values.append({"get": "query", "post": "body"}.get(raw, raw))
+    if request_url := _request_url(record):
+        query_names = {name.casefold() for name, _ in parse_qsl(
+            urlsplit(request_url).query, keep_blank_values=True,
+        )}
+        if query_names.intersection(_parameter_identity(record)):
+            values.append("query")
+    return tuple(sorted({value.casefold() for value in values if value.strip()}))
+
+
+def _semantic_identity(category: str, record: dict[str, Any]) -> dict[str, Any] | None:
+    class_name = evidence.normalize_class(category, record)
+    raw_url = _request_url(record)
+    parameters = _parameter_identity(record)
+    if class_name not in _SEMANTIC_CLASSES or not raw_url or not parameters:
+        return None
+    parts = urlsplit(raw_url)
+    method = str(
+        record.get("method") or record.get("fuzzing_method") or record.get("location") or "GET"
+    ).upper()
+    if method not in {"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"}:
+        method = "GET"
+    return {
+        "class": class_name,
+        "authority": f"{parts.scheme.casefold()}://{parts.netloc.casefold()}",
+        "method": method,
+        "path": parts.path or "/",
+        "parameters": parameters,
+        "locations": _location_identity(record),
+    }
+
+
 def _finding_key(category: str, record: dict[str, Any]) -> str:
+    if semantic := _semantic_identity(category, record):
+        raw = _canonical({"semantic_vulnerability": semantic})
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
     identifiers = {k: record[k] for k in _IDENTITY_KEYS if record.get(k) not in (None, "", [])}
     targets = {k: record[k] for k in _TARGET_KEYS if record.get(k) not in (None, "", [])}
     if identifiers:
@@ -124,16 +190,31 @@ def _text(value: Any) -> str:
 
 
 def _title(category: str, record: dict[str, Any]) -> str:
+    class_name = evidence.normalize_class(category, record)
+    parameters = _parameter_identity(record)
+    if class_name in {"sqli", "xss"} and parameters:
+        label = "SQL injection" if class_name == "sqli" else "Cross-site scripting"
+        return f"{label} in {', '.join(parameters)}"
     for key in ("title", "name", "template-id", "template_id", "cve", "type", "rule_id", "RuleID"):
         if record.get(key):
             return _text(record[key])
     return category.replace("_", " ").replace("-", " ")
 
 
+def _canonical_url_subject(raw: str) -> str:
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        return _text(raw)
+    query_names = sorted({name for name, _ in parse_qsl(parts.query, keep_blank_values=True) if name})
+    query = "&".join(f"{name}=" for name in query_names)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", query, ""))
+
+
 def _subject(record: dict[str, Any]) -> str | None:
     for key in ("url", "matched-at", "matched_at", "endpoint", "host", "subject"):
         if record.get(key):
-            return _text(record[key])
+            value = str(record[key])
+            return _canonical_url_subject(value) if "://" in value else _text(value)
     if record.get("ip"):
         return f"{record['ip']}:{record['port']}" if record.get("port") else str(record["ip"])
     return str(record["app_id"]) if record.get("app_id") else None
@@ -158,6 +239,19 @@ def _poc_paths(record: dict[str, Any]) -> list[str]:
             str(item) for item in values if isinstance(item, (str, Path)) and str(item).strip()
         )
     return list(dict.fromkeys(paths))
+
+
+def _observation(record: dict[str, Any], source: dict[str, Any], detector: str) -> dict[str, Any]:
+    """Compact native evidence variant retained when semantic dedup merges scanner records."""
+    fields = (
+        "title", "technique", "payload", "poc_kind", "inject_type", "fuzzing_parameter",
+        "fuzzing_position", "matcher-name", "matcher_name", "dbms",
+    )
+    return {
+        "detector": detector,
+        "source": source,
+        **{key: record[key] for key in fields if record.get(key) not in (None, "", [], {})},
+    }
 
 
 def gather_findings(
@@ -188,16 +282,22 @@ def gather_findings(
                     "id": key,
                     **normalized.as_dict(),
                     "category": category,
+                    "categories": [category],
                     "severity": normalize_severity(record),
                     "title": _title(category, record),
                     "subject": subject,
                     "evidence": _evidence(record),
                     "poc_paths": poc_paths,
                     "sources": [source],
+                    "detectors": [normalized.detector],
+                    "observations": [_observation(record, source, normalized.detector)],
                     "details": record,
                 }
                 continue
             current = merged[key]
+            current["categories"] = sorted({*current["categories"], category})
+            current["detectors"] = sorted({*current["detectors"], normalized.detector})
+            current["observations"].append(_observation(record, source, normalized.detector))
             if source not in current["sources"]:
                 current["sources"].append(source)
             current["evidence"] = list(dict.fromkeys([*current["evidence"], *_evidence(record)]))
@@ -208,13 +308,25 @@ def gather_findings(
             current["control_evidence_refs"] = list(dict.fromkeys([
                 *current["control_evidence_refs"], *normalized.control_evidence_refs,
             ]))
+            previous_confidence = current["confidence"]
             current["confidence"] = evidence.strongest_confidence(
-                current["confidence"], normalized.confidence,
+                previous_confidence, normalized.confidence,
             )
             current["request_ref"] = current["request_ref"] or normalized.request_ref
-            current["verification_method"] = (
-                current["verification_method"] or normalized.verification_method
-            )
+            if (
+                evidence.confidence_rank(normalized.confidence)
+                > evidence.confidence_rank(previous_confidence)
+                and normalized.verification_method
+            ):
+                current["verification_method"] = normalized.verification_method
+            else:
+                current["verification_method"] = (
+                    current["verification_method"] or normalized.verification_method
+                )
+            severity_rank = {severity: index for index, severity in enumerate(_SEVERITIES)}
+            incoming_severity = normalize_severity(record)
+            if severity_rank[incoming_severity] < severity_rank[current["severity"]]:
+                current["severity"] = incoming_severity
     rank = {severity: i for i, severity in enumerate(_SEVERITIES)}
     return sorted(
         merged.values(),
@@ -236,6 +348,7 @@ def build_report(activity: Activity, *, findings_dir: Path | None = None) -> dic
         "schema_version": 2,
         "summary": {
             "total": len(findings),
+            "evidence_observations": sum(len(finding["observations"]) for finding in findings),
             "by_severity": {severity: counts[severity] for severity in _SEVERITIES},
             "by_confidence": {
                 label: confidence[label] for label in ("verified", "probable", "lead")
@@ -253,7 +366,7 @@ def _render_finding(finding: dict[str, Any]) -> list[str]:
         f"- Category: `{finding['category']}`",
         f"- Class: `{finding['class']}`",
         f"- Confidence: `{finding['confidence']}`",
-        f"- Detector: `{finding['detector']}`",
+        f"- Detectors: `{', '.join(finding['detectors'])}`",
     ]
     if finding["subject"]:
         lines.append(f"- Target: `{finding['subject']}`")
@@ -291,7 +404,12 @@ def render_markdown(
         f"| {severity.capitalize()} | {summary['by_severity'][severity]} |"
         for severity in _SEVERITIES
     )
-    lines.extend(["", f"**Total findings:** {summary['total']}", ""])
+    lines.extend([
+        "",
+        f"**Unique findings:** {summary['total']}",
+        f"**Evidence observations:** {summary['evidence_observations']}",
+        "",
+    ])
     by_severity = {severity: [] for severity in _SEVERITIES}
     for finding in report["findings"]:
         by_severity[finding["severity"]].append(finding)

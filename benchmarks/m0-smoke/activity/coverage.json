@@ -20,6 +20,17 @@
         }
       ],
       "duration_seconds": 4.0,
+      "detectors": [
+        {
+          "attempted": 2,
+          "completed": 2,
+          "detector": "fixture-scanner",
+          "location": "request",
+          "partial_results": 2,
+          "reason": null,
+          "status": "success"
+        }
+      ],
       "network": true,
       "stage": "fixture-detection",
       "status": "success"

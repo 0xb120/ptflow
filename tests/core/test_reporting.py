@@ -57,6 +57,53 @@ def test_build_report_deduplicates_identity_and_merges_evidence(tmp_path):
     assert len(finding["sources"]) == 2
 
 
+def test_report_semantically_deduplicates_payloads_techniques_and_detectors(tmp_path):
+    act = Activity.named("semantic", root=tmp_path).ensure()
+    tools.write_jsonl(act.findings / "dast.jsonl", [{
+        "template-id": "reflected-xss",
+        "type": "http",
+        "method": "GET",
+        "url": "https://shop.test/catalog?category=Juice",
+        "matched-at": "https://shop.test/catalog?category=payload",
+        "fuzzing_parameter": "category",
+        "fuzzing_position": "query",
+        "matcher-status": True,
+        "info": {"severity": "medium", "metadata": {"verified": True}},
+    }])
+    tools.write_jsonl(act.findings / "xss.jsonl", [
+        {"type": "xss", "poc_kind": "R", "param": "category", "method": "GET",
+         "matched-at": "https://shop.test/catalog?category=payload-one", "payload": "one",
+         "severity": "medium", "sources": ["dalfox"]},
+        {"type": "xss", "poc_kind": "V", "param": "category", "method": "GET",
+         "matched-at": "https://shop.test/catalog?category=payload-two", "payload": "two",
+         "severity": "medium", "sources": ["dalfox"]},
+    ])
+    tools.write_jsonl(act.findings / "sqli.jsonl", [
+        {"type": "sqli", "param": "id", "location": "GET", "technique": "boolean",
+         "title": "boolean proof", "payload": "id=1 AND 1=1",
+         "matched-at": "https://shop.test/item?id=1", "sources": ["sqlmap"]},
+        {"type": "sqli", "param": "id", "location": "GET", "technique": "union",
+         "title": "union proof", "payload": "id=1 UNION SELECT 1",
+         "matched-at": "https://shop.test/item?id=1", "sources": ["sqlmap"]},
+    ])
+
+    report = reporting.build_report(act)
+
+    assert report["summary"]["total"] == 2
+    assert report["summary"]["evidence_observations"] == 5
+    xss = next(finding for finding in report["findings"] if finding["class"] == "xss")
+    assert xss["confidence"] == "verified"
+    assert xss["detectors"] == ["dalfox", "nuclei"]
+    assert xss["categories"] == ["dast", "xss"]
+    assert len(xss["observations"]) == 3
+    assert xss["subject"] == "https://shop.test/catalog?category="
+    assert xss["verification_method"] == "verified-nuclei-template"
+    sqli = next(finding for finding in report["findings"] if finding["class"] == "sqli")
+    assert sqli["confidence"] == "verified"
+    assert sqli["verification_method"] == "sqlmap-confirmed-injection"
+    assert {item["technique"] for item in sqli["observations"]} == {"boolean", "union"}
+
+
 def test_write_report_is_byte_stable_and_keeps_source_references(tmp_path):
     act = Activity.named("stable", root=tmp_path).ensure()
     tools.write_jsonl(
