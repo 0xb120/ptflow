@@ -27,7 +27,14 @@ from ptflow.core.agent import propose_hypotheses
 from ptflow.core.config import CONFIG
 from ptflow.core.log import add_file_handler, get_logger
 from ptflow.core.paths import Activity
-from ptflow.core.stage import Pipeline, Stage, enabled_stages, impacted_dependents, stage_band
+from ptflow.core.stage import (
+    Pipeline,
+    Stage,
+    enabled_stages,
+    impacted_dependents,
+    resume_contract_fingerprint,
+    stage_band,
+)
 from ptflow.pipelines import load_pipeline
 
 if TYPE_CHECKING:
@@ -394,41 +401,71 @@ def _run_dag(  # noqa: PLR0913
     return tuple(failures)
 
 
-def _resume_ok(activity: Activity, scope_text: str, *, resume: bool,
-               config_fingerprint: str | None = None) -> bool:
-    """Honour ``--resume`` only when scope and effective run configuration are unchanged.
+_RESUME_INVALIDATION_MESSAGES = {
+    "scope_changed": "scope changed since last run",
+    "legacy_config_missing": "prior run predates config fingerprints",
+    "config_changed": "effective configuration changed since last run",
+    "legacy_pipeline_contract_missing": "prior run predates pipeline contract fingerprints",
+    "pipeline_contract_changed": "pipeline contract changed since last run",
+}
 
-    Hashes live under ``.state/{scope,config}.sha``. A pre-fingerprint workspace that already has a
-    scope hash is invalidated once, then migrated by writing ``config.sha``. Callers that do not supply
-    a fingerprint retain the historical scope-only behavior for library compatibility.
+
+def _fingerprint_invalidation_reason(
+    config_file: Path, config_fingerprint: str | None,
+    pipeline_file: Path, pipeline_fingerprint: str | None,
+) -> str | None:
+    for path, current, legacy_reason, changed_reason in (
+        (config_file, config_fingerprint, "legacy_config_missing", "config_changed"),
+        (pipeline_file, pipeline_fingerprint,
+         "legacy_pipeline_contract_missing", "pipeline_contract_changed"),
+    ):
+        if current is None:
+            continue
+        if not path.exists():
+            return legacy_reason
+        if path.read_text(encoding="utf-8", errors="replace").strip() != current:
+            return changed_reason
+    return None
+
+
+def _resume_ok(activity: Activity, scope_text: str, *, resume: bool,
+               config_fingerprint: str | None = None,
+               pipeline_fingerprint: str | None = None) -> tuple[bool, str | None]:
+    """Honour ``--resume`` only when scope, effective config and pipeline contract are unchanged.
+
+    Hashes live under ``.state/{scope,config,pipeline}.sha``. A workspace predating either optional
+    fingerprint is invalidated once and migrated. Returns ``(effective, invalidation_reason)`` so the
+    coverage manifest explains why a requested resume became a full rerun.
     """
     sha = hashlib.sha256(scope_text.encode()).hexdigest()
     sha_file = activity.state / "scope.sha"
     config_file = activity.state / "config.sha"
+    pipeline_file = activity.state / "pipeline.sha"
     prior_run = sha_file.exists()
-    if resume and prior_run and sha_file.read_text(
-            encoding="utf-8", errors="replace").strip() != sha:
-        log.warning("⚠ resume: scope changed since last run — ignoring stage markers (full rerun)")
-        resume = False
-    elif resume and prior_run and config_fingerprint is not None:
-        if not config_file.exists():
-            log.warning("⚠ resume: prior run predates config fingerprints — ignoring stage markers "
-                        "once (full rerun)")
-            resume = False
-        elif config_file.read_text(
-                encoding="utf-8", errors="replace").strip() != config_fingerprint:
-            log.warning("⚠ resume: effective configuration changed since last run — ignoring stage "
-                        "markers (full rerun)")
+    invalidation_reason: str | None = None
+    if resume and prior_run:
+        if sha_file.read_text(encoding="utf-8", errors="replace").strip() != sha:
+            invalidation_reason = "scope_changed"
+        else:
+            invalidation_reason = _fingerprint_invalidation_reason(
+                config_file, config_fingerprint, pipeline_file, pipeline_fingerprint,
+            )
+        if invalidation_reason:
+            log.warning("⚠ resume: %s — ignoring stage markers%s (full rerun)",
+                        _RESUME_INVALIDATION_MESSAGES[invalidation_reason],
+                        " once" if invalidation_reason.startswith("legacy_") else "")
             resume = False
     activity.state.mkdir(parents=True, exist_ok=True)
     sha_file.write_text(sha, encoding="utf-8")
     if config_fingerprint is not None:
         config_file.write_text(config_fingerprint, encoding="utf-8")
+    if pipeline_fingerprint is not None:
+        pipeline_file.write_text(pipeline_fingerprint, encoding="utf-8")
     if not resume:
         cleared = _clear_resume_markers(activity)
         if cleared:
             log.info("  → resume: cleared %d stale completion marker(s) before full rerun", cleared)
-    return resume
+    return resume, invalidation_reason
 
 
 def _server_reachable(api_url: str, timeout: float = 2.0) -> bool:
@@ -457,8 +494,8 @@ def orchestrate(  # noqa: PLR0913
     """Run the full pipeline for one activity. Returns (activity base dir, stage-failure count);
     the count is 0 on a clean run and >0 when one or more stages failed (the CLI maps it to its
     exit code). With `resume`, stages that completed cleanly in a prior run of this activity are
-    skipped (only failed/incomplete ones rerun) — auto-invalidated if scope or the supplied effective
-    configuration fingerprint changed. With
+    skipped (only failed/incomplete ones rerun) — auto-invalidated if scope, the supplied effective
+    configuration fingerprint, or the pipeline's live artifact contract changed. With
     `observe` (a Prefect API URL), the run streams to that server's UI (run graph, states, timings,
     logs) instead of spinning a throwaway ephemeral server — pure telemetry, the pipeline is
     unchanged. temporary_settings applies the redirect at runtime (env set post-import is too late).
@@ -471,8 +508,10 @@ def orchestrate(  # noqa: PLR0913
     activity.scope.write_text(scope_text, encoding="utf-8")
     activity.scope_init.write_text(scope_text, encoding="utf-8")
     resume_requested = resume
-    resume = _resume_ok(
+    pipeline_fingerprint = resume_contract_fingerprint(pipeline)
+    resume, resume_invalidation_reason = _resume_ok(
         activity, scope_text, resume=resume, config_fingerprint=config_fingerprint,
+        pipeline_fingerprint=pipeline_fingerprint,
     )
     if observe and not _server_reachable(observe):
         log.warning("⚠ observe: Prefect server unreachable at %s — falling back to ephemeral "
@@ -489,6 +528,8 @@ def orchestrate(  # noqa: PLR0913
         activity, pipeline, scope_text=scope_text, resume_requested=resume_requested,
         resume_effective=resume, disabled=disabled, fanout=CONFIG.fanout.max_workers,
         net_limit=_NET_LIMIT, config_fingerprint=config_fingerprint,
+        pipeline_fingerprint=pipeline_fingerprint,
+        resume_invalidation_reason=resume_invalidation_reason,
     )
     # name the flow run after the activity (UI), and size the pool to fan-out + spanning headroom so
     # the spanning stages run ∥ the loops instead of starving them (_FANOUT_SLOTS holds the fan-out cap)

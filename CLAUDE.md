@@ -30,7 +30,7 @@ that fan out under Prefect.
 uv sync --all-groups                                   # install (incl. dev/lint/test groups)
 uv run ptflow run <pipeline> <activity> <scope.txt> [--root DIR] [-v] [--resume]
                                                        # output → <root>/<activity>/ (root defaults to cwd)
-                                                       # --resume: skip stages from same scope + effective config
+                                                       # --resume: same scope + config + pipeline contract only
                   [--config ptflow.toml] [--set KEY=VALUE ...]   # operator knobs (see "Run config")
 uv run ptflow doctor [<pipeline>]                      # verify a pipeline's external tools + datasets
                                                        # are installed (default: external); exit 1 if a
@@ -143,6 +143,16 @@ uv run ptflow run external <activity> <scope.txt> --observe # stream THIS run to
 - *Why not Prefect's native result-cache/retry for resume instead of the `.state` markers:* see
   the resume design — our stages return nothing (they communicate via disk), and the cache store would
   live outside the activity workspace, breaking the file-as-only-state invariant.
+- **Resume contract safety:** `.state/{scope,config,pipeline}.sha` gates every completion marker.
+  `pipeline.sha` hashes the live ordered stage graph (callable identity, needs, phase/scope/spanning/net
+  flags) plus the cluster hook and each pipeline's explicit positive `resume_epoch`. Graph rewiring is
+  detected automatically; bump `resume_epoch` when a task keeps the same graph/callable identity but
+  changes canonical artifact paths/formats, clustering/app IDs, selection semantics, or downstream input
+  requirements. Documentation/log-only changes need no bump. A missing config/pipeline fingerprint in an
+  older workspace causes one conservative full rerun. `coverage.json` records both hashes and
+  `resume.invalidation_reason` (`scope_changed`, `config_changed`, `pipeline_contract_changed`, or a
+  `legacy_*_missing` migration reason). Invalidation is activity-wide by design: cross-phase file reads
+  and cluster/barrier dependencies are broader than explicit `needs`, so per-stage invalidation is unsafe.
 
 ## Documentation automation
 
@@ -249,7 +259,7 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
                                                            #   domain_ip_map}.txt (RoE-authorized set the active
                                                            #   stages read) + excluded_out_of_scope.jsonl (audit)
   late_web_targets.txt                  # exhaustive-only delta handed to nested late_web_recon/
-  .state/  <stage>.done  scope.sha  config.sha   # --resume markers; invalidated on scope/config change
+  .state/  <stage>.done  scope.sha  config.sha  pipeline.sha  # resume contract; mismatch ⇒ full rerun
   scans/                                 # ONLY per-app group workspaces (no special-cased breadth dir)
     <app_id>/                            # one clustered app group (per-app loops)
       meta.json  hosts.txt  endpoints.txt  subs.txt  takeover.txt  …

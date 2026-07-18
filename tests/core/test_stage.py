@@ -60,3 +60,44 @@ def test_impacted_dependents_transitive():
 def test_impacted_dependents_none_when_independent():
     from ptflow.core.stage import Stage, impacted_dependents
     assert impacted_dependents([Stage("a", lambda *_: None), Stage("b", lambda *_: None)], {"a"}) == []
+
+
+def test_resume_contract_fingerprint_is_stable_and_sensitive_to_graph_callable_and_epoch():
+    from types import SimpleNamespace
+
+    from ptflow.core.stage import resume_contract_fingerprint
+
+    def run_a(*_args):
+        return None
+
+    def run_b(*_args):
+        return None
+
+    def cluster_a(*_args):
+        return []
+
+    def cluster_b(*_args):
+        return []
+
+    def pipeline(*, epoch=1, run=run_a, needs=(), cluster=cluster_a):
+        return SimpleNamespace(
+            name="demo", resume_epoch=epoch, cluster=cluster,
+            stages=(Stage("scan", run, needs=needs, spanning=True, net=False),),
+        )
+
+    baseline = resume_contract_fingerprint(pipeline())
+    assert baseline == resume_contract_fingerprint(pipeline())
+    assert baseline != resume_contract_fingerprint(pipeline(epoch=2))
+    assert baseline != resume_contract_fingerprint(pipeline(run=run_b))
+    assert baseline != resume_contract_fingerprint(pipeline(needs=("discover",)))
+    assert baseline != resume_contract_fingerprint(pipeline(cluster=cluster_b))
+
+
+def test_resume_contract_rejects_invalid_epoch():
+    from types import SimpleNamespace
+
+    from ptflow.core.stage import resume_contract
+
+    pipeline = SimpleNamespace(name="demo", resume_epoch=0, stages=())
+    with pytest.raises(ValueError, match="positive integer"):
+        resume_contract(pipeline)

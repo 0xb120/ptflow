@@ -104,6 +104,8 @@ def test_finalize_manifest_includes_limits_disabled_and_stage_summary(tmp_path):
         fanout=3,
         net_limit=4,
         config_fingerprint="config-hash",
+        pipeline_fingerprint="pipeline-hash",
+        resume_invalidation_reason="pipeline_contract_changed",
     )
     telemetry.trace_call(
         act,
@@ -126,8 +128,13 @@ def test_finalize_manifest_includes_limits_disabled_and_stage_summary(tmp_path):
 
     assert manifest["limits"]["fanout_workers"] == 3
     assert manifest["limits"]["network_stages"] == 4
-    assert manifest["resume"] == {"requested": True, "effective": False}
+    assert manifest["resume"] == {
+        "requested": True,
+        "effective": False,
+        "invalidation_reason": "pipeline_contract_changed",
+    }
     assert manifest["config_sha256"] == "config-hash"
+    assert manifest["pipeline_sha256"] == "pipeline-hash"
     assert manifest["summary"]["stage_statuses"] == {"disabled": 1, "success": 1}
     disabled = next(stage for stage in manifest["stages"] if stage["status"] == "disabled")
     assert disabled["stage"] == "scan"

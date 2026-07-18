@@ -23,6 +23,7 @@ _AI_STAGES = ai.per_app_stages()
 
 class ExternalPipeline:
     name = "external"
+    resume_epoch = 1
     stages: Sequence[Stage] = (
         # activity scope (whole-scope asset discovery)
         Stage("provision_wl", tasks.provision_wl, net=False),  # wordlist roles → wl_global/ (offline, ∥)

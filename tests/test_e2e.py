@@ -53,6 +53,11 @@ def test_orchestrate_end_to_end(tmp_path):
     assert (base / "reports" / "report.md").exists()
     coverage = json.loads((base / "coverage.json").read_text())
     assert coverage["status"] == "completed"
+    assert len(coverage["pipeline_sha256"]) == 64
+    assert coverage["resume"] == {
+        "requested": False, "effective": False, "invalidation_reason": None,
+    }
+    assert (base / ".state" / "pipeline.sha").read_text() == coverage["pipeline_sha256"]
     assert any(s["stage"] == "deterministic_report" and s["status"] == "success"
                for s in coverage["stages"])
 
@@ -84,6 +89,26 @@ def test_cli_resume_reruns_cleanly(tmp_path):
     # a --resume rerun completes cleanly (skipping done stages) and keeps the outputs
     assert main(["run", "example", "acme", str(scope_file), "--root", root, "--resume"]) == 0
     assert (base / "findings" / "hypotheses.jsonl").exists()
+
+
+def test_cli_resume_invalidates_when_pipeline_epoch_changes(tmp_path, monkeypatch):
+    scope_file = _scope(tmp_path)
+    root = str(tmp_path / "runs")
+    assert main(["run", "example", "acme", str(scope_file), "--root", root]) == 0
+    pipeline = load_pipeline("example")
+    monkeypatch.setattr(pipeline, "resume_epoch", pipeline.resume_epoch + 1)
+
+    assert main([
+        "run", "example", "acme", str(scope_file), "--root", root, "--resume",
+    ]) == 0
+
+    coverage = json.loads((tmp_path / "runs" / "acme" / "coverage.json").read_text())
+    assert coverage["resume"] == {
+        "requested": True,
+        "effective": False,
+        "invalidation_reason": "pipeline_contract_changed",
+    }
+    assert not any(stage["status"] == "resume-skipped" for stage in coverage["stages"])
 
 
 def test_cli_persists_followup_lineage_and_composed_report(tmp_path, monkeypatch):

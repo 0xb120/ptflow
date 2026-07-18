@@ -204,7 +204,8 @@ class Activity:
     def state(self) -> Path:
         """Resume markers (one empty <stage>.done per completed activity/spanning stage). Hidden dir
         so it never shows among app groups; consulted only with --resume to skip already-done stages.
-        A stale-after-scope-change guard (orchestrate) invalidates all markers if scope.txt changed."""
+        Guards in orchestrate invalidate every marker when scope, effective config, or the pipeline's
+        graph/artifact contract changes; their hashes live alongside the markers."""
         return self.base / ".state"
 
     @property

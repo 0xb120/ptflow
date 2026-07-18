@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 class ExamplePipeline:
     name = "example"
+    resume_epoch = 1
     stages: Sequence[Stage] = (
         Stage("discover", tasks.discover),                                   # activity scope
         Stage("scope_scan", tasks.scope_scan, needs=("discover",), spanning=True),  # ∥ everything

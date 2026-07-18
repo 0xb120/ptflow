@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 class InternalPipeline:
     name = "internal"
+    resume_epoch = 1
     stages: Sequence[Stage] = (
         # BREADTH (whole-scope, one rate-controlled pass) — barrier before cluster
         Stage("expand", tasks.expand, net=False),           # mapcidr: CIDR → candidate IPs (offline transform)

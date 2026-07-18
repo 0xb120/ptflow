@@ -50,6 +50,7 @@ _AI_STAGES = ai.per_app_stages()
 
 class WebscanPipeline:
     name = "webscan"
+    resume_epoch = 1
     stages: Sequence[Stage] = (
         # BREADTH — minimal: no expansion, no active network scan. Just fingerprint the given targets.
         Stage("provision_wl", external.provision_wl, net=False),

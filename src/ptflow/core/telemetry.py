@@ -314,6 +314,8 @@ def begin_run(  # noqa: PLR0913
     fanout: int,
     net_limit: int,
     config_fingerprint: str | None = None,
+    pipeline_fingerprint: str | None = None,
+    resume_invalidation_reason: str | None = None,
 ) -> RunTrace:
     run_id = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
     started = _now()
@@ -324,10 +326,15 @@ def begin_run(  # noqa: PLR0913
         "activity": activity.base.name,
         "scope_sha256": hashlib.sha256(scope_text.encode()).hexdigest(),
         "config_sha256": config_fingerprint,
+        "pipeline_sha256": pipeline_fingerprint,
         "started_at": started,
         "finished_at": None,
         "status": "running",
-        "resume": {"requested": resume_requested, "effective": resume_effective},
+        "resume": {
+            "requested": resume_requested,
+            "effective": resume_effective,
+            "invalidation_reason": resume_invalidation_reason,
+        },
         "disabled_steps": sorted(disabled),
         "limits": {
             "fanout_workers": fanout,

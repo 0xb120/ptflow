@@ -45,7 +45,7 @@ Options:
 |------|--------------|
 | `--root DIR` | Parent directory for the activity. Output goes to `<root>/<activity>/`. Default: the current directory. |
 | `-v`, `--verbose` | Surface the exact command and full stdout/stderr of every tool on the console. The complete run log is **always** persisted to `<activity>/logs/run.log` regardless of this flag. |
-| `--resume` | Skip stages that a prior run of this activity already finished (`.state/<stage>.done` markers). Markers are invalidated automatically if the scope or effective run configuration changes. Older workspaces without a config fingerprint rerun once, then resume normally. |
+| `--resume` | Skip stages that a prior run of this activity already finished (`.state/<stage>.done` markers). Markers are invalidated automatically if scope, effective configuration, or the pipeline graph/artifact contract changes. Older workspaces without config/pipeline fingerprints rerun once, then resume normally. |
 | `--observe [API_URL]` | Stream this run to the Prefect UI (run graph + task states + per-stage logs). `API_URL` defaults to the local server (`http://127.0.0.1:4200/api`); start it first with `ptflow serve`. |
 | `--config PATH` | TOML file of operator knobs (profile, oast, tool paths, wordlists, …) instead of scattered env vars. See [`ptflow.toml.example`](ptflow.toml.example) and [Environment variables](#environment-variables). |
 | `--set KEY=VALUE` | Override one config knob, repeatable — highest precedence (e.g. `--set oast=on --set profile=home`). |
@@ -54,7 +54,8 @@ Options:
 Exit codes: **`0`** all stages OK · **`1`** one or more stages failed (CI/automation signal) · **`130`** interrupted with Ctrl-C — partial results are saved; resume with `--resume`.
 
 Every run initializes `coverage.json` under the activity directory with run/stage coverage
-(resume/disabled/failure status, logical dependencies, observed artifact I/O, command outcomes,
+(resume/disabled/failure status and invalidation reason, config/pipeline hashes, logical dependencies,
+observed artifact I/O, command outcomes,
 caps/drops, limits, and dependency inventory). After every app group completes the phase-2 surface
 DAST, the global `surface_checkpoint` writes an isolated snapshot under
 `checkpoints/surface/findings/` plus the early deterministic `reports/report-surface.md` / `.json`,

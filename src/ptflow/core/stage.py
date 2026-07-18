@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, Protocol
@@ -147,3 +149,52 @@ class Pipeline(Protocol):
         ...
 
     def provider(self) -> HypothesisProvider: ...
+
+
+def _callable_identity(value: object) -> str:
+    """Stable import identity for a stage/hook callable; never hashes source or filesystem paths."""
+    module = getattr(value, "__module__", type(value).__module__)
+    qualname = getattr(value, "__qualname__", type(value).__qualname__)
+    return f"{module}:{qualname}"
+
+
+def resume_contract(pipeline: Pipeline) -> dict[str, object]:
+    """Deterministic artifact contract used to decide whether completion markers are reusable.
+
+    The live graph catches structural rewiring automatically. ``resume_epoch`` is the explicit escape
+    hatch for semantic/output changes inside an otherwise-identical callable graph. It defaults to 1
+    for third-party/test pipelines, while built-in pipelines declare it explicitly.
+    """
+    epoch = getattr(pipeline, "resume_epoch", 1)
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        msg = f"pipeline {pipeline.name!r} resume_epoch must be a positive integer"
+        raise ValueError(msg)
+    cluster = getattr(pipeline, "cluster", None)
+    return {
+        "contract_schema": 1,
+        "pipeline": pipeline.name,
+        "resume_epoch": epoch,
+        "cluster": _callable_identity(cluster) if callable(cluster) else None,
+        "stages": [
+            {
+                "name": stage.name,
+                "run": _callable_identity(stage.run),
+                "needs": list(stage.needs),
+                "per_app": stage.per_app,
+                "phase": stage.phase,
+                "spanning": stage.spanning,
+                "cluster_scope": stage.cluster_scope,
+                "after_phase": stage.after_phase,
+                "net": stage.net,
+            }
+            for stage in pipeline.stages
+        ],
+    }
+
+
+def resume_contract_fingerprint(pipeline: Pipeline) -> str:
+    """SHA-256 of ``resume_contract``; stable across processes and insensitive to docs/log changes."""
+    encoded = json.dumps(
+        resume_contract(pipeline), separators=(",", ":"), sort_keys=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()

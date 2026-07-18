@@ -99,10 +99,10 @@ def test_resume_ok_invalidates_on_scope_change(tmp_path):
     from ptflow.core.paths import Activity
 
     act = Activity.named("acme", root=tmp_path).ensure()
-    assert orchestrator._resume_ok(act, "scopeA", resume=True) is True   # first run: records hash, honored
-    assert orchestrator._resume_ok(act, "scopeA", resume=True) is True   # same scope → resume honored
-    assert orchestrator._resume_ok(act, "scopeB", resume=True) is False  # changed scope → markers stale
-    assert orchestrator._resume_ok(act, "scopeB", resume=False) is False  # never resumes when not asked
+    assert orchestrator._resume_ok(act, "scopeA", resume=True) == (True, None)
+    assert orchestrator._resume_ok(act, "scopeA", resume=True) == (True, None)
+    assert orchestrator._resume_ok(act, "scopeB", resume=True) == (False, "scope_changed")
+    assert orchestrator._resume_ok(act, "scopeB", resume=False) == (False, None)
 
 
 def test_resume_ok_invalidates_on_config_change_and_migrates_legacy_state(tmp_path):
@@ -110,7 +110,7 @@ def test_resume_ok_invalidates_on_config_change_and_migrates_legacy_state(tmp_pa
 
     act = Activity.named("configured", root=tmp_path).ensure()
     assert orchestrator._resume_ok(
-        act, "scope", resume=True, config_fingerprint="config-a") is True
+        act, "scope", resume=True, config_fingerprint="config-a") == (True, None)
     assert (act.state / "config.sha").read_text() == "config-a"
     activity_marker = act.state / "httpx.done"
     app_marker = act.app("app").ensure().state / "crawl.done"
@@ -118,22 +118,61 @@ def test_resume_ok_invalidates_on_config_change_and_migrates_legacy_state(tmp_pa
     app_marker.parent.mkdir(parents=True)
     app_marker.write_text("")
     assert orchestrator._resume_ok(
-        act, "scope", resume=True, config_fingerprint="config-a") is True
+        act, "scope", resume=True, config_fingerprint="config-a") == (True, None)
     assert activity_marker.exists()
     assert app_marker.exists()
     assert orchestrator._resume_ok(
-        act, "scope", resume=True, config_fingerprint="config-b") is False
+        act, "scope", resume=True, config_fingerprint="config-b") == (False, "config_changed")
     assert not activity_marker.exists()
     assert not app_marker.exists()
     assert orchestrator._resume_ok(
-        act, "scope", resume=True, config_fingerprint="config-b") is True
+        act, "scope", resume=True, config_fingerprint="config-b") == (True, None)
 
     legacy = Activity.named("legacy", root=tmp_path).ensure()
-    assert orchestrator._resume_ok(legacy, "scope", resume=False) is False
+    assert orchestrator._resume_ok(legacy, "scope", resume=False) == (False, None)
     assert not (legacy.state / "config.sha").exists()
     assert orchestrator._resume_ok(
-        legacy, "scope", resume=True, config_fingerprint="config-a") is False
+        legacy, "scope", resume=True,
+        config_fingerprint="config-a",
+    ) == (False, "legacy_config_missing")
     assert (legacy.state / "config.sha").read_text() == "config-a"
+
+
+def test_resume_ok_invalidates_on_pipeline_contract_change_and_migrates_legacy_state(tmp_path):
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("contract", root=tmp_path).ensure()
+    assert orchestrator._resume_ok(
+        act, "scope", resume=False, config_fingerprint="config",
+        pipeline_fingerprint="pipeline-a",
+    ) == (False, None)
+    marker = act.state / "httpx.done"
+    marker.write_text("")
+    assert orchestrator._resume_ok(
+        act, "scope", resume=True, config_fingerprint="config",
+        pipeline_fingerprint="pipeline-a",
+    ) == (True, None)
+    assert marker.exists()
+
+    assert orchestrator._resume_ok(
+        act, "scope", resume=True, config_fingerprint="config",
+        pipeline_fingerprint="pipeline-b",
+    ) == (False, "pipeline_contract_changed")
+    assert not marker.exists()
+    assert (act.state / "pipeline.sha").read_text() == "pipeline-b"
+    assert orchestrator._resume_ok(
+        act, "scope", resume=True, config_fingerprint="config",
+        pipeline_fingerprint="pipeline-b",
+    ) == (True, None)
+
+    (act.state / "pipeline.sha").unlink()
+    marker.write_text("")
+    assert orchestrator._resume_ok(
+        act, "scope", resume=True, config_fingerprint="config",
+        pipeline_fingerprint="pipeline-b",
+    ) == (False, "legacy_pipeline_contract_missing")
+    assert not marker.exists()
+    assert (act.state / "pipeline.sha").read_text() == "pipeline-b"
 
 
 def test_per_app_loops_groups_by_phase_in_order():
