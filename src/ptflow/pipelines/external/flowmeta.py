@@ -176,27 +176,30 @@ FLOWMETA: dict[str, StepMeta] = {
         outputs=("endpoints_passive.txt",),
     ),
     "crawl": StepMeta(
-        summary="katana ∥ crawley (TIER 0, niente browser). katana è il downloader (-srd) + classifica "
-                "se l'app è JS-rendered; crawley è un 2° motore di discovery. Host deduplicati per body.",
-        commands=("katana -j -jc -jsl -kf all -fx -xhr -pc -fs fqdn -d 3 -c 2 -omit-body -srd responses/ [-H auth:webscan]",
+        summary="katana ∥ crawley (TIER 0, niente browser). katana è il downloader (-srd) e registra "
+                "una stima JS diagnostica; crawley è un 2° motore di discovery. Host deduplicati per body.",
+        commands=("katana -j -jc -jsl -kf all -fx -aff -xhr -pc -fs fqdn -d 3 -c 2 -omit-body -srd responses/ [-H auth:webscan]",
                   "crawley -headless -depth 3 -workers 15 -all -js -robots crawl [-header auth:webscan]   # per host",
-                  "# classify: <a href> raw + crawley vs fx-parsato (+ thin-shell) → crawl_class.json",
+                  "# classify diagnostico (NON gate): <a href> + crawley vs fx (+ thin-shell) → crawl_class.json",
                   "# parse_katana_requests → requests_crawl.jsonl (method/body/form/xhr, non solo URL)"),
         outputs=("endpoints.txt", "endpoints_crawley.txt", "crawl_class.json", "responses/",
                  "requests_crawl.jsonl"),
         notes=("-headless di crawley = salta la HEAD pre-flight, NON è un browser",
                "crawley non scarica i body → le sue URL diventano candidate per fetch_delta",
                "-omit-raw OFF + -fx/-xhr: tiene metodo/body/form/xhr nel catalogo richieste (DAST POST/JSON)",
+               "katana -aff sperimentale: compila e può inviare form reali anche nel pass non-headless",
                "auth passthrough: PTFLOW_HTTP_HEADER è webscan-only (ignorato da external)"),
     ),
     "crawl_headless": StepMeta(
-        summary="TIER 1 headless (katana -hl, chromium rod) — SOLO sul bucket JS-rendered (gate da "
-                "crawl_class.json). Rende la SPA ed estrae rotte JS + XHR/fetch irraggiungibili dal link-crawl.",
-        commands=("katana -hl -nos -jc -jsl -xhr -fx -iqp -fs fqdn -d 3 -c 5 -ct 180 -rl 50 -srd responses/headless/ [-H auth:webscan]",
-                  "# parse_katana_requests → requests_headless.jsonl (XHR/fetch POST/JSON della SPA)"),
+        summary="TIER 1 headless ALWAYS-ON (katana -hl, chromium rod) su ogni application group. "
+                "Esegue JS anche sulle non-SPA e osserva DOM/form action runtime, rotte e XHR/fetch.",
+        commands=("katana -hl -nos -jc -jsl -xhr -fx -aff -iqp -fs fqdn -d 3 -c 5 -ct 180 -rl 50 -srd responses/headless/ [-H auth:webscan]",
+                  "# parse_katana_requests → requests_headless.jsonl (form/XHR/fetch runtime, SPA e non-SPA)"),
         outputs=("endpoints_headless.txt", "responses/headless/", "requests_headless.jsonl"),
-        notes=("RAM 1-5 GB/host → max 2 processi headless concorrenti (semaforo process-wide) · -aff OFF",
-               "le chiamate XHR/fetch (spesso POST/JSON) entrano nel catalogo richieste — il fuzzer GET-only le perde"),
+        notes=("RAM 1-5 GB/host → max 2 processi headless concorrenti (semaforo process-wide)",
+               "crawl_class.json resta diagnostico: non può disattivare questo pass",
+               "-aff sperimentale: compila e può inviare form reali; il pass non è più read-only",
+               "form runtime e XHR/fetch (spesso POST/JSON) entrano nel catalogo — statico/GET-only li perde"),
     ),
     "subenum": StepMeta(
         summary="Enum passiva sugli apex scoperti del gruppo, filtrata live (su TUTTI gli host, alimenta takeover).",
@@ -429,7 +432,7 @@ FLOWMETA: dict[str, StepMeta] = {
             "# select_recrawl_seeds: hit 2xx il cui PRIMO SEGMENTO di path nessun URL crawlato usa",
             "#   (covered = (host, primo-segmento) di endpoints.txt+headless+store) → 1 seed shallow/segmento nuovo",
             "# PTFLOW_RECRAWL: off | preview (scrive raw/recrawl/seeds.txt, NON crawla) | on (default: crawla)",
-            "katana -jc -jsl -kf all -fx -xhr -fs fqdn -d 2 -c 2 -ct 120 -omit-body -srd responses/recrawl/ [-H auth]",
+            "katana -jc -jsl -kf all -fx -aff -xhr -fs fqdn -d 2 -c 2 -ct 120 -omit-body -srd responses/recrawl/ [-H auth]",
         ),
         outputs=("raw/recrawl/seeds.txt", "requests_recrawl.jsonl", "responses/recrawl/"),
         notes=("conservativo: solo regioni top-level nuove (un sotto-dir sotto una regione crawlata NON semina)",
@@ -591,6 +594,18 @@ FLOWMETA: dict[str, StepMeta] = {
                  "raw/cve_poc/surface/"),
         notes=("needs cve_lookup · net=True · nessun comando/payload arbitrario dal modello",
                "verifica solo con status + literal body/header matcher; altrimenti nessun finding verified"),
+    ),
+    "ai_credential_research": StepMeta(
+        summary="[--ai] FASE 2 — il research agent cerca e fetcha fonti pubbliche sulle credenziali "
+                "factory/default dei prodotti fingerprintati, poi propone solo candidati con URL e "
+                "riscontro letterale nella fonte. Non tenta alcun login.",
+        commands=("DuckDuckGo direct / Google Playwright search → fetch HTTP(S) o headless",
+                  "# loop bounded: engine/query/browser scelti dal modello; SSRF/redirect/size gate"),
+        outputs=("credential_research_observations.jsonl", "credential_candidates.jsonl",
+                 "raw/research/search_results.jsonl", "raw/research/sources.jsonl",
+                 "raw/research/trace.jsonl"),
+        notes=("needs cve_lookup (software_inventory) · agent:research · net=True · opt-in --ai",
+               "query senza hostname/IP target · candidate file 0600 · nessuna esecuzione credenziali"),
     ),
     "ai_secret_triage": StepMeta(
         summary="[--ai] FASE 4, offline — classifica i lead secret (real/test/noise) via LLM → "

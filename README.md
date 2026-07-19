@@ -235,11 +235,13 @@ expert defaults in the code; `profile` is the bundle for the rate-sensitive ones
 
 Install `uv sync --extra ai`, then use one of the ready configurations in
 [`configs/ai/`](configs/ai/). The default provider is local Ollama; a model must always be selected
-explicitly. `--ai` is equivalent to `--set ai.enabled=on`, while a preset can enable itself.
+explicitly. For headless research also run `uv sync --extra ai --extra ai-browser` and
+`uv run playwright install chromium`. `--ai` is equivalent to `--set ai.enabled=on`, while a preset
+can enable itself.
 
 | Variable | Values / default | What it does |
 |----------|------------------|--------------|
-| `PTFLOW_AI` | truthy to enable · default off | Enables contextual wordlists, policy-gated CVE PoC interpretation, secret-lead triage, cross-finding hypotheses, and `reports/report-ai.md` in `external` and `webscan`. |
+| `PTFLOW_AI` | truthy to enable · default off | Enables contextual wordlists, policy-gated CVE PoC interpretation, source-grounded credential research, secret-lead triage, cross-finding hypotheses, and `reports/report-ai.md`. Credential research also runs in `internal`; it proposes candidates but never attempts login. |
 | `PTFLOW_AI_PROVIDER` | `ollama` (default, local) · `ollama-cloud` · `openrouter` · `huggingface` · `openai-compatible` · legacy `openai` / `claude-code` | Selects the runtime backend. Named providers supply their standard endpoint. |
 | `PTFLOW_AI_MODEL` | required | Provider-specific model ID, kept explicit for reproducibility. |
 | `PTFLOW_AI_BASE_URL` | provider default | Overrides the endpoint; required for `openai-compatible`. |
@@ -250,11 +252,25 @@ explicitly. `--ai` is equivalent to `--set ai.enabled=on`, while a preset can en
 | `PTFLOW_AI_MAX_INPUT_TOKENS` / `PTFLOW_AI_MAX_OUTPUT_TOKENS` | `250000` / `30000` | Run-wide token budgets; estimates are used when a provider omits usage. |
 | `PTFLOW_AI_MAX_COST` | `0` (disabled) | Run-wide cost ceiling when the provider exposes cost metadata. |
 | `PTFLOW_AI_REMOTE_SECRETS` | `redacted` | Hosted-provider secret policy: `off`, `redacted`, or explicit `full`. |
+| `PTFLOW_RESEARCH_SEARCH_ENGINES` | `duckduckgo` | Enabled engines: `duckduckgo`, `google`, or both. DuckDuckGo supports direct HTML search; Google uses headless Chromium. No search proxy/API key is required. |
+| `PTFLOW_RESEARCH_BROWSER` | `auto` | `off`, `auto`, or `on`. In auto mode the model may use headless Chromium when the optional Playwright runtime is installed. |
+| `PTFLOW_RESEARCH_BROWSER_PATH` | auto-detected | Optional Chromium/Chrome executable. Common system paths are detected before Playwright’s bundled browser is used. |
+| `PTFLOW_RESEARCH_MAX_STEPS` / `MAX_SEARCHES` / `MAX_FETCHES` | `8` / `3` / `5` | Hard navigation budgets for each research invocation. |
+| `PTFLOW_RESEARCH_ALLOW_PRIVATE` | `off` | Whether fetched sources may resolve to private/non-global addresses. Keep off unless the RoE explicitly permits internal documentation research. |
 
-Each stage (`wordlist`, `cve_poc`, `secret_triage`, `triage`, `report`) can override `enabled`, `provider`,
+Each AI route (`wordlist`, `cve_poc`, `secret_triage`, `research`, `triage`, `report`) can override `enabled`, `provider`,
 `model`, `base_url`, and `max_output_tokens` under `[ai.stages.<name>]`; see the hybrid
 [`mixed.toml`](configs/ai/mixed.toml) setup. Provider usage is recorded without prompts or outputs in
 `<activity>/ai/usage.jsonl`.
+
+The `research` agent is stage-scoped and capability-limited: a stage declares `agents=("research",)`,
+and the orchestrator injects only that agent. Its model-directed loop chooses DuckDuckGo or Google,
+searches DuckDuckGo directly or Google through headless Chromium, fetches public HTTP(S) results,
+follows links discovered in fetched pages, and can request browser rendering for JavaScript sites.
+Redirects and browser requests pass through private-address SSRF gates; navigation, response/DOM
+size, and content type remain bounded. The first consumer is
+`ai_credential_research`, which writes source-grounded `credential_candidates.jsonl` with mode `0600`;
+it performs no authentication attempt.
 
 Credentials stay in standard environment variables and are never stored in the TOML snapshot:
 `OLLAMA_API_KEY` for Ollama Cloud, `OPENROUTER_API_KEY` for OpenRouter, `HF_TOKEN` for Hugging Face,

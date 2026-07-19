@@ -30,13 +30,14 @@ _AI_PROVIDERS = (
     "ollama", "ollama-cloud", "openrouter", "huggingface", "openai-compatible", "openai",
     "claude-code",
 )
-_AI_STAGE_NAMES = ("wordlist", "cve_poc", "secret_triage", "triage", "report")
+_AI_STAGE_NAMES = ("wordlist", "cve_poc", "secret_triage", "research", "triage", "report")
 _ENUMS = {
     "PTFLOW_PROFILE": ("wide", "home"),
     "PTFLOW_EXTERNAL_PORTSCAN_MODE": ("balanced", "exhaustive"),
     "PTFLOW_RECRAWL": ("off", "preview", "on"),
     "PTFLOW_AI_PROVIDER": _AI_PROVIDERS,
     "PTFLOW_AI_REMOTE_SECRETS": ("off", "redacted", "full"),
+    "PTFLOW_RESEARCH_BROWSER": ("off", "auto", "on"),
     "PTFLOW_DAST_AGGRESSION": ("low", "medium", "high"),
 }
 _KEY_ALIASES = {"ai": "ai.enabled"}  # legacy `ai=on`; canonical table-safe key is ai.enabled
@@ -44,6 +45,15 @@ _ROLES_PREFIX = "wordlists.roles."   # dynamic: wordlists.roles.<role> → PTFLO
 _STEPS_PREFIX = "steps."   # dynamic: steps.<pipeline>.<step> → per-step on/off (filters pipeline.stages)
 _STEPS_KEY_SEGMENTS = 3   # steps.<pipeline>.<step> — fewer segments is a malformed (unrecognized) key
 _ATOMIC_TABLES: frozenset[str] = frozenset()
+_POSITIVE_INT_ENVS = frozenset({
+    "PTFLOW_EXTERNAL_PORTSCAN_DEADLINE_SECONDS",
+    "PTFLOW_RESEARCH_MAX_STEPS",
+    "PTFLOW_RESEARCH_MAX_SEARCHES",
+    "PTFLOW_RESEARCH_MAX_FETCHES",
+    "PTFLOW_RESEARCH_MAX_RESULTS",
+    "PTFLOW_RESEARCH_TIMEOUT_SECONDS",
+    "PTFLOW_RESEARCH_MAX_BYTES",
+})
 
 
 class Knob(NamedTuple):
@@ -91,6 +101,16 @@ _KNOBS: tuple[Knob, ...] = (
     *(Knob(f"ai.stages.{stage}.max_output_tokens",
            f"PTFLOW_AI_STAGE_{stage.upper()}_MAX_OUTPUT_TOKENS", "int")
       for stage in _AI_STAGE_NAMES),
+    Knob("agents.research.search_engines", "PTFLOW_RESEARCH_SEARCH_ENGINES", "str"),
+    Knob("agents.research.browser", "PTFLOW_RESEARCH_BROWSER", "str"),
+    Knob("agents.research.browser_path", "PTFLOW_RESEARCH_BROWSER_PATH", "path"),
+    Knob("agents.research.max_steps", "PTFLOW_RESEARCH_MAX_STEPS", "int"),
+    Knob("agents.research.max_searches", "PTFLOW_RESEARCH_MAX_SEARCHES", "int"),
+    Knob("agents.research.max_fetches", "PTFLOW_RESEARCH_MAX_FETCHES", "int"),
+    Knob("agents.research.max_results", "PTFLOW_RESEARCH_MAX_RESULTS", "int"),
+    Knob("agents.research.timeout_seconds", "PTFLOW_RESEARCH_TIMEOUT_SECONDS", "int"),
+    Knob("agents.research.max_bytes", "PTFLOW_RESEARCH_MAX_BYTES", "int"),
+    Knob("agents.research.allow_private", "PTFLOW_RESEARCH_ALLOW_PRIVATE", "bool"),
     Knob("dast.aggression", "PTFLOW_DAST_AGGRESSION", "str"),
     Knob("dast.fuzz_param_frequency", "PTFLOW_DAST_FUZZ_PARAM_FREQUENCY", "int"),
     Knob("dast.packs", "PTFLOW_DAST_PACKS", "json"),
@@ -195,7 +215,14 @@ def _validate(env: str, value: str) -> None:
         except json.JSONDecodeError as exc:
             msg = f"invalid {env}: {exc}"
             raise ConfigError(msg) from exc
-    if env == "PTFLOW_EXTERNAL_PORTSCAN_DEADLINE_SECONDS":
+    if env == "PTFLOW_RESEARCH_SEARCH_ENGINES":
+        engines = {item.strip() for item in value.replace(";;", ",").split(",") if item.strip()}
+        invalid = engines - {"duckduckgo", "google"}
+        if not engines or invalid:
+            expected = "duckduckgo, google"
+            msg = f"invalid {env}={value!r} — expected one or more of {expected}"
+            raise ConfigError(msg)
+    if env in _POSITIVE_INT_ENVS:
         try:
             valid = int(value) > 0
         except ValueError:

@@ -107,12 +107,13 @@ RSYNC = _resolve("PTFLOW_RSYNC", "rsync")
 SHOWMOUNT = _resolve("PTFLOW_SHOWMOUNT", "/usr/sbin/showmount", "showmount")  # nfs-utils (often /usr/sbin)
 SNMPWALK = _resolve("PTFLOW_SNMPWALK", "snmpwalk")                       # net-snmp (post-hit walk)
 DIG = _resolve("PTFLOW_DIG", "dig")                                       # DNS zone-transfer (AXFR)
+BRUTUS = _resolve("PTFLOW_BRUTUS", f"{_HOME}/go/bin/brutus", "brutus")  # default-cred tester (opt-in)
 
 _CORE_TOOLS = {"mapcidr": MAPCIDR, "naabu": NAABU, "nmap": NMAP, "nerva": NERVA}
 _OPTIONAL_TOOLS = {"nuclei": NUCLEI, "netexec": NXC, "search_vulns": SEARCH_VULNS,
                    "onesixtyone": ONESIXTYONE, "ldapsearch": LDAPSEARCH,
                    "scrying": SCRYING, "rsync": RSYNC, "showmount": SHOWMOUNT, "snmpwalk": SNMPWALK,
-                   "dig": DIG}
+                   "dig": DIG, "brutus": BRUTUS}
 
 # --- tunables (rates conservative for live internal infra — legacy/OT gear is fragile) -----------
 # Aggregate load ~= concurrency x rate; a full connect-scan flood can knock over old devices and
@@ -1497,6 +1498,7 @@ _CONSOLIDATE_SOURCES: dict[str, tuple[str, ...]] = {
     "netbios.jsonl": ("findings/netbios.jsonl",),
     "dns.jsonl": ("findings/dns.jsonl",),
     "remote_desktop.jsonl": ("findings/remote_desktop.jsonl",),
+    "creds.jsonl": ("findings/creds_brutus.jsonl", "findings/creds_forms.jsonl"),
 }
 # nuclei_scope AND cve_full are written whole-scope at the activity level (like external) — not lifted
 # here (the full-port CVE delta is activity-scoped, the gemini of the whole-scope nuclei_scope).
@@ -1536,6 +1538,8 @@ def consolidate(activity: Activity) -> dict[str, int]:
         if records:                            # never delete on empty — see docstring (--resume safety)
             counts[out_name.removesuffix(".jsonl")] = tools.write_jsonl(
                 activity.findings / out_name, records)
+            if out_name == "creds.jsonl":
+                (activity.findings / out_name).chmod(0o600)
     web = aggregate_web_targets(activity)
     log.info("  → consolidate — %s · %d web service(s) → %s",
              ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "no per-subnet findings",

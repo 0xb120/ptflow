@@ -284,6 +284,32 @@ def test_ai_cve_poc_stage_routing_resolves():
     assert envs["PTFLOW_AI_STAGE_CVE_POC_MAX_OUTPUT_TOKENS"] == "6000"
 
 
+def test_research_agent_and_route_controls_resolve():
+    envs = _envmap(runconfig.resolve({
+        "ai": {"stages": {"research": {
+            "enabled": True, "provider": "ollama", "model": "local",
+        }}},
+        "agents": {"research": {
+            "search_engines": "duckduckgo,google", "browser": "auto",
+            "browser_path": "/usr/bin/chromium", "max_steps": 6,
+            "max_searches": 2, "max_fetches": 4, "allow_private": False,
+        }},
+    }, {}, None))
+    assert envs["PTFLOW_AI_STAGE_RESEARCH_ENABLED"] == "on"
+    assert envs["PTFLOW_RESEARCH_SEARCH_ENGINES"] == "duckduckgo,google"
+    assert envs["PTFLOW_RESEARCH_BROWSER"] == "auto"
+    assert envs["PTFLOW_RESEARCH_BROWSER_PATH"] == "/usr/bin/chromium"
+    assert envs["PTFLOW_RESEARCH_MAX_STEPS"] == "6"
+    assert envs["PTFLOW_RESEARCH_MAX_SEARCHES"] == "2"
+    assert envs["PTFLOW_RESEARCH_MAX_FETCHES"] == "4"
+    assert envs["PTFLOW_RESEARCH_ALLOW_PRIVATE"] == "off"
+
+    with pytest.raises(runconfig.ConfigError, match="positive integer"):
+        runconfig.resolve({"agents": {"research": {"max_steps": 0}}}, {}, None)
+    with pytest.raises(runconfig.ConfigError, match="expected one or more"):
+        runconfig.resolve({"agents": {"research": {"search_engines": "bing"}}}, {}, None)
+
+
 def test_ai_stage_provider_enum_rejects_unknown():
     with pytest.raises(runconfig.ConfigError):
         runconfig.resolve({"ai": {"stages": {"report": {"provider": "anthropic"}}}}, {})

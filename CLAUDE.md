@@ -296,8 +296,8 @@ Never write path literals in tasks/flows. All paths come from `Activity` (activi
     <app_id>/                            # one clustered app group (per-app loops)
       meta.json  hosts.txt  endpoints.txt  subs.txt  takeover.txt  …
       endpoints_passive.txt  endpoints_crawley.txt   #   discovery sources fetch_delta downloads
-      crawl_class.json                   #   JS-render verdict + signals (gates crawl_headless)
-      endpoints_headless.txt             #   gated headless crawl (JS-rendered apps only)
+      crawl_class.json                   #   diagnostic JS-render/yield signals (headless_policy=always)
+      endpoints_headless.txt             #   always-on browser crawl (all application groups)
       screenshot.png                     #   per-group shot, reconciled from the batched run (or screenshot.failed)
       screenshot.json                    #   per-group fingerprint (status/title/server/tech/header_signals)
       default_creds.jsonl                #   EyeWitness signature-based default-cred leads (optional)
@@ -455,7 +455,7 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     fuzz, then DAST the guessed surface. The clean split (explorable vs guessed) also keeps each DAST
     pass scoped — phase 6 fuzzes only the delta, never re-DASTing the surface phase 2 already covered.
   - **Loop 1 — explorable surface** (`phase=1`, NO guessing): `passive_probe` → `crawl` (katana ∥
-    crawley + JS-render classification, see below) → `crawl_headless` (gated TIER-1 headless, ∥
+    crawley + diagnostic JS-render estimate, see below) → `crawl_headless` (always-on TIER-1, ∥
     takeover) ; `subenum` ; `takeover` (← crawl + subenum) ; `fetch_delta` (OSINT delta) →
     `mine_responses` (offline: extract the corpus + jsluice endpoints) ; `api_spec` (∥, well-known
     OpenAPI/Swagger/GraphQL → `requests_api.jsonl`). The tail `request_catalog` (offline) assembles the
@@ -607,33 +607,35 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
 ### Fetch once, mine offline
 
 Loop 1 `crawl` runs **two crawlers in parallel** (`ThreadPoolExecutor`) for maximum coverage:
-- **katana** is the **downloader** — `katana -j -jc -jsl -kf all -fx -pc -fs fqdn -srd <responses/>`
+- **katana** is the **downloader** — `katana -j -jc -jsl -kf all -fx -aff -pc -fs fqdn -srd <responses/>`
   (depth ≥3 for `-kf`): it parses JS endpoints, known files and forms inline (so `endpoints.txt` is
   JS-/form-enriched) **and** stores every response body under `scans/<app_id>/responses/` (`-omit-body`
   only trims stdout; `-srd` still writes full bodies to disk). It's the downloader for the linked
-  surface — don't fetch the same bytes twice.
+  surface — don't fetch the same bytes twice. `-aff` is experimental and can submit real forms, so
+  Katana discovery is an active interaction rather than a read-only crawl.
 - **crawley** is a second **discovery** engine — `crawley -headless -all -js -robots crawl` per host
   (one positional URL each). It only finds URLs (no body store), so its discoveries
   (`endpoints_crawley.txt`) join the passive sources as `fetch_delta` candidates. (`-headless` here =
   skip the HEAD pre-flight, **not** browser rendering.)
 
-These two are the **TIER-0** cheap layer (no browser). `crawl` then **classifies** each app for the
-gated headless pass (`is_js_rendered`, recorded in `crawl_class.json`): it compares the raw `<a href>`
-count of the stored root page + the crawley surface against the JS-parsed (`-fx`) count, plus
-thin-shell framework markers (Next/Nuxt/Angular). The validated signal (crawler benchmark) is that
-headless **only** pays off when the non-headless link surface is small yet JS-parse finds far more —
-a React/"finto-SPA" with a healthy link surface is traditional and skips the browser. **No framework
-label / `is_spa` heuristic** — that was unreliable (a "React" app can behave traditionally).
+These two are the **TIER-0** cheap layer (no browser). `crawl` also computes the historical
+`is_js_rendered` estimate in `crawl_class.json`: raw `<a href>` count + crawley surface versus the
+JS-parsed (`-fx`) count, with thin-shell framework markers (Next/Nuxt/Angular). This is now only a
+diagnostic for expected marginal URL yield and cost analysis; it **never gates execution**. A healthy
+traditional link surface does not prove that the runtime DOM is equivalent to the static HTML: a
+non-SPA can still rewrite form actions or issue security-relevant requests in JavaScript.
 
 **`crawl_headless`** is the **TIER-1** pass: headless katana
-(`-hl -nos -jc -jsl -xhr -fx -iqp -fs fqdn -ct`, bundled rod chromium, `-aff` OFF) run **only** on the
-JS-rendered bucket. It renders the SPA and extracts JS-built routes + XHR/fetch URLs link-crawling
-can't reach, storing bodies under `responses/headless/` (mined offline like the rest). Browser RAM
+(`-hl -nos -jc -jsl -xhr -fx -aff -iqp -fs fqdn -ct`, bundled rod chromium) run **always on every
+application group**. It executes JavaScript on both SPA and traditional apps, observes runtime-mutated
+DOM/form actions, and extracts JS-built routes + XHR/fetch URLs link-crawling cannot reliably reach,
+storing bodies under `responses/headless/` (mined offline like the rest). Browser RAM
 (1-5 GB/host) is the scale constraint, so concurrent headless processes are capped **process-wide** by
 a module `BoundedSemaphore` (`HEADLESS_PARALLELISM`, since the `ThreadPoolTaskRunner` runs every stage
 in one process), and `-ct` bounds each host. Its `endpoints_headless.txt` is folded into the phase-3
 `build_wordlist` (like `endpoints_js.txt`), and its `-srd` store joins the "already have" set so
-`fetch_delta` doesn't re-download it.
+`fetch_delta` doesn't re-download it. `-aff` enables Katana's experimental automatic form filling and
+can submit real forms: this tier is active interaction, not read-only rendering.
 
 A separate downloader is justified only for URLs neither crawl-stored — and only over that delta:
 the `fetch_delta` step (`passive_delta` + httpx `-srd`) downloads the live delta — passive
@@ -1583,21 +1585,22 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
   breaks the stable `app_id` contract); LSH/simhash near-dup and a `recluster` deep-path pass
   (deferred, not needed yet).
 
-- **Gated headless crawl keyed on a *measured* JS-render signal, not a framework label.** `crawl`
-  classifies each app (`is_js_rendered`: raw `<a href>` vs the JS-parsed/crawley surface + thin-shell
-  markers, recorded in `crawl_class.json`); `crawl_headless` renders only the JS bucket, RAM-capped by
-  a process-wide semaphore. *Why:* the benchmark showed framework labels lie (a "React" app can behave
-  traditionally), and headless RAM (1-5 GB/host) is the scale constraint. *Rejected:* the old `is_spa`
-  framework-keyword heuristic (removed); a Prefect per-stage concurrency tag for the RAM cap (the
-  semaphore works because `ThreadPoolTaskRunner` is one process); `-sc`/system-chrome (hangs for
-  katana here — uses the bundled rod chromium). It was a slip-of-the-tongue "nuclei -headless" → the
-  intent was katana crawling.
+- **Always-on headless crawl; the measured JS-render signal is diagnostic only.** `crawl` still
+  records `is_js_rendered` (raw `<a href>` vs JS-parsed/crawley surface + thin-shell markers) in
+  `crawl_class.json`, but `crawl_headless` renders every application group and is RAM-capped by a
+  process-wide semaphore. *Why:* a real non-SPA case rewrote a vulnerable form action at runtime;
+  static coverage and framework labels cannot safely prove browser execution is unnecessary. The
+  benchmark signal remains useful for comparing marginal URL yield and cost, but recall wins for a
+  one-shot engagement. *Rejected:* using either `is_spa` or `is_js_rendered` as an execution gate; a
+  Prefect per-stage concurrency tag for the RAM cap (the semaphore works because
+  `ThreadPoolTaskRunner` is one process); `-sc`/system-chrome (hangs for katana here — uses bundled rod
+  chromium). It was a slip-of-the-tongue "nuclei -headless" → the intent was katana crawling.
 
-- **Two crawlers run in parallel (`katana ∥ crawley`); no SPA detection.** *Why:* the benchmark's best
+- **Two crawlers run in parallel (`katana ∥ crawley`); no SPA execution gate.** *Why:* the benchmark's best
   coverage/cost knee was katana-fx + crawley; crawley adds form-POST/asset URLs katana-fx misses at
   ~zero marginal cost in parallel. katana is the downloader (`-srd` store for offline mining); crawley
-  is pure URL discovery → its URLs join the `fetch_delta` candidates. SPA handling moved to the gated
-  headless pass above, so the old SPA-detection + katana `-headless` branch was removed.
+  is pure URL discovery → its URLs join the `fetch_delta` candidates. Runtime rendering lives in the
+  always-on headless pass above; the old framework-based SPA branch remains removed.
 
 ## Pin to keep
 

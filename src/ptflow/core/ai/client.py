@@ -51,6 +51,7 @@ _DEFAULT_STAGE_MAX_TOKENS = {
     "wordlist": 2_000,
     "cve_poc": 6_000,
     "secret_triage": 4_000,
+    "research": 4_000,
     "triage": 8_000,
     "report": 12_000,
 }

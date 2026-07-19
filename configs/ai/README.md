@@ -83,7 +83,9 @@ model = "openai/gpt-oss-20b"
 max_output_tokens = 12000
 ```
 
-The stage names are `wordlist`, `cve_poc`, `secret_triage`, `triage`, and `report`. `cve_poc` never
+The AI route names are `wordlist`, `cve_poc`, `secret_triage`, `research`, `triage`, and `report`.
+`research` searches DuckDuckGo directly and/or Google through Playwright/Chromium rendering;
+its first consumer proposes source-grounded factory/default credentials without attempting login. `cve_poc` never
 executes Nuclei or model-supplied commands: it can issue only one policy-validated target-local
 GET/HEAD/OPTIONS request, otherwise it records `manual_review`.
 

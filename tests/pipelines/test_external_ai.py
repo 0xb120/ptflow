@@ -320,6 +320,7 @@ def test_ai_stages_absent_when_off(monkeypatch):
     assert "ai_secret_triage" not in names
     assert "ai_cve_poc" not in names
     assert "ai_cve_poc_full" not in names
+    assert "ai_credential_research" not in names
 
 
 def test_ai_stages_present_when_on(monkeypatch):
@@ -330,6 +331,7 @@ def test_ai_stages_present_when_on(monkeypatch):
     assert "ai_secret_triage" in names
     assert "ai_cve_poc" in names
     assert "ai_cve_poc_full" in names
+    assert "ai_credential_research" in names
     by_name = {s.name: s for s in p.PIPELINE.stages}
     assert by_name["ai_wordlist"].phase == 2
     assert by_name["ai_wordlist"].net is False
@@ -337,6 +339,9 @@ def test_ai_stages_present_when_on(monkeypatch):
     assert by_name["ai_cve_poc"].phase == 2
     assert by_name["ai_cve_poc"].needs == ("cve_lookup",)
     assert by_name["ai_cve_poc"].net is True
+    assert by_name["ai_credential_research"].phase == 2
+    assert by_name["ai_credential_research"].needs == ("cve_lookup",)
+    assert by_name["ai_credential_research"].agents == ("research",)
     assert by_name["ai_cve_poc_full"].phase == 4
     assert by_name["ai_cve_poc_full"].needs == ("cve_lookup_full",)
     monkeypatch.delenv("PTFLOW_AI", raising=False)

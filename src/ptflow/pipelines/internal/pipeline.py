@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from ptflow.core.agent import HypothesisProvider, StubProvider
 from ptflow.core.stage import Stage
-from ptflow.pipelines.internal import tasks
+from ptflow.pipelines.internal import ai, tasks
 
 if TYPE_CHECKING:
     from ptflow.core.flowmap import MapSpec
     from ptflow.core.paths import Activity
     from ptflow.core.requirements import Requirement
     from ptflow.core.stage import Followup
+
+
+_AI = os.getenv("PTFLOW_AI", "").strip().lower() in {"1", "on", "true", "yes"}
+_AI_STAGES = ai.per_app_stages()
 
 
 class InternalPipeline:
@@ -55,6 +60,7 @@ class InternalPipeline:
         Stage("netbios_checks", tasks.netbios_checks, per_app=True, phase=2),  # NetBIOS identity (137/UDP)
         Stage("dns_checks", tasks.dns_checks, per_app=True, phase=2),     # DNS AXFR (reverse-zone map)
         Stage("remote_desktop", tasks.remote_desktop, per_app=True, phase=2),
+        *(_AI_STAGES if _AI else ()),
     )
 
     def cluster(self, activity: Activity) -> list[str]:

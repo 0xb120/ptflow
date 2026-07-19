@@ -254,6 +254,18 @@ FLOWMETA: dict[str, StepMeta] = {
                "gli screenshot sono ri-homati in scans/<subnet>/screenshots/ e referenziati dai finding",
                "no password spraying: solo cattura di ciò che è esposto (i check con credenziali sono futuri)"),
     ),
+    "ai_credential_research": StepMeta(
+        summary="[--ai] LOOP 2 — research agent sulle identità prodotto/versione di services.jsonl: "
+                "cerca fonti pubbliche, naviga risultati e link scoperti e propone credenziali "
+                "factory/default source-grounded. Nessun tentativo di login.",
+        commands=("DuckDuckGo direct / Google Playwright search → HTTP(S) o headless",
+                  "# agent loop engine/query/browser + multi-hop → credential_candidates.jsonl"),
+        outputs=("credential_research_observations.jsonl", "credential_candidates.jsonl",
+                 "raw/research/search_results.jsonl", "raw/research/sources.jsonl",
+                 "raw/research/trace.jsonl"),
+        notes=("agent:research · net=True · opt-in --ai · non invia IP/hostname nelle query",
+               "solo proposte documentate; password file mode 0600; nessun password spraying"),
+    ),
 }
 
 _PIVOT = StepMeta(

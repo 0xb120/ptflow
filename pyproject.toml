@@ -18,9 +18,13 @@ ai = [
 ai-claude = [
     "claude-agent-sdk>=0.2.110",
 ]
+ai-browser = [
+    "playwright>=1.50.0",
+]
 ai-all = [
     "claude-agent-sdk>=0.2.110",
     "openai>=2.44.0",
+    "playwright>=1.50.0",
 ]
 
 [build-system]

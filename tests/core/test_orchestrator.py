@@ -67,6 +67,11 @@ def test_stage_tags_omit_net_for_offline():
     assert "net" not in orchestrator._stage_tags(offline)   # offline stage not counted against net cap
 
 
+def test_stage_tags_include_declared_agents():
+    tagged = Stage("research", lambda *_: None, net=False, agents=("research",))
+    assert orchestrator._stage_tags(tagged) == ["breadth", "agent:research"]
+
+
 def test_net_slots_is_bounded_semaphore():
     import threading
 
@@ -93,6 +98,34 @@ def test_marker_path(tmp_path):
     act = Activity.named("acme", root=tmp_path)
     assert orchestrator._marker(act, "httpx", None) == act.state / "httpx.done"
     assert orchestrator._marker(act, "crawl", "app1") == act.app("app1").state / "crawl.done"
+
+
+def test_run_stage_injects_only_declared_agents(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from ptflow.core.paths import Activity
+
+    captured = {}
+    custom = SimpleNamespace(name="custom", available=True)
+
+    def run(activity, *, agents):
+        captured["activity"] = activity.base
+        captured["agent"] = agents.require("custom")
+
+    class Pipeline:
+        name = "p"
+        stages = (Stage("use_agent", run, net=False, agents=("custom",)),)
+
+        @staticmethod
+        def agent_factories():
+            return {"custom": lambda _context: custom}
+
+    Activity.named("a", root=tmp_path).ensure()
+    monkeypatch.setattr(orchestrator, "load_pipeline", lambda _name: Pipeline())
+
+    orchestrator._run_stage.fn("p", "a", str(tmp_path), "use_agent", None, None, resume=False)
+
+    assert captured == {"activity": tmp_path / "a", "agent": custom}
 
 
 def test_resume_ok_invalidates_on_scope_change(tmp_path):

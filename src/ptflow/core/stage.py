@@ -65,8 +65,19 @@ class Stage:
     global network-concurrency cap (``_NET_SLOTS``); set ``net=False`` for purely offline stages
     (wordlist tokenisation, response-store mining, wordlist provisioning) so they neither claim a
     network slot nor get the ``net`` tag."""
+    agents: tuple[str, ...] = field(default_factory=tuple)
+    """Named runtime agents injected into this stage through an ``agents=AgentAccess`` keyword.
+
+    Agent declarations are metadata, not dependency edges: the orchestrator resolves only the named
+    agents immediately before calling the stage, so existing stage signatures and pipelines stay
+    unchanged. A stage that declares agents must accept the keyword argument explicitly (or through
+    ``**kwargs``). Agent names are included in the resume contract and Prefect tags.
+    """
 
     def __post_init__(self) -> None:
+        if any(not name.strip() for name in self.agents) or len(set(self.agents)) != len(self.agents):
+            msg = "agents must contain unique, non-blank names"
+            raise ValueError(msg)
         if self.after_phase is None:
             return
         if self.after_phase < 1:
@@ -186,6 +197,7 @@ def resume_contract(pipeline: Pipeline) -> dict[str, object]:
                 "cluster_scope": stage.cluster_scope,
                 "after_phase": stage.after_phase,
                 "net": stage.net,
+                "agents": list(stage.agents),
             }
             for stage in pipeline.stages
         ],

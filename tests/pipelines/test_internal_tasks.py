@@ -530,15 +530,20 @@ def test_followups_no_web_service_is_noop(tmp_path, monkeypatch):
 
 # --- pipeline object shape ---------------------------------------------------------------------
 def test_pipeline_object_shape():
+    import os
+
     from ptflow.pipelines.internal.pipeline import PIPELINE
 
     assert PIPELINE.name == "internal"
     names = [s.name for s in PIPELINE.stages]
-    assert names == ["expand", "discover", "portscan", "portscan_full", "nuclei_scope",
-                     "fingerprint_full", "cve_lookup_full", "fingerprint",
-                     "cve_lookup", "smb_checks", "ad_enum", "adcs_checks", "kerberoast_asrep",
-                     "datastore_checks", "snmp_checks", "ldap_checks", "ftp_checks", "telnet_checks",
-                     "nfs_checks", "rsync_checks", "netbios_checks", "dns_checks", "remote_desktop"]
+    expected = ["expand", "discover", "portscan", "portscan_full", "nuclei_scope",
+                "fingerprint_full", "cve_lookup_full", "fingerprint",
+                "cve_lookup", "smb_checks", "ad_enum", "adcs_checks", "kerberoast_asrep",
+                "datastore_checks", "snmp_checks", "ldap_checks", "ftp_checks", "telnet_checks",
+                "nfs_checks", "rsync_checks", "netbios_checks", "dns_checks", "remote_desktop"]
+    if os.getenv("PTFLOW_AI", "").strip().lower() in {"1", "on", "true", "yes"}:
+        expected.append("ai_credential_research")
+    assert names == expected
     by_name = {s.name: s for s in PIPELINE.stages}
     assert by_name["fingerprint"].per_app is True
     assert by_name["fingerprint"].phase == 1
@@ -561,6 +566,10 @@ def test_pipeline_object_shape():
     assert by_name["kerberoast_asrep"].phase == 2
     assert by_name["cve_lookup"].net is False  # offline CVE correlation
     assert by_name["expand"].net is False
+    if "ai_credential_research" in by_name:
+        assert by_name["ai_credential_research"].agents == ("research",)
+        assert by_name["ai_credential_research"].phase == 2
+        assert by_name["ai_credential_research"].net is True
 
 
 def test_load_pipeline_resolves_internal():
@@ -579,3 +588,26 @@ def test_requirements_manifest_covers_internal_tool_dicts():
     # internal's OWN toolset (nmap/netexec/…), not external's web toolchain
     assert by_name["nmap"].kind == "core"
     assert "netexec" in by_name
+
+
+def test_requirements_include_brutus_as_optional():
+    brutus = [r for r in tasks.requirements() if r.name == "brutus"]
+    assert brutus
+    assert brutus[0].kind == "optional"
+
+
+def test_consolidate_folds_and_locks_down_creds(tmp_path):
+    activity = Activity.named("a", root=tmp_path).ensure()
+    ws = activity.app("10.0.0.0-24")
+    ws.root.mkdir(parents=True, exist_ok=True)
+    (ws.root / "meta.json").write_text("{}")
+    tools.write_jsonl(ws.findings / "creds_brutus.jsonl",
+                      [{"type": "default-credentials", "host": "10.0.0.5", "password": "s3cr3t"}])
+    tools.write_jsonl(ws.findings / "creds_forms.jsonl",
+                      [{"type": "default-credentials", "host": "10.0.0.6", "password": "admin"}])
+    tasks.consolidate(activity)
+    out = activity.findings / "creds.jsonl"
+    records = tools.read_jsonl(out)
+    assert {r["host"] for r in records} == {"10.0.0.5", "10.0.0.6"}
+    assert all(r["app_id"] == "10.0.0.0-24" for r in records)
+    assert (out.stat().st_mode & 0o777) == 0o600

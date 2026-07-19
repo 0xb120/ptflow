@@ -41,7 +41,7 @@ rerun, lifecycle degli artefatti e CI restano attività utili, ma sono deliberat
 | Area | Copertura attuale | Valutazione |
 | --- | --- | --- |
 | Asset discovery external | DNS, TLS/PTR, wildcard enumeration, porte web, top-1000/full, HTTP fingerprint | Forte |
-| Surface web | Katana, Crawley, headless condizionale, passive URL, forced browsing a feedback loop | Forte ma poco interattiva |
+| Surface web | Katana, Crawley, headless always-on con form filling, passive URL, forced browsing a feedback loop | Forte sul runtime DOM; restano scoperte le interazioni multi-step |
 | Request catalog | Crawl, form, XHR, JS, OpenAPI parziale, cross-group routing | Buona base |
 | Hidden parameter | Query, body, JSON e header con Arjun/x8 | Buona, limitata dai cap e dalla selezione |
 | Injection | Nuclei DAST, Dalfox, SQLmap, pack PTFlow | Forte sulle classi classiche |

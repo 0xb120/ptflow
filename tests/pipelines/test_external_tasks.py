@@ -289,7 +289,7 @@ def test_pipeline_object_shape():
     # subenum ∥ passive_probe/crawl; takeover waits for both crawl and subenum
     assert by_name["subenum"].needs == ()
     assert set(by_name["takeover"].needs) == {"crawl", "subenum"}
-    # gated headless crawl is a loop-1 step that needs the cheap crawl (for the classification)
+    # always-on headless waits for crawl so the cheap surface and diagnostic classifier are complete
     assert by_name["crawl_headless"].needs == ("crawl",)
     # screenshot is a post-cluster spanning step (cluster_scope), NOT a per-app loop-1 step
     assert by_name["screenshot"].cluster_scope is True
@@ -777,16 +777,58 @@ def test_has_thin_shell_marker():
 
 
 def test_is_js_rendered_matches_benchmark_cases():
-    # JS-rendered (headless wins big): small non-headless link surface, fx dwarfs it
+    # diagnostic high-yield bucket: small non-headless link surface, fx dwarfs it
     assert tasks.is_js_rendered(raw_href=8, fx=106, crawley=27, marker=False)   # telepass Next.js SSR
     assert tasks.is_js_rendered(raw_href=5, fx=124, crawley=6, marker=False)    # octofence Nuxt thin-shell
-    # traditional / finto-SPA (headless = pure cost): a healthy link surface short-circuits
+    # diagnostic lower-yield bucket: a healthy traditional link surface short-circuits
     assert not tasks.is_js_rendered(raw_href=6, fx=29, crawley=114, marker=False)    # academy (the trap)
     assert not tasks.is_js_rendered(raw_href=50, fx=263, crawley=110, marker=False)  # testfire classic
-    # a thin-shell marker forces headless even with tiny counts
+    # a thin-shell marker puts the diagnostic in the JS-rendered bucket even with tiny counts
     assert tasks.is_js_rendered(raw_href=2, fx=0, crawley=1, marker=True)
-    # ...but a healthy link surface wins over the marker (don't pay for a browser)
+    # ...but a healthy link surface wins over the marker in the diagnostic
     assert not tasks.is_js_rendered(raw_href=0, fx=0, crawley=200, marker=True)
+
+
+def test_crawl_headless_always_runs_and_enables_automatic_form_fill(monkeypatch, tmp_path):
+    from ptflow.core import tools, workspace
+    from ptflow.core.paths import Activity
+
+    act = Activity.named("headless-aff", root=tmp_path).ensure()
+    ws = act.app("app").ensure()
+    tools.write_lines(ws.hosts, ["https://example.test"])
+    workspace.write_meta(ws.meta, {"body_by_host": {}})
+    calls: list[list[str]] = []
+
+    def fake_run(_tool, command, **_kwargs):
+        calls.append(list(command))
+        return ""
+
+    monkeypatch.setattr(tasks, "_run", fake_run)
+
+    tasks.crawl_headless(act, "app")
+
+    [command] = calls
+    assert "-hl" in command
+    assert command[command.index("-fx") + 1] == "-aff"
+
+
+def test_standard_katana_enables_automatic_form_fill(monkeypatch, tmp_path):
+    from ptflow.core.paths import AppWorkspace
+
+    ws = AppWorkspace(tmp_path / "app").ensure()
+    calls: list[list[str]] = []
+
+    def fake_run(_tool, command, **_kwargs):
+        calls.append(list(command))
+        return ""
+
+    monkeypatch.setattr(tasks, "_run", fake_run)
+
+    tasks._run_katana(ws, ["https://example.test"], "app")
+
+    [command] = calls
+    assert "-hl" not in command
+    assert command[command.index("-fx") + 1] == "-aff"
 
 
 def test_parse_gitleaks():

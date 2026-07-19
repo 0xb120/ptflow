@@ -17,6 +17,15 @@ def test_stage_defaults():
     assert s.phase == 1  # first per-app loop by default
     assert s.spanning is False
     assert s.after_phase is None
+    assert s.agents == ()
+
+
+def test_stage_agent_declarations_are_validated():
+    assert Stage("research", lambda *_: None, agents=("research",)).agents == ("research",)
+    with pytest.raises(ValueError, match="unique, non-blank"):
+        Stage("bad", lambda *_: None, agents=("research", "research"))
+    with pytest.raises(ValueError, match="unique, non-blank"):
+        Stage("bad", lambda *_: None, agents=("",))
 
 
 def test_load_pipeline_unknown_raises():
@@ -91,6 +100,10 @@ def test_resume_contract_fingerprint_is_stable_and_sensitive_to_graph_callable_a
     assert baseline != resume_contract_fingerprint(pipeline(run=run_b))
     assert baseline != resume_contract_fingerprint(pipeline(needs=("discover",)))
     assert baseline != resume_contract_fingerprint(pipeline(cluster=cluster_b))
+
+    with_agent = pipeline()
+    with_agent.stages = (Stage("scan", run_a, spanning=True, net=False, agents=("research",)),)
+    assert baseline != resume_contract_fingerprint(with_agent)
 
 
 def test_resume_contract_rejects_invalid_epoch():

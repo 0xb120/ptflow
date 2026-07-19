@@ -152,18 +152,22 @@ NUCLEI_RETRIES = "2"    # -retries
 GAU_THREADS = "5"
 KATANA_DEPTH = "3"
 KATANA_CONC = "2"
+# Katana's experimental form fill is active on every Katana pass (cheap, headless and recrawl).
+# It may submit real forms, so these crawls are active interactions rather than read-only discovery.
+KATANA_FORM_FLAGS = ("-fx", "-aff")
 # crawley — a SECOND crawler run ∥ katana for coverage (see crawl()). Headless here means
 # "skip the HEAD pre-flight", NOT browser rendering. Workers/delay mirror the manually-tuned
 # combo; for wide fan-out across many apps consider dialing -workers down / -delay up.
 CRAWLEY_DEPTH = "3"
 CRAWLEY_WORKERS = "15"
 CRAWLEY_DELAY = "0"         # per-request delay ("0" disables it; crawley's default is 150ms)
-# headless crawl (TIER 1) — browser-backed, RAM-heavy; gated on the JS-render classification
-# (is_js_rendered). Uses katana's bundled rod chromium (NOT -sc/system-chrome, which hangs here);
-# -aff stays OFF (it would submit real forms). RAM (1-5 GB/host) is the dominant constraint at
-# scale, so concurrent headless processes are capped PROCESS-WIDE by _HEADLESS_SLOTS (the
+# headless crawl (TIER 1) — browser-backed, RAM-heavy, and ALWAYS run for every application group.
+# Uses katana's bundled rod chromium (NOT -sc/system-chrome, which hangs here);
+# -aff enables Katana's experimental automatic form filling: this can submit real forms and is
+# therefore an ACTIVE interaction, not passive discovery. RAM (1-5 GB/host) is the dominant constraint
+# at scale, so concurrent headless processes are capped PROCESS-WIDE by _HEADLESS_SLOTS (the
 # ThreadPoolTaskRunner runs every stage as a thread in one process, so a module semaphore caps
-# them across all app groups). -ct bounds runaway SPAs per host (footgun: per-host cap is a must).
+# them across all app groups). -ct bounds runaway browser crawls per host (the per-host cap is a must).
 HEADLESS_DEPTH = "3"
 HEADLESS_CONC = "5"          # -c page concurrency within ONE headless process (RAM ∝ this)
 HEADLESS_CT = "180"          # -ct crawl-duration cap per host (seconds)
@@ -171,8 +175,8 @@ HEADLESS_RL = "50"           # -rl requests/second
 HEADLESS_PARALLELISM = 2     # max concurrent headless processes across ALL app groups
 _HEADLESS_SLOTS = threading.BoundedSemaphore(HEADLESS_PARALLELISM)
 # JS-render classification (NO browser) — calibrated on the crawler benchmark (handoff doc §6).
-# Headless pays off only when the non-headless LINK surface is small yet JS-parse (fx) finds much
-# more, or a thin-shell framework marker is present. A healthy link surface ⇒ traditional ⇒ skip.
+# Retained as a diagnostic estimate of headless URL yield, never as an execution gate: even an app
+# with a healthy traditional link surface can mutate forms/actions and requests only at runtime.
 JS_LINK_CEILING = 40   # link surface (max of raw <a href>, crawley) at/above this ⇒ traditional
 JS_FX_MIN = 20         # require at least this many fx endpoints (avoid tiny-sample noise)
 JS_FX_RATIO = 3        # ...and fx must dwarf the link surface by this factor
@@ -1996,13 +2000,14 @@ def has_thin_shell_marker(html: str) -> bool:
 
 
 def is_js_rendered(raw_href: int, fx: int, crawley: int, *, marker: bool) -> bool:
-    """Classify (NO browser) whether an app's surface lives in JS ⇒ a headless crawl pays off.
+    """Estimate (NO browser) whether an app's URL surface predominantly lives in JavaScript.
 
-    Validated signal from the crawler benchmark (handoff §6): headless wins only when the
+    Diagnostic signal from the crawler benchmark (handoff §6): headless URL yield was highest when the
     non-headless LINK surface (raw <a href> and crawley) is small yet JS-parse (katana -fx /
     jsluice) finds far more — or a thin-shell framework marker is present. A healthy link
-    surface means ordinary crawling already saw the site (traditional, or a React/finto-SPA that
-    behaves traditionally), so a browser launch would be pure cost. Thresholds are tunable.
+    surface predicts lower marginal URL yield, but does not prove runtime DOM equivalence: a
+    traditional app can still rewrite form actions or issue security-relevant requests in JavaScript.
+    This verdict is recorded for analysis only and never gates the always-on headless pass.
     """
     link = max(raw_href, crawley)
     if link >= JS_LINK_CEILING:
@@ -3106,7 +3111,8 @@ def _run_katana(ws: AppWorkspace, hosts: list[str], app_id: str) -> str:
     -omit-raw is OFF (was on) so request.method/body/raw survive in the JSONL — the catalog
     needs them to fuzz POST/JSON, not just GET; -omit-body still trims the heavy response
     body (already on disk via -srd). Auth headers (PTFLOW_HTTP_HEADER) reach the logged-in surface."""
-    cmd = ["katana", "-silent", "-j", "-jc", "-jsl", "-kf", "all", "-fx", "-xhr", "-pc",
+    cmd = ["katana", "-silent", "-j", "-jc", "-jsl", "-kf", "all", *KATANA_FORM_FLAGS,
+           "-xhr", "-pc",
            "-fs", "fqdn", "-d", KATANA_DEPTH, "-c", KATANA_CONC,
            "-omit-body", "-srd", str(ws.responses), *_header_flags("-H")]
     return _run("katana", cmd, stdin="\n".join(hosts),
@@ -3152,7 +3158,7 @@ def _stored_root_html(ws: AppWorkspace, hosts: list[str]) -> str:
 
 
 def crawl(activity: Activity, app_id: str) -> None:
-    """DEPTH 2 — TWO crawlers in PARALLEL (TIER 0 cheap layer) + JS-render classification.
+    """DEPTH 2 — TWO crawlers in PARALLEL (TIER 0 cheap layer) + diagnostic classification.
 
     katana (downloader) and crawley (second discovery engine) run concurrently against the
     group's hosts deduped by response body (_scan_hosts: one per backend, but distinct
@@ -3163,10 +3169,10 @@ def crawl(activity: Activity, app_id: str) -> None:
     denoised, is endpoints.txt; crawley's discovery is also persisted (endpoints_crawley.txt)
     so fetch_delta downloads the bodies only it found.
 
-    Then it CLASSIFIES (no browser) whether the app's surface lives in JS — comparing the
+    Then it estimates (no browser) whether the app's surface predominantly lives in JS — comparing the
     raw <a href> count + crawley against the JS-parsed (fx) count, plus thin-shell markers —
-    and records the verdict in crawl_class.json. The gated headless pass (crawl_headless)
-    reads it and only renders the apps that actually benefit.
+    and records the diagnostic verdict in crawl_class.json. It does not gate crawl_headless:
+    every app is rendered so runtime-only DOM and request changes are not lost on non-SPAs.
     """
     ws = activity.app(app_id)
     hosts = _scan_hosts(ws)
@@ -3193,44 +3199,42 @@ def crawl(activity: Activity, app_id: str) -> None:
     js_render = is_js_rendered(raw_href, fx_n, cr_n, marker=marker)
     workspace.write_meta(ws.canonical("crawl_class.json"), {
         "js_render": js_render, "raw_href": raw_href, "fx": fx_n, "crawley": cr_n,
-        "thin_shell_marker": marker,
+        "thin_shell_marker": marker, "headless_policy": "always",
     })
-    log.info("    classify (%s) — raw_href=%d fx=%d crawley=%d marker=%s → js_render=%s",
+    log.info("    classify (%s) — raw_href=%d fx=%d crawley=%d marker=%s → "
+             "js_render=%s (diagnostic; headless=always)",
              app_id, raw_href, fx_n, cr_n, marker, js_render)
 
 
 def crawl_headless(activity: Activity, app_id: str) -> None:
-    """DEPTH 2b — headless katana, run ONLY on the JS-rendered bucket (TIER 1, gated).
+    """DEPTH 2b — always-on headless katana for every application group (TIER 1).
 
-    crawl classified each app (crawl_class.json). Traditional apps skip this entirely —
-    headless is browser-backed and RAM-heavy (1-5 GB/host), so concurrent launches are
-    capped process-wide (_HEADLESS_SLOTS). On a JS-rendered app it renders the SPA (-hl)
-    and extracts what link-crawling can't reach — JS-built routes and XHR/fetch URLs
-    (-jsl/-xhr) — storing bodies under responses/headless/ for offline mining. -iqp folds
-    query-param variants; -ct bounds runaway SPAs per host; -aff is OFF (never submit forms).
+    It renders both SPA and traditional apps (-hl) to observe runtime-mutated DOM, form actions,
+    JS-built routes and XHR/fetch URLs (-jsl/-xhr) that static/link crawling cannot reliably see.
+    The diagnostic crawl_class.json verdict is deliberately ignored. Browser RAM is capped
+    process-wide (_HEADLESS_SLOTS), and bodies are stored under responses/headless/ for offline
+    mining. -iqp folds query-param variants; -ct bounds runaway browser crawls per host; -aff fills
+    and submits forms, so this is an active interaction pass rather than read-only rendering.
     Output endpoints_headless.txt is folded into the phase-3 wordlist (like endpoints_js.txt).
     """
     ws = activity.app(app_id)
-    cls_path = ws.canonical("crawl_class.json")
-    if not (cls_path.exists() and workspace.read_meta(cls_path).get("js_render")):
-        log.debug("  · skip headless (not JS-rendered) for %s", app_id)
-        return
     hosts = _scan_hosts(ws)  # one render per backend (headless is RAM-heavy); keeps distinct envs
     if not hosts:
         return
     store = ws.responses / "headless"
     store.mkdir(parents=True, exist_ok=True)
-    cmd = ["katana", "-silent", "-j", "-hl", "-nos", "-jc", "-jsl", "-xhr", "-fx", "-iqp",
+    cmd = ["katana", "-silent", "-j", "-hl", "-nos", "-jc", "-jsl", "-xhr",
+           *KATANA_FORM_FLAGS, "-iqp",
            "-fs", "fqdn", "-d", HEADLESS_DEPTH, "-c", HEADLESS_CONC, "-ct", HEADLESS_CT,
            "-rl", HEADLESS_RL, "-omit-body", "-srd", str(store), *_header_flags("-H")]
-    log.info("  → headless (%s) — JS-rendered, %d host(s) (capped at %d concurrent)",
+    log.info("  → headless (%s) — always-on, %d host(s) (capped at %d concurrent)",
              app_id, len(hosts), HEADLESS_PARALLELISM)
     with _HEADLESS_SLOTS:
         out = _run("katana-headless", cmd, stdin="\n".join(hosts),
                    dest=ws.raw("katana") / "headless" / "out.jsonl", label=app_id)
     tools.write_lines(ws.canonical("endpoints_headless.txt"), denoise(parse_katana(out)))
-    # headless catches the SPA's XHR/fetch API calls (often POST/JSON) link-crawling can't —
-    # exactly the surface a GET-only fuzzer misses. Preserve their method/body in the catalog.
+    # Preserve runtime-mutated forms and dynamic XHR/fetch calls (often POST/JSON) from both SPA and
+    # traditional apps: exactly the request shapes a static or GET-only crawler can miss.
     n_req = tools.write_jsonl(ws.canonical("requests_headless.jsonl"),
                               merge_requests(parse_katana_requests(out, source="katana-headless")))
     log.debug("    catalog (%s) — %d request shape(s) from headless → requests_headless.jsonl",
@@ -4797,7 +4801,8 @@ def recrawl(activity: Activity, app_id: str) -> None:
         return
     store = ws.responses / "recrawl"
     store.mkdir(parents=True, exist_ok=True)
-    cmd = ["katana", "-silent", "-j", "-jc", "-jsl", "-kf", "all", "-fx", "-xhr", "-fs", "fqdn",
+    cmd = ["katana", "-silent", "-j", "-jc", "-jsl", "-kf", "all", *KATANA_FORM_FLAGS,
+           "-xhr", "-fs", "fqdn",
            "-d", RECRAWL_DEPTH, "-c", KATANA_CONC, "-ct", RECRAWL_CT,
            "-omit-body", "-srd", str(store), *_header_flags("-H")]
     out = _run("katana-recrawl", cmd, stdin="\n".join(seeds),

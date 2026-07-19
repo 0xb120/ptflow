@@ -24,6 +24,7 @@ from prefect.task_runners import ThreadPoolTaskRunner
 
 from ptflow.core import reporting, telemetry, tools
 from ptflow.core.agent import propose_hypotheses
+from ptflow.core.agents import build_agent_access
 from ptflow.core.config import CONFIG
 from ptflow.core.log import add_file_handler, get_logger
 from ptflow.core.paths import Activity
@@ -113,7 +114,8 @@ def _stage_tags(stage: Stage) -> list[str]:
     """Band tag for the Prefect UI (so task runs group/filter by phase in the dashboard), plus the
     `net` tag for network stages (offline ones omit it). Pure — derived from the Stage's flags."""
     band = stage_band(stage)
-    return ["net", band] if stage.net else [band]
+    tags = ["net", band] if stage.net else [band]
+    return [*tags, *(f"agent:{name}" for name in stage.agents)]
 
 
 def _filter_disabled(pipeline: Pipeline, disabled: set[str]) -> list[Stage]:
@@ -215,10 +217,12 @@ def _run_stage(  # noqa: PLR0913
             if app_id is not None:
                 slots.enter_context(_FANOUT_SLOTS)
             log.info("  ▶ %s%s", stage_name, f" [{app_id}]" if app_id else "")
+            agent_access = build_agent_access(pipeline, stage, activity)
+            kwargs = {"agents": agent_access} if stage.agents else {}
             if app_id is None:
-                stage.run(activity)
+                stage.run(activity, **kwargs)
             else:
-                stage.run(activity, app_id)
+                stage.run(activity, app_id, **kwargs)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("", encoding="utf-8")  # only AFTER success → failed stages re-run
 

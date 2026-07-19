@@ -68,10 +68,28 @@ remote_secrets = "redacted"  # off | redacted | full
 # [ai.stages.cve_poc]
 # enabled = true              # Interprets search_vulns poc/exploits; no Nuclei or arbitrary commands.
 # max_output_tokens = 6000
+# [ai.stages.research]
+# enabled = true              # Model-directed direct search/fetch/headless-browser loop.
+# max_output_tokens = 4000
 # [ai.stages.report]
 # provider = "openrouter"
 # model = "openai/gpt-oss-20b"
 # max_output_tokens = 12000
+
+# Bounded web research agent. No search proxy or API key is required. The model chooses an enabled
+# public engine and may request Playwright rendering; it can follow links discovered in fetched pages.
+# It has no shell/target tools. Private fetching stays OFF unless the RoE explicitly allows it.
+[agents.research]
+search_engines = "duckduckgo,google" # Google is navigated through headless; DDG also works directly.
+browser = "auto"                    # off | auto | on; needs the ai-browser extra + Chromium.
+# browser_path = "/usr/bin/chromium" # Optional; common system Chromium/Chrome paths are auto-detected.
+max_steps = 8
+max_searches = 3
+max_fetches = 5
+max_results = 5
+timeout_seconds = 20
+max_bytes = 1000000
+allow_private = false
 
 # ── Nuclei DAST packs ───────────────────────────────────────────────────────
 # Every template in every enabled local pack runs in BOTH DAST passes. There are no tag/ID policies.

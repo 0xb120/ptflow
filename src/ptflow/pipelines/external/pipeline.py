@@ -57,7 +57,7 @@ class ExternalPipeline:
         # assemble the surface request catalog (requests.jsonl). No fuzzing/guessing in this phase.
         Stage("passive_probe", tasks.passive_probe, per_app=True, phase=1),
         Stage("crawl", tasks.crawl, needs=("passive_probe",), per_app=True, phase=1),
-        # gated TIER-1 headless crawl — runs only on the JS-rendered bucket (∥ takeover)
+        # always-on TIER-1 browser crawl for every app group (bounded process-wide; ∥ takeover)
         Stage("crawl_headless", tasks.crawl_headless, needs=("crawl",), per_app=True, phase=1),
         Stage("subenum", tasks.subenum, per_app=True, phase=1),  # ∥ passive_probe/crawl
         Stage("takeover", tasks.takeover, needs=("crawl", "subenum"), per_app=True, phase=1),
