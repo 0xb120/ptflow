@@ -153,3 +153,24 @@ def test_creds_test_brutus_writes_hit_and_locks_down(activity_with_candidates, m
     assert hit["product"] == "Acme NAS"
     assert hit["source_urls"] == ["https://vendor/manual"]
     assert ((ws.findings / "creds_brutus.jsonl").stat().st_mode & 0o777) == 0o600
+
+
+def test_creds_test_brutus_command_shape(activity_with_candidates, monkeypatch):
+    activity, _ws = activity_with_candidates
+    captured = {}
+    def _fake_run(cmd, *, dest, label):  # noqa: ARG001
+        captured["cmd"] = cmd
+        return ""
+    monkeypatch.setattr(creds, "_run_brutus", _fake_run)
+    creds.creds_test_brutus(activity, "10.0.0.0-24")
+    cmd = captured["cmd"]
+    assert cmd[0] == creds.BRUTUS
+    assert "--target" in cmd
+    assert "10.0.0.5:22" in cmd
+    assert cmd[cmd.index("--protocol") + 1] == "ssh"
+    assert cmd[cmd.index("-u") + 1] == "admin"
+    assert cmd[cmd.index("-p") + 1] == "acme"
+    assert "--json" in cmd
+    assert "--mode" not in cmd
+    assert "--targets-file" not in cmd
+    assert "-c" not in cmd

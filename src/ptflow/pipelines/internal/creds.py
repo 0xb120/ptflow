@@ -273,6 +273,7 @@ def _run_brutus(cmd: list[str], *, dest, label: str) -> str:  # noqa: ANN001
         log.debug("  · %s failed: %s", label, exc)
         return ""
     tools.write_text(dest, out)
+    _chmod_600(dest)
     return out
 
 
