@@ -11,10 +11,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from ptflow.core.log import get_logger
-from ptflow.pipelines.internal.tasks import _banner_product, web_targets_from
+from ptflow.core import tools
+from ptflow.core.log import get_logger, is_verbose
+from ptflow.pipelines.internal.tasks import BRUTUS, _banner_product, web_targets_from
+
+if TYPE_CHECKING:
+    from ptflow.core.paths import Activity
 
 log = get_logger()
 
@@ -256,3 +263,71 @@ def group_forms(form_attempts: list[dict]) -> list[dict]:
         job["by_pair"][pair] = {"confidence": a["confidence"], "source_urls": a["source_urls"],
                                 "rationale": a["rationale"], "product": a["product"]}
     return list(jobs.values())
+
+
+def _run_brutus(cmd: list[str], *, dest, label: str) -> str:  # noqa: ANN001
+    """Best-effort Brutus run (bounded), stdout persisted to ``dest``. '' on any error."""
+    try:
+        out = tools.run(cmd, stream_stderr=is_verbose(), timeout=BRUTUS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError, tools.AbortedError) as exc:
+        log.debug("  · %s failed: %s", label, exc)
+        return ""
+    tools.write_text(dest, out)
+    return out
+
+
+def _chmod_600(path) -> None:  # noqa: ANN001
+    try:
+        path.chmod(0o600)
+    except OSError as exc:  # pragma: no cover
+        log.debug("  · chmod 600 failed on %s: %s", path, exc)
+
+
+def _enrich_brutus(hits: list[dict], attempt: dict, app_id: str) -> list[dict]:
+    out: list[dict] = []
+    for h in hits:
+        host, port = _split_target(str(h.get("target", "")))
+        out.append({
+            "app_id": app_id, "type": "default-credentials", "severity": "high", "via": "brutus",
+            "tool": "brutus", "host": host or attempt["host"], "port": port or attempt["port"],
+            "protocol": attempt["protocol"], "product": attempt["product"],
+            "username": h.get("username", attempt["username"]),
+            "password": h.get("password", attempt["password"]), "confidence": attempt["confidence"],
+            "source_urls": attempt["source_urls"], "rationale": attempt["rationale"],
+            "banner": h.get("banner", ""),
+            "evidence": f"default credentials accepted on {attempt['protocol']}"})
+    return out
+
+
+def _load(activity: Activity, app_id: str) -> tuple:  # type: ignore[type-arg]
+    ws = activity.app(app_id)
+    if shutil.which(BRUTUS) is None:
+        return ws, None, None
+    return (ws, tools.read_jsonl(ws.canonical("credential_candidates.jsonl")),
+            tools.read_jsonl(ws.canonical("services.jsonl")))
+
+
+def creds_test_brutus(activity: Activity, app_id: str) -> None:
+    """LOOP 3 (opt-in) — try curated default credentials on non-HTTP services and HTTP Basic-auth panels
+    via Brutus (one invocation per pair x socket). Lockout-aware, best-effort -> findings/creds_brutus.jsonl
+    (0600)."""
+    ws, candidates, services = _load(activity, app_id)
+    if not candidates or not services:
+        log.debug("  · skip creds_test_brutus [%s] (brutus/candidates/services absent)", app_id)
+        return
+    threshold = parse_lockout_threshold(tools.read_jsonl(ws.findings / "ad_enum.jsonl"))
+    brutus_attempts, _forms, skips = plan_attempts(
+        candidates, services, lockout_threshold=threshold, lockout_default=_lockout_default())
+    flags = mode_flags()
+    findings: list[dict] = []
+    for i, a in enumerate(brutus_attempts):
+        out = _run_brutus(
+            [BRUTUS, "--target", f'{a["host"]}:{a["port"]}', "--protocol", a["protocol"],
+             "-u", a["username"], "-p", a["password"], "--json", *flags],
+            dest=ws.raw("brutus") / f'{a["protocol"]}-{i}.jsonl', label=f'creds-{a["protocol"]}')
+        findings += _enrich_brutus(parse_brutus_jsonl(out), a, app_id)
+    hits = len(findings)
+    findings += [{"app_id": app_id, "skipped": True, **s} for s in skips if s.get("via") == "brutus"]
+    tools.write_jsonl(ws.findings / "creds_brutus.jsonl", findings)
+    _chmod_600(ws.findings / "creds_brutus.jsonl")
+    log.info("  → creds_test_brutus [%s] — %d attempt(s) → %d hit(s)", app_id, len(brutus_attempts), hits)

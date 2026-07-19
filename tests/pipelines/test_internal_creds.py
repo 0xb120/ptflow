@@ -1,3 +1,7 @@
+import pytest
+
+from ptflow.core import tools
+from ptflow.core.paths import Activity
 from ptflow.pipelines.internal import creds
 
 
@@ -119,3 +123,33 @@ def test_group_forms_shape():
     assert job["url"] == "https://10.0.0.5:8443"
     assert job["pairs"] == [("admin", "a")]
     assert job["by_pair"][("admin", "a")]["product"] == "P"
+
+
+@pytest.fixture
+def activity_with_candidates(tmp_path, monkeypatch):
+    monkeypatch.setattr(creds.shutil, "which", lambda _b: "/fake/brutus")
+    activity = Activity.named("a", root=tmp_path).ensure()
+    ws = activity.app("10.0.0.0-24")
+    ws.root.mkdir(parents=True, exist_ok=True)
+    tools.write_jsonl(ws.canonical("services.jsonl"),
+                      [{"ip": "10.0.0.5", "port": 22, "product": "Acme NAS", "service": "ssh"}])
+    tools.write_jsonl(ws.canonical("credential_candidates.jsonl"),
+                      [{"product": "Acme NAS", "protocol": "ssh", "username": "admin",
+                        "password": "acme", "confidence": 0.95,
+                        "source_urls": ["https://vendor/manual"], "rationale": "manual"}])
+    return activity, ws
+
+
+def test_creds_test_brutus_writes_hit_and_locks_down(activity_with_candidates, monkeypatch):
+    activity, ws = activity_with_candidates
+    monkeypatch.setattr(creds, "_run_brutus", lambda *_a, **_k:
+        '{"protocol":"ssh","target":"10.0.0.5:22","username":"admin","password":"acme"}\n')
+    creds.creds_test_brutus(activity, "10.0.0.0-24")
+    findings = tools.read_jsonl(ws.findings / "creds_brutus.jsonl")
+    hit = next(f for f in findings if not f.get("skipped"))
+    assert hit["type"] == "default-credentials"
+    assert hit["severity"] == "high"
+    assert hit["host"] == "10.0.0.5"
+    assert hit["product"] == "Acme NAS"
+    assert hit["source_urls"] == ["https://vendor/manual"]
+    assert ((ws.findings / "creds_brutus.jsonl").stat().st_mode & 0o777) == 0o600
