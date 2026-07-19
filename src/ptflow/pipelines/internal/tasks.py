@@ -1531,7 +1531,11 @@ def consolidate(activity: Activity) -> dict[str, int]:
     activity dir. Empty types write no file. Idempotent overwrite of a non-empty type. `creds.jsonl` is
     additionally REDACTED (password → "****", via creds.redact) before writing — report.json (world-
     readable) is generated from this consolidated file, so plaintext must never reach it; the plaintext
-    stays only in the per-app 0600 creds_brutus.jsonl/creds_forms.jsonl sources."""
+    stays only in the per-app 0600 creds_brutus.jsonl/creds_forms.jsonl sources. `creds.jsonl` ALSO drops
+    ``skipped`` audit/lockout records (only real hits become findings — an audit record surviving into
+    report.json would misleadingly render as a finding); a run with only skips this run leaves any prior
+    creds.jsonl untouched, same as any other empty-this-run type. The skip audit remains on-disk in the
+    per-app 0600 sources."""
     from ptflow.pipelines.internal import creds  # noqa: PLC0415 (avoids tasks<->creds import cycle)
 
     apps = activity.list_apps()
@@ -1541,8 +1545,10 @@ def consolidate(activity: Activity) -> dict[str, int]:
                    for ws in apps for src in sources
                    for rec in tools.read_jsonl(ws.root / src)]
         if records:                            # never delete on empty — see docstring (--resume safety)
-            if out_name == "creds.jsonl":       # plaintext stays ONLY in the per-app 0600 sources above;
-                records = [creds.redact(r) for r in records]  # the consolidated file feeds report.json
+            if out_name == "creds.jsonl":       # skip/audit records are not findings — never let them
+                records = [creds.redact(r) for r in records if not r.get("skipped")]  # reach report.json
+                if not records:                # nothing but skips this run — leave any prior file untouched
+                    continue
             counts[out_name.removesuffix(".jsonl")] = tools.write_jsonl(
                 activity.findings / out_name, records)
             if out_name == "creds.jsonl":

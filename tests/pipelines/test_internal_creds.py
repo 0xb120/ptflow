@@ -56,6 +56,14 @@ def test_parse_lockout_threshold_reads_ad_password_policy():
     assert creds.parse_lockout_threshold([]) is None
 
 
+def test_parse_lockout_threshold_garbage_falls_back_to_none_not_unlimited():
+    # A malformed/garbage threshold must NOT be treated as "disabled" (0 = unlimited); only an
+    # explicit none/disabled does that. Garbage → None, so the caller falls back to the conservative
+    # default budget instead of removing the cap entirely.
+    assert creds.parse_lockout_threshold(
+        [{"type": "ad-password-policy", "lockout_threshold": "N/A"}]) is None
+
+
 def test_account_budget_semantics():
     assert creds.account_budget(None, 3) == 2
     assert creds.account_budget(0, 3) is None
@@ -77,6 +85,27 @@ def test_apply_lockout_caps_per_account_and_skips():
     kept2, skips2 = creds._apply_lockout(attempts, threshold=1, default=3)
     assert not [a for a in kept2 if a["protocol"] == "smb"]
     assert all(s["reason"] == "lockout_policy" for s in skips2 if s["protocol"] == "smb")
+
+
+def test_apply_lockout_collapses_across_lockout_protocols_per_account():
+    # AD counts failures per ACCOUNT across SMB/LDAP/RDP/WinRM combined — one account with attempts
+    # split across two lockout protocols must share ONE budget, not one budget each.
+    attempts = (
+        [{"product": "DC", "protocol": "smb", "host": "10.0.0.1", "port": 445,
+          "username": "administrator", "password": p, "confidence": c}
+         for p, c in (("p1", 0.9), ("p2", 0.5))]
+        + [{"product": "DC", "protocol": "ldap", "host": "10.0.0.1", "port": 389,
+            "username": "administrator", "password": p, "confidence": c}
+           for p, c in (("p3", 0.8), ("p4", 0.3))]
+        + [{"product": "SW", "protocol": "ssh", "host": "10.0.0.2", "port": 22,
+            "username": "root", "password": "x", "confidence": 0.9}]
+    )
+    kept, skips = creds._apply_lockout(attempts, threshold=2, default=3)  # budget = 2-1 = 1
+    lockout_kept = [a for a in kept if a["protocol"] in creds._LOCKOUT_PROTOCOLS]
+    assert len(lockout_kept) == 1
+    assert lockout_kept[0]["password"] == "p1"  # noqa: S105 — highest confidence (0.9) across BOTH protocols
+    assert len(skips) == 3
+    assert {a["password"] for a in kept if a["protocol"] == "ssh"} == {"x"}
 
 
 def test_parse_brutus_jsonl_keeps_hits_skips_noise():
@@ -171,11 +200,14 @@ def test_creds_test_brutus_command_shape(activity_with_candidates, monkeypatch):
     assert "10.0.0.5:22" in cmd
     assert cmd[cmd.index("--protocol") + 1] == "ssh"
     assert cmd[cmd.index("-u") + 1] == "admin"
-    assert cmd[cmd.index("-p") + 1] == "acme"
+    assert "-P" in cmd
+    assert "brutus" in cmd[cmd.index("-P") + 1]
+    assert "acme" not in cmd
     assert "--json" in cmd
     assert "--mode" not in cmd
     assert "--targets-file" not in cmd
     assert "-c" not in cmd
+    assert "-p" not in cmd
 
 
 def test_creds_test_forms_writes_hit(tmp_path, monkeypatch):

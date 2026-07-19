@@ -134,14 +134,16 @@ def web_urls(services: list[dict]) -> dict[tuple[str, int], str]:
 
 def parse_lockout_threshold(records: list[dict]) -> int | None:
     """Account-lockout threshold from ``findings/ad_enum.jsonl``'s ``ad-password-policy`` record. None
-    when no policy was enumerated (caller uses the default); 0 for None/Disabled (unlimited). Pure."""
+    when no policy was enumerated, OR the value is unparseable/blank garbage (caller uses the
+    conservative default — a malformed threshold must never disable the cap); 0 ONLY for an explicit
+    ``none``/``disabled`` (case-insensitive, truly unlimited); else the parsed int. Pure."""
     for r in records:
         if r.get("type") == "ad-password-policy":
             raw = str(r.get("lockout_threshold", "")).strip().lower()
-            digits = "".join(ch for ch in raw if ch.isdigit())
-            if not digits or raw in ("none", "disabled"):
+            if raw in ("none", "disabled"):
                 return 0
-            return int(digits)
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            return int(digits) if digits else None
     return None
 
 
@@ -155,16 +157,19 @@ def account_budget(threshold: int | None, default: int) -> int | None:
 def _apply_lockout(
     net_attempts: list[dict], threshold: int | None, default: int,
 ) -> tuple[list[dict], list[dict]]:
-    """Cap attempts on domain-lockout protocols to ``account_budget`` per (host, protocol, username),
-    highest-confidence first. Non-lockout protocols pass through. Returns (kept, skips)."""
+    """Cap attempts on domain-lockout protocols to ``account_budget`` per (host, username), COLLAPSED
+    across all lockout protocols (AD counts failures per account across SMB/LDAP/RDP/WinRM combined —
+    a per-protocol budget would multiply past ``threshold - 1`` and lock the account), highest-confidence
+    first. Non-lockout protocols pass through untouched. Each dropped attempt keeps its own ``protocol``
+    in its skip record. Returns (kept, skips)."""
     budget = account_budget(threshold, default)
     kept = [a for a in net_attempts if a["protocol"] not in _LOCKOUT_PROTOCOLS]
     skips: list[dict] = []
-    groups: dict[tuple[str, str, str], list[dict]] = {}
+    groups: dict[tuple[str, str], list[dict]] = {}
     for a in net_attempts:
         if a["protocol"] in _LOCKOUT_PROTOCOLS:
-            groups.setdefault((a["host"], a["protocol"], a["username"]), []).append(a)
-    for (host, proto, user), atts in groups.items():
+            groups.setdefault((a["host"], a["username"]), []).append(a)
+    for (host, user), atts in groups.items():
         ordered = sorted(atts, key=lambda a: (a.get("confidence") or 0), reverse=True)
         if budget is None:
             kept += ordered
@@ -172,7 +177,8 @@ def _apply_lockout(
         kept += ordered[:budget]
         reason = "lockout_policy" if budget == 0 else "lockout_budget"
         skips += [{"product": a["product"], "reason": reason, "via": "brutus", "host": host,
-                   "port": a["port"], "protocol": proto, "username": user} for a in ordered[budget:]]
+                   "port": a["port"], "protocol": a["protocol"], "username": user}
+                  for a in ordered[budget:]]
     return kept, skips
 
 
@@ -272,7 +278,9 @@ def _run_brutus(cmd: list[str], *, dest, label: str) -> str:  # noqa: ANN001
     try:
         out = tools.run(cmd, stream_stderr=is_verbose(), timeout=BRUTUS_TIMEOUT)
     except (OSError, subprocess.SubprocessError, tools.AbortedError) as exc:
-        log.debug("  · %s failed: %s", label, exc)
+        # Log the exception TYPE only — the exception object can embed argv (which may include
+        # the password-file path, or worse); never interpolate it directly.
+        log.debug("  · %s failed: %s", label, type(exc).__name__)
         return ""
     tools.write_text(dest, out)
     _chmod_600(dest)
@@ -313,8 +321,10 @@ def _load(activity: Activity, app_id: str) -> tuple:  # type: ignore[type-arg]
 
 def creds_test_brutus(activity: Activity, app_id: str) -> None:
     """LOOP 3 (opt-in) — try curated default credentials on non-HTTP services and HTTP Basic-auth panels
-    via Brutus (one invocation per pair x socket). Lockout-aware, best-effort -> findings/creds_brutus.jsonl
-    (0600)."""
+    via Brutus (one invocation per pair x socket). The password NEVER touches argv (visible via `ps`/
+    `/proc/cmdline` and the DEBUG-logged command in run.log): each attempt's password is written to its
+    own 0600 file under raw/brutus/ and passed via Brutus's `-P <file>` flag, never `-p`. Lockout-aware,
+    best-effort -> findings/creds_brutus.jsonl (0600)."""
     ws, candidates, services = _load(activity, app_id)
     if not candidates or not services:
         log.debug("  · skip creds_test_brutus [%s] (brutus/candidates/services absent)", app_id)
@@ -325,9 +335,12 @@ def creds_test_brutus(activity: Activity, app_id: str) -> None:
     flags = mode_flags()
     findings: list[dict] = []
     for i, a in enumerate(brutus_attempts):
+        pwfile = ws.raw("brutus") / f'pw-{a["protocol"]}-{i}.txt'
+        tools.write_text(pwfile, a["password"])
+        _chmod_600(pwfile)  # written BEFORE Brutus runs — the password never touches argv/ps/logs
         out = _run_brutus(
             [BRUTUS, "--target", f'{a["host"]}:{a["port"]}', "--protocol", a["protocol"],
-             "-u", a["username"], "-p", a["password"], "--json", *flags],
+             "-u", a["username"], "-P", str(pwfile), "--json", *flags],
             dest=ws.raw("brutus") / f'{a["protocol"]}-{i}.jsonl', label=f'creds-{a["protocol"]}')
         findings += _enrich_brutus(parse_brutus_jsonl(out), a, app_id)
     hits = len(findings)

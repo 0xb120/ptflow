@@ -604,7 +604,9 @@ def test_consolidate_folds_and_locks_down_creds(tmp_path):
     ws.root.mkdir(parents=True, exist_ok=True)
     (ws.root / "meta.json").write_text("{}")
     tools.write_jsonl(ws.findings / "creds_brutus.jsonl",
-                      [{"type": "default-credentials", "host": "10.0.0.5", "password": "s3cr3t"}])
+                      [{"type": "default-credentials", "host": "10.0.0.5", "password": "s3cr3t"},
+                       {"skipped": True, "reason": "lockout_policy", "host": "10.0.0.5",
+                        "protocol": "smb", "username": "administrator"}])
     tools.write_jsonl(ws.findings / "creds_forms.jsonl",
                       [{"type": "default-credentials", "host": "10.0.0.6", "password": "admin"}])
     tasks.consolidate(activity)
@@ -614,6 +616,8 @@ def test_consolidate_folds_and_locks_down_creds(tmp_path):
     assert all(r["app_id"] == "10.0.0.0-24" for r in records)
     assert (out.stat().st_mode & 0o777) == 0o600
     assert all(r["password"] == "****" for r in records)  # noqa: S105 — redacted, report.json is world-readable
+    assert not any(r.get("skipped") for r in records)  # skip/audit records never become report findings
+    assert len(records) == 2
     raw = out.read_text()
     assert "s3cr3t" not in raw
     assert "admin" not in raw
