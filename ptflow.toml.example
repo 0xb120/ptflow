@@ -37,6 +37,12 @@ recrawl = "on"
 # hosts. OFF by default — costs HOURS/host. Turn on only for a deep assessment.
 deep_dive = false
 
+# --- internal default-credential testing (opt-in, env-only in v1) ----------------
+# PTFLOW_CREDS_TEST=on            # enable phase-3 credential testing (default OFF)
+# PTFLOW_CREDS_MODE=cautious      # cautious|default|aggressive (brutus flags + probe settle)
+# PTFLOW_CREDS_LOCKOUT_DEFAULT=3  # max attempts/account when the lockout policy is unknown
+# PTFLOW_BRUTUS=/path/to/brutus   # override the brutus binary
+
 # External breadth port policy. Both modes keep the pre-cluster path predictable: curated ~250 web
 # ports + naabu top-1000 with a 15-minute budget, preserving partial results. `exhaustive` additionally
 # runs full-65535 as a spanning pass and hands only genuinely new web apps to a nested webscan run.
