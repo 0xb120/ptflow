@@ -38,9 +38,15 @@ recrawl = "on"
 deep_dive = false
 
 # --- internal default-credential testing (opt-in, env-only in v1) ----------------
-# PTFLOW_CREDS_TEST=on            # enable phase-3 credential testing (default OFF)
-# PTFLOW_CREDS_MODE=cautious      # cautious|default|aggressive (brutus flags + probe settle)
-# PTFLOW_CREDS_LOCKOUT_DEFAULT=3  # max attempts/account when the lockout policy is unknown
+# PTFLOW_CREDS_TEST=on            # enable phase-3 credential testing (default OFF). Candidates come
+#                                  # from the phase-2 ai_credential_research stage, which only runs
+#                                  # when the AI layer is ALSO enabled (--ai / PTFLOW_AI) — with AI off,
+#                                  # PTFLOW_CREDS_TEST alone produces no candidates and both testing
+#                                  # stages no-op.
+# PTFLOW_CREDS_MODE=cautious      # cautious|default|aggressive — a NOISE/politeness lever only (brutus
+#                                  # rate/retry/timeout + form-probe settle); does NOT control lockout.
+# PTFLOW_CREDS_LOCKOUT_DEFAULT=3  # max attempts/account when the lockout policy is unknown — a SEPARATE,
+#                                  # always-on cap (from ad_enum's pass-pol), independent of CREDS_MODE
 # PTFLOW_BRUTUS=/path/to/brutus   # override the brutus binary
 
 # External breadth port policy. Both modes keep the pre-cluster path predictable: curated ~250 web

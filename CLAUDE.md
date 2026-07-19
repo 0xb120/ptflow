@@ -550,15 +550,21 @@ with a coincidentally-identical favicon/fingerprint, e.g. a corporate template) 
     (Whole-scope `nuclei` is the spanning `nuclei_scope`, not a per-subnet `nuclei_net`.)
   - **Loop 3 — default-credential testing** (`phase=3`, **OPT-IN `PTFLOW_CREDS_TEST`**, default OFF):
     `creds_test_brutus` (Brutus: non-HTTP + HTTP **Basic** auth) ∥ `creds_test_forms` (our Playwright
-    `FormLoginProbe`: HTTP **form** login, provider-agnostic, no Anthropic key). Both try the `research`
-    agent's source-grounded candidates (`credential_candidates.jsonl`) against the services they were
-    proposed for — **curated pairs only**, never wordlists / never Brutus `--experimental-ai`. Matching is
-    per-product→socket; HTTP vs non-HTTP routing reuses `web_targets_from`; lockout-aware (never
-    > `threshold-1` attempts/account on SMB/LDAP/RDP/WinRM, from `ad_enum`'s `parse_nxc_pass_pol`; unknown
-    ⇒ `PTFLOW_CREDS_LOCKOUT_DEFAULT`, default 3). `PTFLOW_CREDS_MODE` (cautious|default|aggressive, default
-    cautious) → Brutus flags + probe settle. Best-effort → `findings/creds_{brutus,forms}.jsonl` (`0600`);
-    `consolidate` folds both → `findings/creds.jsonl` (`0600`; password redacted in reports). Form success
-    detection is heuristic (lead-grade); an LLM-assisted variant on our provider-agnostic seam is a follow-up.
+    `FormLoginProbe`: HTTP **form** login, provider-agnostic, no Anthropic key). Both try the phase-2
+    `ai_credential_research` agent's source-grounded candidates (`credential_candidates.jsonl`) against
+    the services they were proposed for — **curated pairs only**, never wordlists / never Brutus
+    `--experimental-ai`. **Dependency:** `ai_credential_research` only runs when the AI layer is enabled
+    (`--ai` / `PTFLOW_AI`) — `PTFLOW_CREDS_TEST=on` alone produces no candidates, so both testing stages
+    just no-op. Matching is per-product→socket; HTTP vs non-HTTP routing reuses `web_targets_from`;
+    lockout-aware (never > `threshold-1` attempts/account on SMB/LDAP/RDP/WinRM, from `ad_enum`'s
+    `parse_nxc_pass_pol`; unknown ⇒ `PTFLOW_CREDS_LOCKOUT_DEFAULT`, default 3 — an always-on cap,
+    independent of mode). `PTFLOW_CREDS_MODE` (cautious|default|aggressive, default cautious) is a
+    NOISE/politeness lever only → Brutus rate/retry/timeout + form-probe settle. Best-effort →
+    `findings/creds_{brutus,forms}.jsonl` (`0600`, plaintext password). `consolidate` folds both into
+    `findings/creds.jsonl` (`0600`) with the password REDACTED (`****`) — the ONLY place plaintext
+    persists is the per-app 0600 sources above, so every rendered report (which reads the consolidated
+    file) stays clean. Form success detection is heuristic (lead-grade); an LLM-assisted variant on our
+    provider-agnostic seam is a follow-up.
   - **`consolidate`** lifts the per-subnet findings to `<activity>/findings/<type>.jsonl` (one file per
     finding TYPE, each record stamped `app_id`), same deterministic terminal fan-in as external, AND
     aggregates web services into `<activity>/web_targets.txt` (`scheme://ip:port`, https for a TLS
@@ -1080,7 +1086,11 @@ flow changed:
 - **Default-credential testing (opt-in)** uses **Brutus** (`~/go/bin/brutus`, `PTFLOW_BRUTUS`; flat CLI —
   no subcommands) for non-HTTP + HTTP Basic, and our **Playwright `FormLoginProbe`** for HTTP forms. Brutus
   is fed only the agent's validated pairs; its own AI/defaults are never used. Forms need Playwright/Chromium
-  (already present). Opt-in `PTFLOW_CREDS_TEST`; `PTFLOW_CREDS_MODE` is the RoE noise/lockout lever.
+  (already present). Opt-in `PTFLOW_CREDS_TEST`; requires the AI layer enabled too (`--ai`/`PTFLOW_AI`) —
+  `ai_credential_research` (the candidate source) only runs then, so `PTFLOW_CREDS_TEST` alone no-ops both
+  testing stages. `PTFLOW_CREDS_MODE` is a NOISE/politeness lever only (Brutus rate/retry/timeout + form
+  settle); the lockout cap is a SEPARATE, always-on mechanism (`ad_enum`'s pass-pol +
+  `PTFLOW_CREDS_LOCKOUT_DEFAULT`), not controlled by mode.
 - **Auth passthrough (`webscan` only)** — set `PTFLOW_HTTP_HEADER` to one or more `Name: value`
   session headers/cookies (separated by newlines or `;;`) to reach the authenticated surface. Ignored
   by `external`; in `webscan`, threaded into the web scanning tools. Set it *before* launching.

@@ -613,6 +613,10 @@ def test_consolidate_folds_and_locks_down_creds(tmp_path):
     assert {r["host"] for r in records} == {"10.0.0.5", "10.0.0.6"}
     assert all(r["app_id"] == "10.0.0.0-24" for r in records)
     assert (out.stat().st_mode & 0o777) == 0o600
+    assert all(r["password"] == "****" for r in records)  # noqa: S105 — redacted, report.json is world-readable
+    raw = out.read_text()
+    assert "s3cr3t" not in raw
+    assert "admin" not in raw
 
 
 # --- opt-in credential-testing stages (PTFLOW_CREDS_TEST) -----------------------------------------------
