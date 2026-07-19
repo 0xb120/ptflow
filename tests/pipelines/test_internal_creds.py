@@ -73,3 +73,23 @@ def test_apply_lockout_caps_per_account_and_skips():
     kept2, skips2 = creds._apply_lockout(attempts, threshold=1, default=3)
     assert not [a for a in kept2 if a["protocol"] == "smb"]
     assert all(s["reason"] == "lockout_policy" for s in skips2 if s["protocol"] == "smb")
+
+
+def test_parse_brutus_jsonl_keeps_hits_skips_noise():
+    text = ('[*] scanning...\n'
+            '{"protocol":"ssh","target":"10.0.0.5:22","username":"root","password":"toor"}\n'
+            '{"not":"a hit"}\n\n')
+    hits = creds.parse_brutus_jsonl(text)
+    assert len(hits) == 1
+    assert hits[0]["username"] == "root"
+
+
+def test_redact_masks_password():
+    assert creds.redact({"username": "a", "password": "s3cr3t"})["password"] == "****"  # noqa: S105
+    assert creds.redact({"username": "a", "password": ""})["password"] == ""
+
+
+def test_split_target():
+    assert creds._split_target("10.0.0.5:22") == ("10.0.0.5", 22)
+    assert creds._split_target("https://10.0.0.5:8443") == ("10.0.0.5", 8443)
+    assert creds._split_target("10.0.0.5") == ("10.0.0.5", 0)

@@ -9,6 +9,7 @@ Opt-in (``PTFLOW_CREDS_TEST``), best-effort, lockout-aware.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 
@@ -164,3 +165,32 @@ def _apply_lockout(
         skips += [{"product": a["product"], "reason": reason, "via": "brutus", "host": host,
                    "port": a["port"], "protocol": proto, "username": user} for a in ordered[budget:]]
     return kept, skips
+
+
+def parse_brutus_jsonl(text: str) -> list[dict]:
+    """Brutus ``--json`` stdout → success records (dict lines with a ``username``); noise skipped. Pure."""
+    hits: list[dict] = []
+    for ln in text.splitlines():
+        if not ln.strip():
+            continue
+        try:
+            rec = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and rec.get("username"):
+            hits.append(rec)
+    return hits
+
+
+def redact(record: dict) -> dict:
+    """Shallow copy with a non-empty ``password`` masked, for any rendered report. Pure."""
+    out = dict(record)
+    if out.get("password"):
+        out["password"] = "****"  # noqa: S105
+    return out
+
+
+def _split_target(target: str) -> tuple[str, int]:
+    tail = target.split("://", 1)[-1]
+    host, _, port = tail.rpartition(":")
+    return (host, int(port)) if host and port.isdigit() else (tail, 0)
