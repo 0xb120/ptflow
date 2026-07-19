@@ -1,3 +1,5 @@
+import importlib
+
 from ptflow.core import tools, workspace
 from ptflow.core.paths import Activity
 from ptflow.pipelines.internal import tasks
@@ -611,3 +613,24 @@ def test_consolidate_folds_and_locks_down_creds(tmp_path):
     assert {r["host"] for r in records} == {"10.0.0.5", "10.0.0.6"}
     assert all(r["app_id"] == "10.0.0.0-24" for r in records)
     assert (out.stat().st_mode & 0o777) == 0o600
+
+
+# --- opt-in credential-testing stages (PTFLOW_CREDS_TEST) -----------------------------------------------
+def test_creds_stages_absent_by_default(monkeypatch):
+    monkeypatch.delenv("PTFLOW_CREDS_TEST", raising=False)
+    from ptflow.pipelines.internal import pipeline as pl
+
+    pl = importlib.reload(pl)
+    assert "creds_test_brutus" not in {s.name for s in pl.PIPELINE.stages}
+
+
+def test_creds_stages_present_when_opt_in(monkeypatch):
+    monkeypatch.setenv("PTFLOW_CREDS_TEST", "on")
+    from ptflow.pipelines.internal import pipeline as pl
+
+    pl = importlib.reload(pl)
+    names = {s.name for s in pl.PIPELINE.stages}
+    assert {"creds_test_brutus", "creds_test_forms"} <= names
+    assert all(s.phase == 3 for s in pl.PIPELINE.stages if s.name.startswith("creds_test"))
+    monkeypatch.delenv("PTFLOW_CREDS_TEST", raising=False)
+    importlib.reload(pl)

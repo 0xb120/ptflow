@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from ptflow.core.agent import HypothesisProvider, StubProvider
 from ptflow.core.stage import Stage
-from ptflow.pipelines.internal import ai, tasks
+from ptflow.pipelines.internal import ai, creds, tasks
 
 if TYPE_CHECKING:
     from ptflow.core.flowmap import MapSpec
@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
 _AI = os.getenv("PTFLOW_AI", "").strip().lower() in {"1", "on", "true", "yes"}
 _AI_STAGES = ai.per_app_stages()
+_CREDS = creds.creds_test_enabled()
+_CREDS_STAGES = creds.per_app_stages()
 
 
 class InternalPipeline:
@@ -61,6 +63,9 @@ class InternalPipeline:
         Stage("dns_checks", tasks.dns_checks, per_app=True, phase=2),     # DNS AXFR (reverse-zone map)
         Stage("remote_desktop", tasks.remote_desktop, per_app=True, phase=2),
         *(_AI_STAGES if _AI else ()),
+        # LOOP 3 — opt-in default-credential testing (PTFLOW_CREDS_TEST): try the research agent's
+        # source-grounded candidates against the services they were proposed for (Brutus + form probe).
+        *(_CREDS_STAGES if _CREDS else ()),
     )
 
     def cluster(self, activity: Activity) -> list[str]:
