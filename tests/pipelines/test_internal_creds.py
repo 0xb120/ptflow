@@ -174,3 +174,37 @@ def test_creds_test_brutus_command_shape(activity_with_candidates, monkeypatch):
     assert "--mode" not in cmd
     assert "--targets-file" not in cmd
     assert "-c" not in cmd
+
+
+def test_creds_test_forms_writes_hit(tmp_path, monkeypatch):
+    from ptflow.core.agents.form_login import LoginOutcome
+    monkeypatch.setattr(creds.shutil, "which", lambda _b: "/fake/brutus")
+    activity = Activity.named("f", root=tmp_path).ensure()
+    ws = activity.app("10.0.0.0-24")
+    ws.root.mkdir(parents=True, exist_ok=True)
+    tools.write_jsonl(ws.canonical("services.jsonl"),
+                      [{"ip": "10.0.0.5", "port": 8443, "product": "Acme Router", "service": "https"}])
+    tools.write_jsonl(ws.canonical("credential_candidates.jsonl"),
+                      [{"product": "Acme Router", "protocol": "https", "username": "admin",
+                        "password": "acme", "confidence": 0.9, "source_urls": ["u"], "rationale": "r"}])
+
+    class _Probe:
+        available = True
+        def attempt(self, _url, _user, _pw):
+            return LoginOutcome(applicable=True, success=True, confidence="probable", reason="redirect+session")
+    monkeypatch.setattr(creds, "FormLoginProbe", lambda **_k: _Probe())
+
+    creds.creds_test_forms(activity, "10.0.0.0-24")
+    findings = tools.read_jsonl(ws.findings / "creds_forms.jsonl")
+    assert findings
+    assert findings[0]["via"] == "form"
+    assert findings[0]["confidence"] == "probable"
+    assert findings[0]["host"] == "10.0.0.5"
+    assert findings[0]["port"] == 8443
+    assert ((ws.findings / "creds_forms.jsonl").stat().st_mode & 0o777) == 0o600
+
+
+def test_per_app_stages_are_phase_3():
+    stages = creds.per_app_stages()
+    assert {s.name for s in stages} == {"creds_test_brutus", "creds_test_forms"}
+    assert all(s.phase == 3 and s.per_app for s in stages)

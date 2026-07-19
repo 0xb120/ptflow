@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ptflow.core import tools
+from ptflow.core.agents.form_login import FormLoginProbe
 from ptflow.core.log import get_logger, is_verbose
+from ptflow.core.stage import Stage
 from ptflow.pipelines.internal.tasks import BRUTUS, _banner_product, web_targets_from
 
 if TYPE_CHECKING:
@@ -332,3 +334,69 @@ def creds_test_brutus(activity: Activity, app_id: str) -> None:
     tools.write_jsonl(ws.findings / "creds_brutus.jsonl", findings)
     _chmod_600(ws.findings / "creds_brutus.jsonl")
     log.info("  → creds_test_brutus [%s] — %d attempt(s) → %d hit(s)", app_id, len(brutus_attempts), hits)
+
+
+def _enrich_form(  # noqa: PLR0913
+    outcome,  # noqa: ANN001
+    url: str,
+    host: str,
+    port: int,
+    pair,  # noqa: ANN001
+    meta: dict,
+    app_id: str,
+) -> dict:
+    return {
+        "app_id": app_id,
+        "type": "default-credentials",
+        "severity": "high",
+        "via": "form",
+        "tool": "form-login",
+        "host": host,
+        "port": port,
+        "protocol": "http",
+        "url": url,
+        "product": meta.get("product", ""),
+        "username": pair[0],
+        "password": pair[1],
+        "confidence": outcome.confidence or meta.get("confidence"),
+        "source_urls": meta.get("source_urls", []),
+        "rationale": meta.get("rationale", ""),
+        "evidence": f"default credentials accepted on web login form ({outcome.reason})",
+    }
+
+
+def creds_test_forms(activity: Activity, app_id: str) -> None:
+    """LOOP 3 (opt-in) — try curated default credentials on HTTP FORM login panels via the Playwright
+    FormLoginProbe (provider-agnostic, no Anthropic key). Best-effort → findings/creds_forms.jsonl (0600)."""
+    ws = activity.app(app_id)
+    candidates = tools.read_jsonl(ws.canonical("credential_candidates.jsonl"))
+    services = tools.read_jsonl(ws.canonical("services.jsonl"))
+    if not candidates or not services:
+        log.debug("  · skip creds_test_forms [%s] (no candidates/services)", app_id)
+        return
+    probe = FormLoginProbe(settle_ms=2000 if resolve_mode() == "cautious" else 1000)
+    if not probe.available:
+        log.debug("  · skip creds_test_forms [%s] (playwright absent)", app_id)
+        return
+    threshold = parse_lockout_threshold(tools.read_jsonl(ws.findings / "ad_enum.jsonl"))
+    _brutus, form_attempts, _skips = plan_attempts(
+        candidates, services, lockout_threshold=threshold, lockout_default=_lockout_default())
+    findings: list[dict] = []
+    for job in group_forms(form_attempts):
+        for pair in job["pairs"]:
+            outcome = probe.attempt(job["url"], pair[0], pair[1])
+            if outcome.success:
+                findings.append(_enrich_form(outcome, job["url"], job["host"], job["port"], pair,
+                                             job["by_pair"][pair], app_id))
+    tools.write_jsonl(ws.findings / "creds_forms.jsonl", findings)
+    _chmod_600(ws.findings / "creds_forms.jsonl")
+    log.info("  → creds_test_forms [%s] — %d panel(s) → %d hit(s)",
+             app_id, len(group_forms(form_attempts)), len(findings))
+
+
+def per_app_stages() -> tuple[Stage, ...]:
+    """The opt-in phase-3 credential-testing stages (spliced by pipeline.py only when enabled)."""
+    return (
+        Stage("creds_test_brutus", creds_test_brutus, per_app=True, phase=3, net=True),
+        Stage("creds_test_forms", creds_test_forms, per_app=True, phase=3, net=True),
+    )
