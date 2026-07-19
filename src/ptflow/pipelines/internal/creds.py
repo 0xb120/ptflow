@@ -295,7 +295,8 @@ def _enrich_brutus(hits: list[dict], attempt: dict, app_id: str) -> list[dict]:
             "tool": "brutus", "host": host or attempt["host"], "port": port or attempt["port"],
             "protocol": attempt["protocol"], "product": attempt["product"],
             "username": h.get("username", attempt["username"]),
-            "password": h.get("password", attempt["password"]), "confidence": attempt["confidence"],
+            "password": h.get("password", attempt["password"]), "confidence": "verified",
+            "candidate_confidence": attempt["confidence"],
             "source_urls": attempt["source_urls"], "rationale": attempt["rationale"],
             "banner": h.get("banner", ""),
             "evidence": f"default credentials accepted on {attempt['protocol']}"})
@@ -358,7 +359,8 @@ def _enrich_form(  # noqa: PLR0913
         "product": meta.get("product", ""),
         "username": pair[0],
         "password": pair[1],
-        "confidence": outcome.confidence or meta.get("confidence"),
+        "confidence": outcome.confidence,
+        "candidate_confidence": meta.get("confidence"),
         "source_urls": meta.get("source_urls", []),
         "rationale": meta.get("rationale", ""),
         "evidence": f"default credentials accepted on web login form ({outcome.reason})",
@@ -378,11 +380,11 @@ def creds_test_forms(activity: Activity, app_id: str) -> None:
     if not probe.available:
         log.debug("  · skip creds_test_forms [%s] (playwright absent)", app_id)
         return
-    threshold = parse_lockout_threshold(tools.read_jsonl(ws.findings / "ad_enum.jsonl"))
     _brutus, form_attempts, _skips = plan_attempts(
-        candidates, services, lockout_threshold=threshold, lockout_default=_lockout_default())
+        candidates, services, lockout_threshold=None, lockout_default=_lockout_default())
+    jobs = group_forms(form_attempts)
     findings: list[dict] = []
-    for job in group_forms(form_attempts):
+    for job in jobs:
         for pair in job["pairs"]:
             outcome = probe.attempt(job["url"], pair[0], pair[1])
             if outcome.success:
@@ -391,7 +393,7 @@ def creds_test_forms(activity: Activity, app_id: str) -> None:
     tools.write_jsonl(ws.findings / "creds_forms.jsonl", findings)
     _chmod_600(ws.findings / "creds_forms.jsonl")
     log.info("  → creds_test_forms [%s] — %d panel(s) → %d hit(s)",
-             app_id, len(group_forms(form_attempts)), len(findings))
+             app_id, len(jobs), len(findings))
 
 
 def per_app_stages() -> tuple[Stage, ...]:

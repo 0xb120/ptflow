@@ -152,6 +152,8 @@ def test_creds_test_brutus_writes_hit_and_locks_down(activity_with_candidates, m
     assert hit["host"] == "10.0.0.5"
     assert hit["product"] == "Acme NAS"
     assert hit["source_urls"] == ["https://vendor/manual"]
+    assert hit["confidence"] == "verified"
+    assert hit["candidate_confidence"] == 0.95
     assert ((ws.findings / "creds_brutus.jsonl").stat().st_mode & 0o777) == 0o600
 
 
@@ -199,8 +201,12 @@ def test_creds_test_forms_writes_hit(tmp_path, monkeypatch):
     assert findings
     assert findings[0]["via"] == "form"
     assert findings[0]["confidence"] == "probable"
+    assert findings[0]["candidate_confidence"] == 0.9
     assert findings[0]["host"] == "10.0.0.5"
     assert findings[0]["port"] == 8443
+    assert findings[0]["product"] == "Acme Router"
+    assert findings[0]["source_urls"] == ["u"]
+    assert findings[0]["rationale"] == "r"
     assert ((ws.findings / "creds_forms.jsonl").stat().st_mode & 0o777) == 0o600
 
 
