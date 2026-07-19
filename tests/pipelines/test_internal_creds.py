@@ -43,3 +43,33 @@ def test_mode_flags_bundle(monkeypatch):
     assert creds.mode_flags()[:2] == ["-t", "20"]
     monkeypatch.setenv("PTFLOW_CREDS_MODE", "bogus")
     assert creds.resolve_mode() == "cautious"
+
+
+def test_parse_lockout_threshold_reads_ad_password_policy():
+    assert creds.parse_lockout_threshold([{"type": "ad-password-policy", "lockout_threshold": "5"}]) == 5
+    assert creds.parse_lockout_threshold([{"type": "ad-password-policy", "lockout_threshold": "None"}]) == 0
+    assert creds.parse_lockout_threshold([{"type": "ad-users-enumerated"}]) is None
+    assert creds.parse_lockout_threshold([]) is None
+
+
+def test_account_budget_semantics():
+    assert creds.account_budget(None, 3) == 2
+    assert creds.account_budget(0, 3) is None
+    assert creds.account_budget(1, 3) == 0
+    assert creds.account_budget(5, 3) == 4
+
+
+def test_apply_lockout_caps_per_account_and_skips():
+    attempts = [
+        {"product": "DC", "protocol": "smb", "host": "10.0.0.1", "port": 445,
+         "username": "admin", "password": p, "confidence": c}
+        for p, c in (("p1", 0.9), ("p2", 0.5), ("p3", 0.1))
+    ] + [{"product": "SW", "protocol": "ssh", "host": "10.0.0.2", "port": 22,
+          "username": "root", "password": "x", "confidence": 0.9}]
+    kept, skips = creds._apply_lockout(attempts, threshold=2, default=3)
+    assert [a["password"] for a in kept if a["protocol"] == "smb"] == ["p1"]
+    assert {a["password"] for a in kept if a["protocol"] == "ssh"} == {"x"}
+    assert any(s["reason"] == "lockout_budget" for s in skips)
+    kept2, skips2 = creds._apply_lockout(attempts, threshold=1, default=3)
+    assert not [a for a in kept2 if a["protocol"] == "smb"]
+    assert all(s["reason"] == "lockout_policy" for s in skips2 if s["protocol"] == "smb")

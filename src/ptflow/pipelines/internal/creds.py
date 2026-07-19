@@ -120,3 +120,47 @@ def web_urls(services: list[dict]) -> dict[tuple[str, int], str]:
         if host and port.isdigit():
             out[host, int(port)] = url
     return out
+
+
+def parse_lockout_threshold(records: list[dict]) -> int | None:
+    """Account-lockout threshold from ``findings/ad_enum.jsonl``'s ``ad-password-policy`` record. None
+    when no policy was enumerated (caller uses the default); 0 for None/Disabled (unlimited). Pure."""
+    for r in records:
+        if r.get("type") == "ad-password-policy":
+            raw = str(r.get("lockout_threshold", "")).strip().lower()
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            if not digits or raw in ("none", "disabled"):
+                return 0
+            return int(digits)
+    return None
+
+
+def account_budget(threshold: int | None, default: int) -> int | None:
+    """Max login attempts per single account: None = unlimited; 0 = must skip; N = cap. Unknown
+    threshold uses ``default``."""
+    t = default if threshold is None else threshold
+    return None if t <= 0 else t - 1
+
+
+def _apply_lockout(
+    net_attempts: list[dict], threshold: int | None, default: int,
+) -> tuple[list[dict], list[dict]]:
+    """Cap attempts on domain-lockout protocols to ``account_budget`` per (host, protocol, username),
+    highest-confidence first. Non-lockout protocols pass through. Returns (kept, skips)."""
+    budget = account_budget(threshold, default)
+    kept = [a for a in net_attempts if a["protocol"] not in _LOCKOUT_PROTOCOLS]
+    skips: list[dict] = []
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for a in net_attempts:
+        if a["protocol"] in _LOCKOUT_PROTOCOLS:
+            groups.setdefault((a["host"], a["protocol"], a["username"]), []).append(a)
+    for (host, proto, user), atts in groups.items():
+        ordered = sorted(atts, key=lambda a: (a.get("confidence") or 0), reverse=True)
+        if budget is None:
+            kept += ordered
+            continue
+        kept += ordered[:budget]
+        reason = "lockout_policy" if budget == 0 else "lockout_budget"
+        skips += [{"product": a["product"], "reason": reason, "via": "brutus", "host": host,
+                   "port": a["port"], "protocol": proto, "username": user} for a in ordered[budget:]]
+    return kept, skips
