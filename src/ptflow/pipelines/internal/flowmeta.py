@@ -266,6 +266,26 @@ FLOWMETA: dict[str, StepMeta] = {
         notes=("agent:research · net=True · opt-in --ai · non invia IP/hostname nelle query",
                "solo proposte documentate; password file mode 0600; nessun password spraying"),
     ),
+    "creds_test_brutus": StepMeta(
+        summary="[opt-in PTFLOW_CREDS_TEST] LOOP 3 — prova le credenziali default source-grounded "
+                "dell'agente sui servizi non-HTTP e sui pannelli HTTP Basic-auth via Brutus. Solo il set "
+                "curato (mai wordlist / mai --experimental-ai), una invocazione per coppia x socket, lockout-aware.",
+        commands=("brutus --target <ip:port> --protocol <p> -u <u> -p <p> --json <mode-flags>",
+                  "# match prodotto→socket · budget lockout (threshold-1/account su smb/ldap/rdp/winrm)"),
+        outputs=("findings/creds_brutus.jsonl", "raw/brutus/*.jsonl"),
+        notes=("net=True · best-effort (salta se brutus/candidati/servizi assenti) · findings 0600",
+               "PTFLOW_CREDS_MODE→flag reali (cautious=-t 5 --rate-limit 2 …); TLS skip di default"),
+    ),
+    "creds_test_forms": StepMeta(
+        summary="[opt-in PTFLOW_CREDS_TEST] LOOP 3 — prova le credenziali default sui pannelli HTTP "
+                "FORM-based via un FormLoginProbe Playwright NOSTRO (deterministico, niente chiave "
+                "Anthropic): naviga, compila, invia e giudica il successo per euristica (lead/probable).",
+        commands=("FormLoginProbe.attempt(url, user, pass) → judge_login(before, after)",
+                  "# routing socket→web via web_targets_from · allow_private (target interni)"),
+        outputs=("findings/creds_forms.jsonl",),
+        notes=("net=True · best-effort (salta se playwright/chromium assente o nessun form) · findings 0600",
+               "consolidate folda creds_brutus + creds_forms → findings/creds.jsonl (0600)"),
+    ),
 }
 
 _PIVOT = StepMeta(
@@ -299,7 +319,7 @@ SPEC = MapSpec(
            "poi frutti bassi (CVE note offline + check SMB/SNMP/LDAP/nuclei ∥) — con una barriera globale "
            "tra loro. Ogni stage comunica solo via file su disco.",
     steps=FLOWMETA,
-    phase_labels={1: "inventario servizi", 2: "frutti bassi"},
+    phase_labels={1: "inventario servizi", 2: "frutti bassi", 3: "test credenziali default"},
     pivot=("scans/<subnet>/", _PIVOT),
     fanin=("consolidate", _FANIN),
 )
