@@ -629,8 +629,10 @@ def test_creds_stages_present_when_opt_in(monkeypatch):
     from ptflow.pipelines.internal import pipeline as pl
 
     pl = importlib.reload(pl)
-    names = {s.name for s in pl.PIPELINE.stages}
-    assert {"creds_test_brutus", "creds_test_forms"} <= names
-    assert all(s.phase == 3 for s in pl.PIPELINE.stages if s.name.startswith("creds_test"))
-    monkeypatch.delenv("PTFLOW_CREDS_TEST", raising=False)
-    importlib.reload(pl)
+    try:
+        names = {s.name for s in pl.PIPELINE.stages}
+        assert {"creds_test_brutus", "creds_test_forms"} <= names
+        assert all(s.phase == 3 for s in pl.PIPELINE.stages if s.name.startswith("creds_test"))
+    finally:  # restore the default (creds-absent) module state even if an assertion fails
+        monkeypatch.delenv("PTFLOW_CREDS_TEST", raising=False)
+        importlib.reload(pl)
