@@ -93,3 +93,29 @@ def test_split_target():
     assert creds._split_target("10.0.0.5:22") == ("10.0.0.5", 22)
     assert creds._split_target("https://10.0.0.5:8443") == ("10.0.0.5", 8443)
     assert creds._split_target("10.0.0.5") == ("10.0.0.5", 0)
+
+
+def _cand(product, user, pw, conf=0.9):
+    return {"product": product, "username": user, "password": pw, "confidence": conf,
+            "source_urls": ["https://vendor/manual"], "rationale": "manual"}
+
+
+def test_plan_routes_web_to_both_and_net_to_brutus():
+    services = [{"ip": "10.0.0.5", "port": 8443, "product": "Acme Router", "service": "https"},
+                {"ip": "10.0.0.5", "port": 22, "product": "Acme Router", "service": "ssh"}]
+    candidates = [_cand("Acme Router", "admin", "acme"), _cand("Ghost", "root", "x")]
+    brutus, forms, skips = creds.plan_attempts(
+        candidates, services, lockout_threshold=None, lockout_default=3)
+    assert {(a["protocol"], a["port"]) for a in brutus} == {("https", 8443), ("ssh", 22)}
+    assert {a["url"] for a in forms} == {"https://10.0.0.5:8443"}
+    assert any(s["reason"] == "no_match" and s["product"] == "Ghost" for s in skips)
+
+
+def test_group_forms_shape():
+    forms = [{"product": "P", "url": "https://10.0.0.5:8443", "host": "10.0.0.5", "port": 8443,
+              "username": "admin", "password": "a", "confidence": 0.9,
+              "source_urls": ["u"], "rationale": "r"}]
+    (job,) = creds.group_forms(forms)
+    assert job["url"] == "https://10.0.0.5:8443"
+    assert job["pairs"] == [("admin", "a")]
+    assert job["by_pair"][("admin", "a")]["product"] == "P"

@@ -194,3 +194,65 @@ def _split_target(target: str) -> tuple[str, int]:
     tail = target.split("://", 1)[-1]
     host, _, port = tail.rpartition(":")
     return (host, int(port)) if host and port.isdigit() else (tail, 0)
+
+
+def _place_candidate(
+    candidate: dict, sockets: list[ServiceSocket], web_map: dict[tuple[str, int], str],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Route one candidate's pair onto matching sockets: web sockets → a Brutus http/https (Basic) attempt
+    AND a form attempt; mapped non-web sockets → a Brutus attempt; unmapped → skip; no match → no_match."""
+    product = str(candidate.get("product") or "")
+    base = {"product": product, "username": str(candidate.get("username") or ""),
+            "password": str(candidate.get("password") or ""), "confidence": candidate.get("confidence"),
+            "source_urls": list(candidate.get("source_urls") or []),
+            "rationale": str(candidate.get("rationale") or "")}
+    matched = [s for s in sockets if _product_matches(product, s.product)]
+    if not matched:
+        return [], [], [{"product": product, "reason": "no_match", "via": "brutus"}]
+    brutus, forms, skips = [], [], []
+    for s in matched:
+        if (url := web_map.get((s.host, s.port))):
+            scheme = url.split("://", 1)[0]
+            brutus.append({**base, "protocol": scheme, "host": s.host, "port": s.port})
+            forms.append({**base, "url": url, "host": s.host, "port": s.port})
+        elif (proto := socket_proto(s)):
+            brutus.append({**base, "protocol": proto, "host": s.host, "port": s.port})
+        else:
+            skips.append({"product": product, "reason": "unmapped_protocol", "via": "brutus",
+                          "host": s.host, "port": s.port})
+    return brutus, forms, skips
+
+
+def plan_attempts(
+    candidates: list[dict], services: list[dict], *,
+    lockout_threshold: int | None, lockout_default: int,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Curated candidates + fingerprinted services → concrete Brutus/form attempts, applying the
+    per-account lockout budget to the Brutus set. Pure."""
+    sockets = service_sockets(services)
+    web_map = web_urls(services)
+    brutus_attempts: list[dict] = []
+    form_attempts: list[dict] = []
+    skips: list[dict] = []
+    for c in candidates:
+        b, f, s = _place_candidate(c, sockets, web_map)
+        brutus_attempts += b
+        form_attempts += f
+        skips += s
+    brutus_attempts, lockout_skips = _apply_lockout(brutus_attempts, lockout_threshold, lockout_default)
+    return brutus_attempts, form_attempts, skips + lockout_skips
+
+
+def group_forms(form_attempts: list[dict]) -> list[dict]:
+    """One browser session per web panel URL; try all its pairs, keeping per-pair metadata for finding
+    attribution."""
+    jobs: dict[str, dict] = {}
+    for a in form_attempts:
+        job = jobs.setdefault(a["url"], {"url": a["url"], "host": a["host"], "port": a["port"],
+                                         "pairs": [], "by_pair": {}})
+        pair = (a["username"], a["password"])
+        if pair not in job["pairs"]:
+            job["pairs"].append(pair)
+        job["by_pair"][pair] = {"confidence": a["confidence"], "source_urls": a["source_urls"],
+                                "rationale": a["rationale"], "product": a["product"]}
+    return list(jobs.values())
