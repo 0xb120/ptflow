@@ -3,6 +3,14 @@
 - **Date:** 2026-07-19
 - **Status:** Approved (design); pending implementation plan
 - **Scope:** internal pipeline, new phase-3 loop. Active authenticated login attempts (opt-in). RoE-sensitive.
+- **Revision (2026-07-19b):** rewritten after verifying the installed Brutus binary (Task 0). The
+  installed `brutus dev` build has a **flat CLI** (`--target`/`--protocol`/`--nerva`), **not** the
+  `brutus creds`/`brutus web` subcommands an unreliable README summary suggested; and — consistent across
+  the binary's own `--help` and the README — **HTTP form-based login requires Brutus's `--experimental-ai`
+  (Claude Vision + `ANTHROPIC_API_KEY`)**. We rejected Brutus's AI (provider-agnostic seam; internal-RoE
+  screenshot exfiltration). Therefore: **Brutus for non-HTTP + HTTP Basic auth**, and a **new
+  Playwright-based `FormLoginProbe`** (reusing the browser the `research` agent already ships) for
+  form-based panels — deterministic, no Anthropic key.
 
 ## 1. Motivation
 
@@ -16,148 +24,165 @@ conditions}`.
 
 Nothing **tests** these proposals yet. This is exactly the `PTFLOW_CREDS` "credentialed auth … opt-in,
 not yet wired" that CLAUDE.md anticipates. This design adds the testing steps for the **internal**
-pipeline only (`external`/`webscan` do not run the research agent today — a deliberate later phase).
+pipeline only.
 
 ## 2. Goals / Non-goals
 
 **Goals:**
-- Test the agent's curated candidates against the concrete services they were proposed for, for both
-  **non-HTTP** services and **HTTP login panels** (the diverse-panel problem).
-- Precision-first + low volume (only the validated set, never wordlists) so account-lockout risk stays
-  minimal, and hard opt-in gating.
-- Successes become high-severity findings, consolidated to the activity level, with the secret handled
-  safely (plaintext only in a `0600` file; redacted in any rendered report).
-- Reuse the existing file-on-disk / per-app-loop / best-effort conventions with zero `core/` changes.
+- Test the agent's curated candidates against the concrete services they were proposed for, across
+  **non-HTTP** services, **HTTP Basic-auth** panels, and **HTTP form-based** login panels.
+- Precision-first + low volume (only the validated set, never wordlists), hard opt-in gating, lockout
+  awareness — minimal account-lockout risk.
+- Successes become high-severity findings, consolidated to the activity level, secret-safe (plaintext
+  only in `0600` files; redacted in any rendered report).
+- Reuse existing conventions (files-on-disk, per-app loops, best-effort) with **zero `core/` changes to
+  the orchestrator**; the form probe reuses the `research` agent's Playwright + SSRF-safety helpers.
 
 **Non-goals:**
-- No brute-force / password spraying / wordlists — only the curated candidate pairs.
-- No credential testing in `external`/`webscan` (later phase; the agent isn't wired there).
-- No use of Brutus's own `--experimental-ai` (our provider-agnostic, source-grounded agent already does
-  credential research; Brutus stays a deterministic executor fed our validated pairs).
+- No brute-force / spraying / wordlists — only the curated candidate pairs.
+- No credential testing in `external`/`webscan` (the agent isn't wired there — later phase).
+- **No Brutus `--experimental-ai`** (Claude Vision, `ANTHROPIC_API_KEY`): duplicates our provider-agnostic
+  research agent and would exfiltrate internal-panel screenshots to a third party.
 - No persistence of successful sessions / no post-auth actions — a hit is reported, nothing more.
 
-## 3. Engine decision — Brutus for both HTTP and non-HTTP
+## 3. Engines (verified against the installed binary)
 
-Chosen engine: **[Brutus](https://github.com/praetorian-inc/brutus)** (Praetorian, Go, single static
-binary, already installed at `~/go/bin/brutus`; chromium present at `/usr/bin/chromium`). It replaces
-the initially-considered `nxc`+`hydra` hybrid. Rationale (depth + stability):
+Two engines, split by mechanism:
 
-- **Depth, non-HTTP (`brutus creds`):** 27 protocols in one tool — SSH/FTP/telnet/VNC/RDP/SNMP/SMB/
-  LDAP/WinRM + MySQL/Postgres/MSSQL/Mongo/Redis/Oracle/Cassandra/CouchDB/Elasticsearch/InfluxDB/Neo4j/
-  Docker/Kubernetes.
-- **Depth, HTTP (`brutus web`):** natively handles login-panel diversity — HTTP Basic (via
-  `WWW-Authenticate`), **form-based** (headless Chrome renders, analyzes form structure, submits, detects
-  success by page-state diff), and JSON APIs. This is the hard part we do **not** hand-roll.
-- **Stability / integration:** JSONL output (`--json`) = ptflow convention; native **nerva JSON**
-  ingestion — and `internal`'s `fingerprint` stage already writes `services.jsonl` as the output of
-  `nerva --json`; `--mode cautious|default|aggressive` rate-limit preset; SOCKS5. One binary, one output
-  format, one parser.
+### 3a. Brutus — non-HTTP services **and** HTTP Basic auth
+[Brutus](https://github.com/praetorian-inc/brutus) (`~/go/bin/brutus`, Go binary, `PTFLOW_BRUTUS`
+override). Verified `--help`: flat CLI, `--protocol` ∈ {ssh, rdp, ftp, telnet, vnc, smb, ldap, winrm,
+mysql, postgresql, mssql, mongodb, redis, neo4j, cassandra, couchdb, elasticsearch, influxdb, smtp, imap,
+pop3, **http, https**, snmp}. On http/https **without** `--experimental-ai` it tests **HTTP Basic auth**
+only. Invocation (single-target mode, one process per curated pair × socket):
+```
+brutus --target <ip:port> --protocol <proto> -u <user> -p <pass> --json <mode-flags>
+```
+- **No `--mode`/`--targets-file`/`-c`** exist. Our `PTFLOW_CREDS_MODE` maps to a real flag bundle:
+  - `cautious` → `-t 5 --rate-limit 2 --retries 1 --timeout 15s`
+  - `default`  → `-t 10 --retries 2`
+  - `aggressive` → `-t 20 --retries 3`
+- TLS: leave the default (**no `--verify-tls`** ⇒ skip verification, correct for self-signed internal
+  panels; nerva TLS auto-upgrades).
+- `--stop-on-success` defaults true. `--json` prints one success object per line to stdout. `--max-attempts`
+  exists as a tool-side per-user cap; our per-pair invocation already bounds this, so it's not required.
 
-**Known constraints designed around:**
-- `brutus creds` has **no combo-file** (only cartesian `-U`/`-P` or `-u`/`-p`). To preserve exact
-  pairing and keep volume minimal we invoke it **once per curated pair** with `-u`/`-p`.
-- `brutus web` **does** accept explicit pairs via `-c "user1:pass1,user2:pass2"` (not cartesian), so the
-  web path batches all pairs for a target set into one call.
-- Form-mode needs Chromium (present). If absent, web degrades best-effort (Basic-auth still works).
+### 3b. `FormLoginProbe` — HTTP form-based login (our own, Playwright)
+A new `core/agents/form_login.py`. Reuses the `research` agent's Playwright machinery and SSRF helpers
+(`_validate_fetch_url`) but with `allow_private=True` (internal targets are private by design). It
+navigates to the panel, locates the login form deterministically, submits each curated pair, and judges
+success by a conservative heuristic (below). **Provider-agnostic, no Anthropic key.** Form success
+detection is inherently imperfect → findings are **lead-grade** (`confidence:"lead"` unless a strong
+signal fires). An optional enhancement (our provider-agnostic LLM seam locating fields / judging success)
+is a documented follow-up, not v1.
 
 ## 4. Placement in the DAG
 
-New **phase-3 per-app loop** in `internal`, two sibling stages in a new deterministic (non-AI) module
+New **phase-3 per-app loop** in `internal`, two sibling stages in a new module
 `pipelines/internal/creds.py`:
+- `creds_test_brutus` — Brutus over matched sockets (non-HTTP + HTTP Basic).
+- `creds_test_forms` — `FormLoginProbe` over matched HTTP panels (form login).
 
-- `creds_test_net` — `brutus creds` over matched non-HTTP sockets.
-- `creds_test_web` — `brutus web` over matched HTTP panels.
-
-Both `per_app=True, phase=3, net=True`. The global 2→3 barrier guarantees `credential_candidates.jsonl`
-(phase-2 `ai_credential_research`) and `services.jsonl` (phase-1 `fingerprint`) are present. They are
-appended to the pipeline stage tuple via `*_CREDS_STAGES`, where `creds.per_app_stages()` returns `()`
-when `PTFLOW_CREDS_TEST` is off — **absent from the DAG when disabled**, mirroring `_AI_STAGES`.
+Both `per_app=True, phase=3, net=True`. The 2→3 barrier guarantees `credential_candidates.jsonl`
+(phase-2) and `services.jsonl` (phase-1) exist. Spliced via `*_CREDS_STAGES` where
+`creds.per_app_stages()` is included by `pipeline.py` only when `PTFLOW_CREDS_TEST` is set — **absent from
+the DAG when disabled**, mirroring `_AI_STAGES`. **Part A** (`creds_test_brutus` + all wiring) is
+independently mergeable; **Part B** (`creds_test_forms` + `FormLoginProbe`) builds on the same
+primitives and can land second.
 
 ## 5. Gating (safety model)
 
-- **`PTFLOW_CREDS_TEST`** ∈ `{1,on,true,yes}`, default OFF — same parser as `WEB_HANDOFF_ENV`
-  (`tasks.py:1551`). Off ⇒ stages absent ⇒ no-op.
-- **`PTFLOW_CREDS_MODE`** ∈ `cautious|default|aggressive`, default **`cautious`** (5 threads, 2 req/s,
-  1 retry) → Brutus `--mode`. Operator-facing (RoE noise/lockout lever, like `PTFLOW_PROFILE`).
-- **Lockout-aware (concrete rule):** before testing SMB/LDAP/RDP/WinRM on a host, read the password
-  policy `ad_enum` already enumerates (`parse_nxc_pass_pol` → its `lockout_threshold`). The invariant is
-  **never make more than `threshold - 1` attempts against any single account**:
-  - `threshold <= 1` (any failure locks) ⇒ **skip** that protocol on that host, record
-    `{skipped:"lockout_policy"}`.
-  - `threshold >= 2` ⇒ for each account, test at most `threshold - 1` pairs, ordered by descending
-    `confidence` (excess pairs dropped, recorded as `{skipped:"lockout_budget"}`).
-  - No enumerated policy (null-session denied / no AD) ⇒ treat as `threshold` unknown and apply the
-    conservative default `PTFLOW_CREDS_LOCKOUT_DEFAULT` (default `3`, i.e. cap at 2 attempts/account).
-  Lockout-free protocols (SSH/FTP/DB/SNMP/telnet/VNC) are not gated.
+- **`PTFLOW_CREDS_TEST`** ∈ `{1,on,true,yes}`, default OFF — same parser as `WEB_HANDOFF_ENV`.
+- **`PTFLOW_CREDS_MODE`** ∈ `{cautious,default,aggressive}`, default `cautious` → the Brutus flag bundle
+  above; the form probe reads it for its own concurrency/timeout (cautious ⇒ 1 worker, longer settle).
+- **Lockout-aware (concrete rule)** for SMB/LDAP/RDP/WinRM: read `parse_nxc_pass_pol`'s
+  `lockout_threshold` from `findings/ad_enum.jsonl`. Invariant: **never more than `threshold-1` attempts
+  per single account**:
+  - `threshold <= 1` ⇒ **skip** that protocol on that host (`{skipped:"lockout_policy"}`).
+  - `threshold >= 2` ⇒ per account, keep at most `threshold-1` pairs by descending `confidence`
+    (excess → `{skipped:"lockout_budget"}`).
+  - No enumerated policy ⇒ conservative default `PTFLOW_CREDS_LOCKOUT_DEFAULT` (default `3` ⇒ cap 2/account).
+  Lockout-free protocols (SSH/FTP/DB/SNMP/telnet/VNC/HTTP) are not gated.
 - **Curated set only** — never wordlists; never Brutus `--experimental-ai`; never Brutus's embedded
-  defaults. Candidate `conditions` (e.g. "factory-reset-only") are **logged, not blocking** (a device is
-  often not reset — that is the point).
+  defaults. Candidate `conditions` (e.g. "factory-reset-only") are logged, not blocking.
 
 ## 6. Core logic (pure, unit-tested)
 
-Matching candidate → concrete socket is the real code we own:
+Shared by both stages (`pipelines/internal/creds.py`):
+1. **`service_sockets(services)`** → per-socket `{host, port, product, service, banner}` (product from the
+   explicit field else `_banner_product(banner)`).
+2. **`_product_matches(candidate_product, socket_product)`** — bidirectional casefold substring (the
+   `_product_is_observed` rule the agent used).
+3. **Routing:** `web_urls(services)` reuses the tested `web_targets_from` to know which sockets are web
+   (and their `scheme://host:port`). Non-web sockets map to a Brutus `--protocol` via `socket_proto`
+   (`_BRUTUS_PROTO` by service name, then `_PORT_PROTO` by well-known port; `None` ⇒ unmapped skip).
+   Web sockets go to Brutus (as `http`/`https` = Basic auth) **and** to the form probe.
+4. **Lockout budget** (`parse_lockout_threshold` + `account_budget` + `_apply_lockout`) over the
+   non-HTTP/Basic attempts.
+5. **`plan_attempts(...)`** integrates match → route → lockout → `(brutus_attempts, form_attempts, skips)`.
+6. **`parse_brutus_jsonl`** (success records) and **`redact`** (mask password for reports).
 
-1. **Match** each candidate to `services.jsonl` records whose **product matches** (bidirectional
-   casefold substring, the `_product_is_observed` rule) → concrete `host:port` sockets where the pair is
-   meaningful.
-2. **Route** each matched socket HTTP vs non-HTTP reusing the `web_targets_from` rule (protocol
-   http/https, web port, banner) — web sockets → `creds_test_web`, others → `creds_test_net`.
-3. **Protocol map** candidate/nerva service name → Brutus `--protocol` name (`_BRUTUS_PROTO`, e.g.
-   `microsoft-ds`→`smb`, `ms-wbt-server`→`rdp`, `postgresql`→`postgres`). Precision-first: an unmapped
-   protocol is skipped with a logged reason (never guessed).
+## 7. Invocation & output
 
-## 7. Invocation
+- **`creds_test_brutus`:** for each curated pair, for each matched socket (non-web via its protocol; web
+  via `http`/`https`), run `brutus --target <ip:port> --protocol <p> -u <u> -p <p> --json <mode-flags>`
+  via a bounded best-effort runner (stdout persisted to `raw/brutus/`). Parse hits → enrich with product/
+  source/confidence → `findings/creds_brutus.jsonl` (`0600`).
+- **`creds_test_forms`:** for each matched web panel, `FormLoginProbe.attempt(url, user, pass)` per curated
+  pair (sequential; browser is heavy) → `findings/creds_forms.jsonl` (`0600`). Skips cleanly when
+  Playwright/Chromium is unavailable or no form is present.
+- **`FormLoginProbe.attempt` heuristic:** navigate (`domcontentloaded` + settle); locate
+  `input[type=password]` (first visible) and a username field (same form: `input[type=email]`,
+  `[name*=user]`, `[name*=login]`, else the preceding text input); fill; submit (click
+  `button[type=submit],input[type=submit]` else Enter); wait for load/settle. **Success** =
+  password field gone from the result **and** (final URL path changed **or** a new session-looking cookie
+  set) **and** no visible error marker; a strong signal (redirect to a dashboard-y path + auth cookie)
+  ⇒ `confidence:"probable"`, otherwise `"lead"`. **Failure/again-on-login** ⇒ no finding. No form found
+  ⇒ not-applicable (no finding, no error). Per-attempt bounded by the browser timeout.
+- **Record** (both stages): `{app_id, type:"default-credentials", severity:"high", via:"brutus"|"form",
+  tool, host, port, protocol, product, username, password, confidence, source_urls, rationale, banner?,
+  evidence}`. Skip records carry `{skipped:true, reason, ...}` and no password.
 
-- **`creds_test_net`:** group matched sockets by Brutus protocol; per curated pair invoke
-  `brutus creds --protocol <X> --targets-file <sockets.txt> -u <user> -p <pass> --mode <mode> --json
-  -o raw/brutus/creds-<X>-<i>.jsonl`. Volume = number of curated pairs (minimal).
-- **`creds_test_web`:** one call per matched web-socket group with all pairs inline:
-  `brutus web --targets-file <urls.txt> -c "u1:p1,u2:p2,…" --mode <mode> --json -o raw/brutus/web.jsonl`.
-  Target URLs are `scheme://host:port` (https for TLS/web port, per `web_targets_from`).
-- **Best-effort everywhere:** binary absent / non-zero exit / timeout ⇒ stage logs and writes `[]`,
-  never aborts (like every internal check; the teardown-kill contract still applies — no per-tool
-  timeout babysitting beyond Brutus's own `--timeout`).
+## 8. Consolidate & secret handling
 
-## 8. Output, consolidate, redaction
-
-- Per-app (write-once, one file per writer): `creds_test_net` → `scans/<subnet>/findings/creds_net.jsonl`;
-  `creds_test_web` → `scans/<subnet>/findings/creds_web.jsonl`.
-- Enriched record: `{app_id, host, port, protocol, product, username, password, confidence,
-  source_urls, rationale, conditions, banner, tool:"brutus", via:"creds"|"web"}`. A gate-skip record is
-  `{app_id, host, port, protocol, skipped:"lockout_policy"|"unmapped_protocol"|"no_match"}`.
-- **`consolidate`** folds both per-app files by type → `<activity>/findings/creds.jsonl` (add `creds` to
-  `_CONSOLIDATE_SOURCES`, exactly like cve/dast fold surface+deep). Each activity finding is stamped
-  `app_id`.
-- **Secret handling:** the findings JSONL is `chmod 0600` and carries the plaintext password (it is the
-  finding); **any rendered report masks it (`****`)**. This mirrors `credential_candidates.jsonl`'s
-  `0600` treatment.
+- Per-app (write-once): `creds_test_brutus` → `findings/creds_brutus.jsonl`; `creds_test_forms` →
+  `findings/creds_forms.jsonl`.
+- **`consolidate`** folds both by type → `<activity>/findings/creds.jsonl` (add
+  `"creds.jsonl": ("findings/creds_brutus.jsonl", "findings/creds_forms.jsonl")` to
+  `_CONSOLIDATE_SOURCES`), each record stamped `app_id`.
+- **Secret handling:** `findings/creds_*.jsonl` and the consolidated `findings/creds.jsonl` are
+  `chmod 0600`; passwords are plaintext only there; `redact()` masks them for any rendered report; never
+  logged.
 
 ## 9. Surrounding wiring
 
-- **Requirements/doctor:** add `brutus` to internal `_OPTIONAL_TOOLS` (opt-in feature ⇒ warns, never
-  fails the `doctor` gate). Chromium stays implicit (web degrades if absent).
-- **Flow map:** add `StepMeta` for `creds_test_net`/`creds_test_web` in `internal/flowmeta.py`
-  (documentation; not gate-required since the stages are absent by default, same as `ai_credential_research`).
-- **Config snapshot:** `PTFLOW_CREDS_TEST`/`PTFLOW_CREDS_MODE` recorded in `<activity>/config.toml` via
-  the existing `runconfig` snapshot if surfaced there; otherwise logged at preflight like `PTFLOW_PROFILE`.
+- **Requirements/doctor:** add `brutus` to internal `_OPTIONAL_TOOLS` (opt-in ⇒ warns, never fails the
+  gate). Playwright/Chromium stay implicit (the form stage degrades if absent).
+- **Flow map:** `StepMeta` for `creds_test_brutus`/`creds_test_forms` + `phase_labels[3]` in
+  `internal/flowmeta.py`.
+- **Knobs (env, v1):** `PTFLOW_CREDS_TEST`, `PTFLOW_CREDS_MODE`, `PTFLOW_CREDS_LOCKOUT_DEFAULT`,
+  `PTFLOW_BRUTUS`; documented in `ptflow.toml.example` + CLAUDE.md.
 
 ## 10. Testing
 
-- Pure-unit: candidate→socket matching, HTTP/non-HTTP routing, `_BRUTUS_PROTO` mapping, Brutus JSONL
-  parsing (fixture corpus, as with the existing `parse_nxc_*`/`parse_*` parsers), the lockout gate, and
-  the redaction helper.
-- Stage-level: `PTFLOW_CREDS_TEST` off ⇒ stages absent from the graph; on with no candidates ⇒ clean
-  no-op; on with a fake Brutus stub ⇒ findings written + consolidated + `0600`.
-- Optional e2e-smoke on a loopback service (as `internal`'s existing checks are smoke-tested).
+- Pure-unit: matching, routing, `socket_proto`, lockout parse/budget, `parse_brutus_jsonl`, mode-flag
+  bundle, `redact`, `plan_attempts`, the form success-heuristic decision function (fed synthetic
+  before/after page states — pure, no real browser).
+- Stage-level with a monkeypatched Brutus runner / a fake browser: findings written + `0600`; consolidate
+  fold; `PTFLOW_CREDS_TEST` off ⇒ stages absent.
+- Optional e2e-smoke on a loopback HTTP Basic realm + a trivial login form.
 
 ## 11. Alternatives rejected
 
-- **`nxc` + `hydra` hybrid:** its only advantage (reuse of existing `nxc` parsers) is outweighed by two
-  engines/outputs, a new hydra parser, and — decisively — no native HTTP-panel handling (we'd hand-roll
-  form recipes / drive Playwright). Brutus covers both with one integration.
-- **Brutus `--experimental-ai`:** duplicates our source-grounded research agent, is non-deterministic,
-  and is Anthropic-key-only (conflicts with the provider-agnostic seam). We feed our validated pairs.
-- **Testing in `external`/`webscan` now:** the research agent isn't wired there and internet-facing
-  login-spraying is a heavier RoE decision — deliberately a later phase.
-- **Combo-file for `brutus creds`:** unsupported; per-pair `-u`/`-p` invocation both preserves exact
-  pairing and keeps volume minimal (better for lockout anyway).
+- **Trusting the WebFetch README (`brutus creds`/`web` subcommands, `-c`/`--mode`):** contradicted by the
+  installed binary's own `--help` (and the README summary confabulated release notes). The binary is
+  ground truth.
+- **Brutus `--experimental-ai` for HTTP forms:** the only way to get form login *from Brutus*, but needs
+  `ANTHROPIC_API_KEY`, ships internal-panel screenshots to a third party (internal-RoE), duplicates our
+  agent, and is non-deterministic. Rejected → we drive forms ourselves.
+- **`nxc`+`hydra` hybrid:** superseded; Brutus covers all non-HTTP + Basic in one integration.
+- **A single web stage doing Basic+form:** split so Brutus (Basic) and the Playwright probe (form) stay
+  single-purpose and independently testable; a web socket is simply tried by both (each yields a finding
+  only if its mechanism works).
+- **LLM-assisted form field-location/success-judging in v1:** deferred to a follow-up (would reintroduce
+  an AI-stage dependency); v1 is a deterministic heuristic, lead-grade.
