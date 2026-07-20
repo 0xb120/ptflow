@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Self
 
 import pytest
 
@@ -65,6 +66,17 @@ def test_home_profile_is_gentler_than_wide():
 def test_wide_profile_matches_legacy_rates():
     # `wide` must reproduce today's values so the default run is unchanged
     assert (tasks.WIDE.naabu_rate, tasks.WIDE.nuclei_rl, tasks.WIDE.ferox_threads) == ("1000", "150", "5")
+
+
+def test_profile_bounds_dalfox_workers_and_vuln_concurrency():
+    # dalfox timeouts (kindertap run 2026-07-20): -w 30 could not finish reflect-heavy endpoints
+    # (~10k dalfox queries) within the per-request cap. Workers are now profile-driven; home stays
+    # gentler than wide, and a process-wide vuln-scanner cap bounds concurrent dalfox/sqlmap (the
+    # chromedp-crash + aggregate-load fix — the analog of _HEADLESS_SLOTS for browser-spawning tools).
+    assert int(tasks.HOME.dalfox_workers) <= int(tasks.WIDE.dalfox_workers)
+    assert int(tasks.HOME.vuln_conc) <= int(tasks.WIDE.vuln_conc)
+    assert int(tasks.WIDE.dalfox_workers) >= 100     # target-fast default; -w 30 was the timeout cause
+    assert tasks._VULN_SLOTS._initial_value == int(tasks.PROFILE.vuln_conc)
 
 
 def test_slug_is_filesystem_safe():
@@ -2244,6 +2256,96 @@ def test_parse_sqlmap_extracts_injection_points():
 
 def test_parse_sqlmap_empty_when_not_injectable():
     assert tasks.parse_sqlmap("all tested parameters do not appear to be injectable") == []
+
+
+def test_parse_sqlmap_dbms_ignores_force_dbms_hint():
+    # Regression: sqlmap prints a UNION "…try to force the back-end DBMS (e.g. '--dbms=mysql')"
+    # HINT before the confirmed result line. re.search grabbed the first "back-end DBMS" match, so
+    # the finding's dbms became the hint text instead of the real fingerprint. Anchor to the result
+    # line (": <dbms>" or " is <dbms>"), never the hint.
+    out = (
+        "[WARNING] if UNION based SQL injection is not detected, please consider and/or try to "
+        "force the back-end DBMS (e.g. '--dbms=mysql')\n"
+        "sqlmap identified the following injection point(s) with a total of 684 HTTP(s) requests:\n"
+        "---\n"
+        "Parameter: schoolName (GET)\n"
+        "    Type: boolean-based blind\n"
+        "    Title: AND boolean-based blind - WHERE or HAVING clause\n"
+        "    Payload: schoolName=x) AND 4841=4841 AND (8371=8371\n"
+        "---\n"
+        "back-end DBMS: H2 (Apache Ignite fork)\n"
+    )
+    recs = tasks.parse_sqlmap(out, url="https://t/x?schoolName=x")
+    assert len(recs) == 1
+    assert recs[0]["dbms"] == "H2 (Apache Ignite fork)"
+
+
+def test_run_sqlmap_command_omits_text_only(tmp_path, monkeypatch):
+    # --text-only compares visible text only; on a content-dynamic page it defeats sqlmap's own
+    # dynamic-content + false-positive checks, spuriously "confirming" boolean-based blind SQLi
+    # (verified: a non-injectable registration form was flagged, TRUE==FALSE responses identical).
+    # The command must NOT carry it, while keeping the core detection flags + --force-ssl for https.
+    from ptflow.core.paths import AppWorkspace
+
+    fake_sqlmap = tmp_path / "sqlmap.py"
+    fake_sqlmap.write_text("", encoding="utf-8")
+    monkeypatch.setattr(tasks, "_SQLMAP_SCRIPT", str(fake_sqlmap))
+    monkeypatch.setattr(tasks, "SQLMAP_CMD", ["python3", str(fake_sqlmap)])
+    calls: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(list(command))
+        return ""
+
+    monkeypatch.setattr(tasks.tools, "run", fake_run)
+    ws = AppWorkspace(tmp_path / "app").ensure()
+    request = {"url": "https://a.test/?q=1", "raw": "GET /?q=1 HTTP/1.1\r\nHost: a.test\r\n\r\n"}
+    tasks._run_sqlmap(ws, [request], out_name="sqli.jsonl", label="app")
+
+    cmd = next(c for c in calls if any("sqlmap" in str(part) for part in c))
+    assert "--text-only" not in cmd
+    assert "--batch" in cmd
+    assert "--force-ssl" in cmd  # https target
+
+
+class _CountingCM:
+    """Stand-in for a BoundedSemaphore that records how many times it was entered as a context
+    manager, so a test can assert a subprocess passed through the concurrency gate."""
+
+    def __init__(self) -> None:
+        self.entered = 0
+
+    def __enter__(self) -> Self:
+        self.entered += 1
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+
+def test_run_dalfox_skips_mining_uses_profile_workers_and_the_vuln_gate(tmp_path, monkeypatch):
+    # Root cause of the dalfox timeouts (kindertap 2026-07-20): -w 30 vs endpoints generating ~10k
+    # queries, dalfox's built-in param mining (redundant with param_fuzz) inflating the volume, and no
+    # process-wide cap on concurrent scanners (which crashed chromedp under fan-out). The command must
+    # skip mining and use the profile worker count, and every invocation must pass the _VULN_SLOTS gate.
+    from ptflow.core.paths import AppWorkspace
+
+    monkeypatch.setattr(tasks.shutil, "which", lambda _b: "/usr/bin/dalfox")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(tasks.tools, "run", lambda command, **_k: calls.append(list(command)) or "")
+    gate = _CountingCM()
+    monkeypatch.setattr(tasks, "_VULN_SLOTS", gate)
+
+    ws = AppWorkspace(tmp_path / "app").ensure()
+    request = {"url": "https://a.test/?q=1", "raw": "GET /?q=1 HTTP/1.1\r\nHost: a.test\r\n\r\n",
+               "params": [{"name": "q", "loc": "query"}]}
+    tasks._run_dalfox(ws, [request], out_name="xss.jsonl", label="app")
+
+    cmd = next(c for c in calls if any("dalfox" in str(part) for part in c))
+    assert "--skip-mining-all" in cmd                 # param_fuzz owns hidden-param discovery
+    assert "-w" in cmd                                 # profile-driven worker count (not the old -w 30)
+    assert tasks.DALFOX_WORKERS in cmd
+    assert gate.entered == 1                            # the scan passed the process-wide vuln gate
 
 
 def test_correlate_oast_matches_marker_dedups_and_ignores_noise():

@@ -71,12 +71,22 @@ class Profile:
     ferox_threads: str       # feroxbuster -t
     ferox_scan_limit: str    # feroxbuster -L (concurrent dir scans)
     shuffledns_conc: str     # shuffledns -t (concurrent active DNS resolutions)
+    dalfox_workers: str      # dalfox -w (concurrent payloads per scan — the prime dalfox-runtime knob)
+    vuln_conc: str           # process-wide concurrent dalfox/sqlmap scans (across ALL app groups)
 
 
+# dalfox_workers: the 2026-07-20 kindertap run timed out 33/42 dalfox scans because -w was pinned at 30
+# — a reflect-heavy endpoint generates ~10k dalfox queries that cannot finish in the per-request cap at
+# that width, even against a fast (~80ms) target. dalfox's own default is 100; `home` stays gentler.
+# vuln_conc bounds concurrent scanner PROCESSES engagement-wide (the per-app VULN_FANOUT is unbounded
+# across groups), so many dalfox headless-verify chromiums can't pile up (the run's chromedp Allocate
+# crash) and aggregate target load stays capped — the _HEADLESS_SLOTS pattern for the vuln scanners.
 WIDE = Profile(name="wide", naabu_rate="1000", naabu_conc="50", nuclei_rl="150", nuclei_conc="25",
-               ferox_threads="5", ferox_scan_limit="2", shuffledns_conc="2000")
+               ferox_threads="5", ferox_scan_limit="2", shuffledns_conc="2000",
+               dalfox_workers="100", vuln_conc="6")
 HOME = Profile(name="home", naabu_rate="300", naabu_conc="20", nuclei_rl="50", nuclei_conc="10",
-               ferox_threads="3", ferox_scan_limit="1", shuffledns_conc="500")
+               ferox_threads="3", ferox_scan_limit="1", shuffledns_conc="500",
+               dalfox_workers="50", vuln_conc="3")
 _PROFILES = {p.name: p for p in (WIDE, HOME)}
 
 
@@ -438,24 +448,35 @@ def _dast_selection(settings: dastconfig.Settings) -> dastconfig.Selection:
 # process per request so EVERY param location is tested (query/body/json/header/cookie), not GET-only.
 # No candidate heuristic (gf-style param-NAME routing deliberately rejected): every parameterized
 # request is a candidate and each tool's OWN engine decides — dalfox by reflection+context, sqlmap by
-# its boolean/error/union/time tests. NOT --smart: its basic heuristic only fires on a reflected DBMS
-# error, so a boolean/UNION SQLi that leaks NO error (e.g. ginandjuice `category`) is skipped untested
-# — verified. We run the full per-param tests + --text-only (compare visible text only) so detection
-# survives a content-DYNAMIC page, where the default page-comparison is "not stable" and misses the
-# injection — verified: --smart→0, --text-only L1/R1→boolean+UNION in ~14s. Surface (phase 2) + delta
-# (phase 6), mirroring dast/dast_full. Best-effort; per-request wall-clock cap (arjun/x8 livelock lesson).
+# its boolean/error/union/time tests. NOT --smart (its basic heuristic only fires on a reflected DBMS
+# error, so a boolean/UNION SQLi that leaks NO error — e.g. ginandjuice `category` — is skipped
+# untested) and NOT --text-only: comparing visible text only defeats sqlmap's own dynamic-content +
+# false-positive checks on a content-DYNAMIC page, spuriously "confirming" boolean-based blind SQLi
+# (verified 2026-07-20: a non-injectable registration form was flagged; its TRUE/FALSE responses were
+# byte-identical). sqlmap's DEFAULT page-comparison both DETECTS ginandjuice `category` AND REJECTS
+# that FP (both verified). Surface (phase 2) + delta (phase 6), mirroring dast/dast_full. Best-effort;
+# per-request wall-clock cap (arjun/x8 livelock lesson).
 _DALFOX_BIN = Path.home() / "go" / "bin" / "dalfox"
 DALFOX = str(_DALFOX_BIN) if _DALFOX_BIN.exists() else "dalfox"
 _SQLMAP_SCRIPT = os.environ.get("PTFLOW_SQLMAP") or "/opt/sqlmap-dev/sqlmap.py"
 SQLMAP_CMD = [sys.executable, _SQLMAP_SCRIPT]   # sqlmap is a python script, not a PATH binary
 VULN_MAX_REQUESTS = 40      # base per-app cap; M1 redistributes unused engagement capacity by risk
-VULN_FANOUT = 3             # concurrent scanner processes per app (each is itself network-heavy)
-VULN_TOOL_TIMEOUT = 180     # per-request wall-clock cap (s) — a slow target must not hang the loop
-DALFOX_WORKERS = "30"       # dalfox -w (concurrent payloads per request)
+VULN_FANOUT = 3             # concurrent scanner processes per app (bounded engagement-wide by _VULN_SLOTS)
+VULN_TOOL_TIMEOUT = 300     # per-request wall-clock cap (s) — headroom for a big scan to FINISH (was 180,
+                            #   which killed reflect-heavy dalfox scans mid-flight); a slow one still can't
+                            #   hang the loop
+DALFOX_WORKERS = PROFILE.dalfox_workers  # dalfox -w (concurrent payloads per scan; -w 30 caused timeouts)
 DALFOX_HTTP_TIMEOUT = "10"  # dalfox --timeout (per HTTP request)
 SQLMAP_LEVEL = "1"          # sqlmap --level (1 = query/cookie; polite on live infra)
 SQLMAP_RISK = "1"           # sqlmap --risk (1 = safe payloads only)
 SQLMAP_THREADS = "4"        # sqlmap --threads
+# Process-wide cap on concurrent dalfox/sqlmap SCANS across ALL app groups. VULN_FANOUT bounds them
+# per-app but nothing bounded the aggregate — several groups' xss/sqli stages run in parallel (net cap),
+# each fanning out VULN_FANOUT scans, each dalfox spinning a headless chromium for DOM verification. That
+# pile-up crashed chromedp (`Allocate` panic, exit 2) on the 2026-07-20 run and multiplied target load.
+# Acquired around each scanner subprocess (leaf lock — nothing else acquired while held, so no deadlock
+# with the orchestrator's net/fan-out semaphores). Same pattern as _HEADLESS_SLOTS for headless katana.
+_VULN_SLOTS = threading.BoundedSemaphore(int(PROFILE.vuln_conc))
 
 # OAST / blind XSS (OPT-IN, best-effort) — dalfox -b fires blind payloads at an interactsh callback; the
 # hit lands on the interactsh SERVER, not dalfox's output. So with PTFLOW_OAST on we run an interactsh-client
@@ -5582,7 +5603,7 @@ def parse_sqlmap(out: str, *, url: str | None = None) -> list[dict]:
     finding per (param, technique) from each Type/Title/Payload triple, stamped with the back-end DBMS.
     Pure; tolerant of empty/garbled output (returns [] when no injection block is present)."""
     text = _ANSI_RE.sub("", out or "")
-    dm = re.search(r"back-end DBMS(?:\s+is)?:?\s*([^\n]+)", text)
+    dm = re.search(r"back-end DBMS(?::|\s+is)\s+([^\n]+)", text)
     dbms = dm.group(1).strip() if dm else None
     findings: list[dict] = []
     for pm in re.finditer(r"^Parameter:\s*(?P<param>.+?)\s*\((?P<loc>[^)]+)\)\s*$(?P<body>.*?)"
@@ -5704,8 +5725,12 @@ def _run_dalfox(  # noqa: C901
         i, r = i_r
         reqfile = reqdir / f"{stage}_{i}.txt"
         reqfile.write_text(r.get("raw") or "", encoding="utf-8")
+        # --skip-mining-all: dalfox's built-in dict+DOM parameter mining (default ON) brute-forces a
+        # wordlist of param NAMES on every request — redundant with our dedicated param_fuzz (arjun/x8)
+        # stage and a major driver of the ~10k-query-per-endpoint volume that blew the per-request cap.
         cmd = [DALFOX, "file", str(reqfile), "--rawdata", "--format", "jsonl", "--no-color",
-               "--skip-bav", "-w", DALFOX_WORKERS, "--timeout", DALFOX_HTTP_TIMEOUT, *auth]
+               "--skip-bav", "--skip-mining-all", "-w", DALFOX_WORKERS,
+               "--timeout", DALFOX_HTTP_TIMEOUT, *auth]
         if domain:
             marker = f"b{i}"                             # unique per-request callback subdomain
             marker_map[marker] = r
@@ -5713,10 +5738,11 @@ def _run_dalfox(  # noqa: C901
         if (r.get("url") or "").startswith("http://"):
             cmd.append("--http")          # raw mode defaults to https; force http where that's the scheme
         try:
-            output = tools.run(
-                cmd, stdin="", timeout=VULN_TOOL_TIMEOUT, check=True,
-                stream_stderr=is_verbose(), stderr_path=reqdir / f"{stage}_{i}.stderr.log",
-            )
+            with _VULN_SLOTS:              # bound concurrent scanner+chromium count engagement-wide
+                output = tools.run(
+                    cmd, stdin="", timeout=VULN_TOOL_TIMEOUT, check=True,
+                    stream_stderr=is_verbose(), stderr_path=reqdir / f"{stage}_{i}.stderr.log",
+                )
             return "success", None, parse_dalfox(output)
         except subprocess.CalledProcessError as exc:
             return "nonzero", f"exit-{exc.returncode}", parse_dalfox(str(exc.output or ""))
@@ -5749,12 +5775,14 @@ def _run_dalfox(  # noqa: C901
 def _run_sqlmap(  # noqa: C901
     ws: AppWorkspace, requests_: list[dict], *, out_name: str, label: str,
 ) -> None:
-    """Run sqlmap over each candidate request's `raw` (-r), one process per request. --text-only (NOT
-    --smart): --smart's basic heuristic only fires on a reflected DBMS error, so it skips a boolean/UNION
-    SQLi that leaks none (ginandjuice `category`); --text-only compares visible text so detection holds on
-    a content-dynamic ("not stable") page. Injection block parsed from stdout → findings/<out_name>.
-    Best-effort: skips if the sqlmap script or parameterized requests are absent. On the per-request
-    timeout that request yields nothing (sqlmap prints its result block at the end)."""
+    """Run sqlmap over each candidate request's `raw` (-r), one process per request. Uses sqlmap's
+    DEFAULT page-comparison — NOT --smart (its heuristic only fires on a reflected DBMS error, skipping
+    an error-less boolean/UNION SQLi like ginandjuice `category`) and NOT --text-only (which, by
+    comparing visible text only, defeats sqlmap's dynamic-content + false-positive checks on a
+    content-dynamic page → boolean-based-blind FPs; verified 2026-07-20 on a non-injectable registration
+    form). Default comparison detects ginandjuice AND rejects that FP. Injection block parsed from stdout
+    → findings/<out_name>. Best-effort: skips if the sqlmap script or parameterized requests are absent.
+    On the per-request timeout that request yields nothing (sqlmap prints its result block at the end)."""
     stage = out_name.removesuffix(".jsonl")
     if not requests_:
         log.debug("  · skip %s (no parameterized requests) for %s", stage, label)
@@ -5781,7 +5809,7 @@ def _run_sqlmap(  # noqa: C901
         i, r = i_r
         reqfile = reqdir / f"{stage}_{i}.txt"
         reqfile.write_text(r.get("raw") or "", encoding="utf-8")
-        cmd = [*SQLMAP_CMD, "-r", str(reqfile), "--batch", "--text-only", "--level", SQLMAP_LEVEL,
+        cmd = [*SQLMAP_CMD, "-r", str(reqfile), "--batch", "--level", SQLMAP_LEVEL,
                "--risk", SQLMAP_RISK, "--threads", SQLMAP_THREADS, "--disable-coloring",
                "--output-dir", str(reqdir / f"out_{i}")]
         # The `raw` request carries only `Host:` (no scheme), so sqlmap defaults to http — on an
@@ -5796,10 +5824,11 @@ def _run_sqlmap(  # noqa: C901
             # from STDIN and IGNORES `-r` (tests nothing). A pty slave keeps -r honoured; --batch means
             # it never blocks reading it. Default verbosity (NOT -v 0, which suppresses the injection
             # block parse_sqlmap keys on).
-            output = tools.run(
-                cmd, stdin_tty=True, timeout=VULN_TOOL_TIMEOUT, check=True,
-                stream_stderr=is_verbose(), stderr_path=reqdir / f"{stage}_{i}.stderr.log",
-            )
+            with _VULN_SLOTS:             # shared engagement-wide scanner cap (dalfox ∥ sqlmap)
+                output = tools.run(
+                    cmd, stdin_tty=True, timeout=VULN_TOOL_TIMEOUT, check=True,
+                    stream_stderr=is_verbose(), stderr_path=reqdir / f"{stage}_{i}.stderr.log",
+                )
             return "success", None, parse_sqlmap(output, url=r.get("url"))
         except subprocess.CalledProcessError as exc:
             parsed = parse_sqlmap(str(exc.output or ""), url=r.get("url"))

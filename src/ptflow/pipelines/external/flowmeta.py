@@ -317,25 +317,27 @@ FLOWMETA: dict[str, StepMeta] = {
                 "candidato (NIENTE routing per nome stile gf); dalfox decide per riflessione+contesto.",
         commands=(
             "# candidati = request parametrizzati del catalogo superficie (cap VULN_MAX_REQUESTS=40)",
-            "dalfox file <raw> --rawdata --format jsonl --skip-bav -w 30 --timeout 10 [--http] [-H auth]",
+            "dalfox file <raw> --rawdata --format jsonl --skip-bav --skip-mining-all -w <profilo> "
+            "--timeout 10 [--http] [-H auth]   # skip-mining: param_fuzz possiede la scoperta parametri",
             "# 1 processo per request (raw Burp/ZAP) → testa query/body/json/header, non solo GET",
             "# PTFLOW_OAST=on: interactsh-client per il pass + -b https://b<i>.<domain> (callback per-request)",
             "#   → correlate_oast: full-id <marker>.<uid> → request → finding poc_kind:blind (solo sincroni)",
         ),
         outputs=("findings/xss.jsonl",),
         notes=("best-effort (salta se dalfox assente / nessun request parametrizzato)",
-               "cap wall-clock per-request VULN_TOOL_TIMEOUT (no hang) · pool VULN_FANOUT",
+               "cap wall-clock per-request VULN_TOOL_TIMEOUT (no hang) · pool VULN_FANOUT per-app",
+               "-w = profilo (wide 100 · home 50) · concorrenza scanner globale _VULN_SLOTS (wide 6 · home 3)",
                "consuma il `raw` del catalogo: stesso vantaggio full-request del DAST, non liste di URL",
                "OAST opt-in (PTFLOW_OAST): blind XSS via interactsh ≥1.3, solo callback SINCRONI nella run"),
     ),
     "sqli": StepMeta(
         summary="FASE 2 — SQLi dedicato (sqlmap) sulla superficie esplorabile: sqlmap -r sul `raw` di ogni "
-                "request parametrizzato, --smart lascia decidere al motore (no routing per nome). Prende "
+                "request parametrizzato, il motore DEFAULT decide (no routing per nome). Prende "
                 "le SQLi blind/time-based che i template error-based di nuclei mancano.",
         commands=(
             "# candidati = request parametrizzati del catalogo superficie (cap VULN_MAX_REQUESTS=40)",
-            "sqlmap -r <raw> --batch --smart --level 1 --risk 1 --threads 4 --disable-coloring [-H auth]",
-            "# 1 processo per request · --smart = test pesanti solo su euristica positiva (politeness)",
+            "sqlmap -r <raw> --batch --level 1 --risk 1 --threads 4 --disable-coloring [--force-ssl] [-H auth]",
+            "# 1 processo per request · page-comparison DEFAULT (no --text-only/--smart: causavano FP boolean)",
         ),
         outputs=("findings/sqli.jsonl",),
         notes=("best-effort (salta se lo script sqlmap assente / nessun request parametrizzato)",
@@ -530,7 +532,8 @@ FLOWMETA: dict[str, StepMeta] = {
                 "param scoperti — non ri-scansiona ciò che la FASE 2 ha già coperto.",
         commands=(
             "# candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)",
-            "dalfox file <raw> --rawdata --format jsonl --skip-bav -w 30 --timeout 10 [--http] [-H auth]",
+            "dalfox file <raw> --rawdata --format jsonl --skip-bav --skip-mining-all -w <profilo> "
+            "--timeout 10 [--http] [-H auth]   # skip-mining: param_fuzz possiede la scoperta parametri",
         ),
         outputs=("findings/xss_full.jsonl", "raw/ranking/xss_full*.jsonl"),
         notes=("barriere full-catalog + param globali · best-effort · cap wall-clock per-request",
@@ -539,10 +542,10 @@ FLOWMETA: dict[str, StepMeta] = {
     ),
     "sqli_full": StepMeta(
         summary="FASE 6 — SQLi dedicato (sqlmap) sulla superficie INDOVINATA: il duale di dast_full. -r sul "
-                "`raw` del DELTA (full meno superficie) + i request dei param scoperti; --smart decide.",
+                "`raw` del DELTA (full meno superficie) + i request dei param scoperti; motore DEFAULT decide.",
         commands=(
             "# candidati = request parametrizzati del DELTA + build_fuzz_requests(params) (cap VULN_MAX_REQUESTS)",
-            "sqlmap -r <raw> --batch --smart --level 1 --risk 1 --threads 4 --disable-coloring [-H auth]",
+            "sqlmap -r <raw> --batch --level 1 --risk 1 --threads 4 --disable-coloring [--force-ssl] [-H auth]",
         ),
         outputs=("findings/sqli_full.jsonl", "raw/ranking/sqli_full*.jsonl"),
         notes=("barriere full-catalog + param globali · best-effort · cap wall-clock per-request",

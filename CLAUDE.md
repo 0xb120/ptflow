@@ -1123,8 +1123,8 @@ flow changed:
   `openai-compatible` endpoint. All use the `openai` SDK from the optional `ai` extra; named hosted
   providers read `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` / `HF_TOKEN`, while `PTFLOW_AI_MODEL` is
   always explicit.
-  `claude-code` remains a legacy opt-in backend isolated in `ai-claude`; it is no longer installed or
-  selected by default. Structured output is **hybrid**: native schema support first, falling back to
+  (The legacy `claude-code` / Claude Agent SDK backend has been removed — `openai`-compatible
+  providers only.) Structured output is **hybrid**: native schema support first, falling back to
   prompt+validate+retry. Every call returns `LLMResult`; managed clients add per-activity cache,
   usage telemetry (`ai/usage.jsonl`), run budgets, timeout/retry and bounded concurrency. Provider,
   model, endpoint, enablement and output cap can be overridden for each of `wordlist`,
@@ -1282,7 +1282,8 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
   `_surface_request_set`/`_delta_request_set`). *Why no gf routing:* reconftw pipes `gf xss`/`gf sqli`
   (regex on the param NAME) into the tools — a guess that both misses (a SQLi on `category` isn't in the
   list) and wastes (an `id` that's safe), and operates on GET URLs only. Instead the ONLY filter is
-  `_has_params` and **each tool's own engine decides** (dalfox reflection+context · sqlmap `--smart`).
+  `_has_params` and **each tool's own engine decides** (dalfox reflection+context · sqlmap's DEFAULT
+  boolean/error/UNION/time engine — see the `--text-only` note below).
   *Why feed `raw` (not URL lists):* both ingest a Burp/ZAP raw request (dalfox `file --rawdata`, sqlmap
   `-r`), so every param location is tested (query/body/json/header/cookie) — the payoff of the
   full-request catalog; sqlmap's time-based detection catches the blind SQLi nuclei missed. *Why one
@@ -1294,8 +1295,13 @@ alternatives deliberately rejected — so they aren't re-litigated. Newest first
   `findings/{xss,sqli}{,_full}.jsonl`); `consolidate` folds surface+deep by type. *Rejected:* gf-pattern
   routing (the user explicitly called it "falsato"); evidence-based candidate selection (reflection for
   XSS, dynamism for SQLi) — deferred, the user chose "every parameterized request is a candidate" for now;
-  ghauri/crlfuzz (a later best-effort layer). *Open:* detection TUNING (sqlmap level/risk, ensuring the
-  real SQLi endpoints are in the candidate cap) — the integration is done; efficacy is the next lever.
+  ghauri/crlfuzz (a later best-effort layer); **sqlmap `--smart`** (its heuristic only fires on a
+  reflected DBMS error → skips an error-less boolean/UNION SQLi like ginandjuice `category`) **and
+  `--text-only`** (comparing visible text only defeats sqlmap's dynamic-content + false-positive checks
+  on a content-dynamic page → boolean-based-blind FPs; verified 2026-07-20 a non-injectable registration
+  form was flagged, its TRUE/FALSE responses byte-identical) — sqlmap's DEFAULT page-comparison both
+  DETECTS ginandjuice `category` AND REJECTS that FP (both verified). *Open:* detection TUNING (sqlmap
+  level/risk, ensuring the real SQLi endpoints are in the candidate cap) — integration done; the next lever.
 
 - **A param "found" on ~every tested endpoint is collapsed as a SITE-WIDE reflection, not sprayed.**
   Run-analysis traced the phase-4 `?category=`-on-everything spray to its source: `param_fuzz` reported
