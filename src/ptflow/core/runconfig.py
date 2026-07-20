@@ -28,7 +28,6 @@ _HTTP_HEADER_SEP = ";;"          # PTFLOW_HTTP_HEADER multi-value separator (env
 _TRUE = {"1", "on", "true", "yes"}
 _AI_PROVIDERS = (
     "ollama", "ollama-cloud", "openrouter", "huggingface", "openai-compatible", "openai",
-    "claude-code",
 )
 _AI_STAGE_NAMES = ("wordlist", "cve_poc", "secret_triage", "research", "triage", "report")
 _ENUMS = {

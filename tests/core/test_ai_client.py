@@ -100,14 +100,6 @@ def test_make_client_generic_provider_requires_base_url(monkeypatch):
     assert aic.make_client() is None
 
 
-def test_make_client_claude_code_remains_explicit_legacy_provider(monkeypatch):
-    pytest.importorskip("claude_agent_sdk")
-    monkeypatch.setenv("PTFLOW_AI", "on")
-    monkeypatch.setenv("PTFLOW_AI_PROVIDER", "claude-code")
-    monkeypatch.delenv("PTFLOW_AI_MODEL", raising=False)
-    assert isinstance(aic.make_client(), aic.ClaudeCodeClient)
-
-
 def test_make_client_unknown_provider(monkeypatch):
     monkeypatch.setenv("PTFLOW_AI", "on")
     monkeypatch.setenv("PTFLOW_AI_PROVIDER", "bogus")
@@ -239,55 +231,6 @@ def test_openai_complete_json_none_when_all_fail():
     assert result.error == "invalid_structured_output"
 
 
-class _CCBlock:
-    def __init__(self, text):
-        self.type = "text"
-        self.text = text
-
-
-class _CCMsg:
-    def __init__(self, blocks=None, structured_output=None):
-        self.content = blocks or []
-        if structured_output is not None:
-            self.structured_output = structured_output
-
-
-def _cc_query(messages):
-    async def _q(**_kwargs):
-        for m in messages:
-            yield m
-    return _q
-
-
-class _CCOptions:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-
-
-def test_claude_code_complete_text():
-    q = _cc_query([_CCMsg([_CCBlock("hello "), _CCBlock("world")])])
-    c = aic.ClaudeCodeClient(query=q, options_cls=_CCOptions)
-    assert c.complete_text("sys", "usr").value == "hello world"
-
-
-def test_claude_code_complete_json_native():
-    q = _cc_query([_CCMsg(structured_output={"value": "hi"})])
-    c = aic.ClaudeCodeClient(query=q, options_cls=_CCOptions)
-    out = c.complete_json("sys", "usr", _Out)
-    assert out.value is not None
-    assert out.value.value == "hi"
-
-
-def test_claude_code_complete_json_falls_back_to_prompt():
-    # no structured_output on the message → complete_json re-runs via complete_text (prompt fallback)
-    q = _cc_query([_CCMsg([_CCBlock('{"value": "fb"}')])])
-    c = aic.ClaudeCodeClient(query=q, options_cls=_CCOptions)
-    out = c.complete_json("sys", "usr", _Out)
-    assert out.value is not None
-    assert out.value.value == "fb"
-    assert out.structured_fallback is True
-
-
 def test_openai_forwards_explicit_bounded_generation_settings():
     captured = []
 
@@ -319,19 +262,6 @@ def test_openai_forwards_explicit_bounded_generation_settings():
     assert captured, "create was never called"
     assert [item["max_tokens"] for item in captured] == [123, 456]
     assert all(item["temperature"] == 0 for item in captured)
-
-
-def test_claude_code_options_disable_tools():
-    captured = {}
-
-    class _Opts:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    q = _cc_query([_CCMsg([_CCBlock("x")])])
-    aic.ClaudeCodeClient(query=q, options_cls=_Opts).complete_text("sys", "usr")
-    assert captured.get("tools") == []
-    assert captured.get("system_prompt") == "sys"
 
 
 class _StaticClient:

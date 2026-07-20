@@ -63,7 +63,7 @@ portscan_deadline_seconds = 900       # positive integer; common pre-cluster top
 # the engagement's data-handling rules. Ready-to-run presets: configs/ai/*.toml.
 [ai]
 enabled = false
-provider = "ollama"          # ollama | ollama-cloud | openrouter | huggingface | openai-compatible | claude-code
+provider = "ollama"          # ollama | ollama-cloud | openrouter | huggingface | openai-compatible
 model = "gpt-oss:20b"        # Must exist locally for Ollama; use the provider's model ID remotely.
 # base_url = "http://127.0.0.1:11434/v1" # Optional for named providers; required for openai-compatible.
 cache = true

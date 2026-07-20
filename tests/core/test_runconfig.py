@@ -217,7 +217,6 @@ def test_ai_provider_enum_accepts_new_values():
     from ptflow.core import runconfig
     providers = (
         "ollama", "ollama-cloud", "openrouter", "huggingface", "openai-compatible", "openai",
-        "claude-code",
     )
     for prov in providers:
         resolved = runconfig.resolve({"ai": {"provider": prov}}, {})

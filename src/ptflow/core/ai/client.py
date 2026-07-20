@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 from urllib.parse import urlparse
 
-import anyio
 from pydantic import BaseModel
 
 from ptflow.core.log import get_logger
@@ -276,96 +275,6 @@ class OpenAICompatibleClient:
                 return _result_from_response(response, parsed, self.name, self.model, started)
         except Exception:  # noqa: BLE001 - structured output is optional across providers
             log.debug("native response_format unavailable; using prompt fallback")
-        return _json_via_prompt(
-            lambda prompted_system, prompted_user: self.complete_text(
-                prompted_system, prompted_user, max_tokens=max_tokens,
-            ),
-            system,
-            user,
-            schema,
-        )
-
-
-def _cc_text(messages: list[object]) -> str:
-    parts: list[str] = []
-    for message in messages:
-        for block in getattr(message, "content", None) or []:
-            value = getattr(block, "text", None)
-            if value:
-                parts.append(value)
-    return "".join(parts)
-
-
-def _cc_structured(messages: list[object]) -> object | None:
-    for message in messages:
-        value = getattr(message, "structured_output", None)
-        if value is not None:
-            return value
-    return None
-
-
-class ClaudeCodeClient:
-    """Optional legacy Claude Agent SDK adapter, kept behind the ``ai-claude`` extra."""
-
-    name = "claude-code"
-    remote = True
-
-    def __init__(
-        self, model: str | None = None, *, query: Callable[..., Any] | None = None,
-        options_cls: Callable[..., Any] | None = None, timeout_seconds: float = 180,
-    ) -> None:
-        self.model = model
-        self._query = query
-        self._options_cls = options_cls
-        self._timeout_seconds = timeout_seconds
-
-    def _sdk(self) -> tuple[Callable[..., Any], Callable[..., Any]]:
-        if self._query is None or self._options_cls is None:
-            from claude_agent_sdk import ClaudeAgentOptions, query  # noqa: PLC0415
-
-            self._query = self._query or query
-            self._options_cls = self._options_cls or ClaudeAgentOptions
-        return self._query, self._options_cls
-
-    async def _arun(self, system: str, user: str, output_format: object | None = None) -> list[object]:
-        query, options_cls = self._sdk()
-        options: dict[str, Any] = {"system_prompt": system, "tools": []}
-        if self.model:
-            options["model"] = self.model
-        query_options: dict[str, Any] = {"prompt": user, "options": options_cls(**options)}
-        if output_format is not None:
-            query_options["output_format"] = output_format
-        with anyio.fail_after(self._timeout_seconds):
-            return [message async for message in query(**query_options)]
-
-    def complete_text(
-        self, system: str, user: str, *, max_tokens: int = 4096,  # noqa: ARG002
-    ) -> LLMResult[str]:
-        started = time.monotonic()
-        try:
-            value = _cc_text(anyio.run(self._arun, system, user)) or None
-            return LLMResult(
-                value=value, provider=self.name, model=self.model,
-                latency_ms=round((time.monotonic() - started) * 1000),
-            )
-        except Exception as exc:
-            log.exception("AI complete_text failed")
-            return _failure(self.name, self.model, type(exc).__name__, started)
-
-    def complete_json(
-        self, system: str, user: str, schema: type[P], *, max_tokens: int = 4096,
-    ) -> LLMResult[P]:
-        started = time.monotonic()
-        try:
-            output_format = {"type": "json_schema", "schema": schema.model_json_schema()}
-            structured = _cc_structured(anyio.run(self._arun, system, user, output_format))
-            if structured is not None:
-                return LLMResult(
-                    value=schema.model_validate(structured), provider=self.name, model=self.model,
-                    latency_ms=round((time.monotonic() - started) * 1000),
-                )
-        except Exception:  # noqa: BLE001 - structured output is optional in legacy provider
-            log.debug("native structured output unavailable; using prompt fallback")
         return _json_via_prompt(
             lambda prompted_system, prompted_user: self.complete_text(
                 prompted_system, prompted_user, max_tokens=max_tokens,
@@ -675,14 +584,7 @@ def make_client(  # noqa: PLR0911
     timeout = _float_env("PTFLOW_AI_TIMEOUT_SECONDS", 180, minimum=1)
     retries = _int_env("PTFLOW_AI_MAX_RETRIES", 2)
     client: LLMClient
-    if provider == "claude-code":
-        try:
-            import claude_agent_sdk  # noqa: F401, PLC0415
-        except ImportError:
-            log.warning("PTFLOW_AI_PROVIDER=claude-code requires ptflow[ai-claude] — AI disabled")
-            return None
-        client = ClaudeCodeClient(model=model, timeout_seconds=timeout)
-    elif provider in _OPENAI_COMPATIBLE_PROVIDERS:
+    if provider in _OPENAI_COMPATIBLE_PROVIDERS:
         if not model:
             log.warning("AI provider %s requires a model — stage %s disabled", provider, stage or "*")
             return None
@@ -709,7 +611,7 @@ def make_client(  # noqa: PLR0911
             max_retries=retries,
         )
     else:
-        expected = " | ".join((*sorted(_OPENAI_COMPATIBLE_PROVIDERS), "claude-code"))
+        expected = " | ".join(sorted(_OPENAI_COMPATIBLE_PROVIDERS))
         log.warning("PTFLOW_AI_PROVIDER=%s unsupported (expected %s) — AI disabled", provider, expected)
         return None
     return ManagedLLMClient(client, activity, stage) if activity is not None and stage else client

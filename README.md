@@ -242,7 +242,7 @@ can enable itself.
 | Variable | Values / default | What it does |
 |----------|------------------|--------------|
 | `PTFLOW_AI` | truthy to enable · default off | Enables contextual wordlists, policy-gated CVE PoC interpretation, source-grounded credential research, secret-lead triage, cross-finding hypotheses, and `reports/report-ai.md`. Credential research also runs in `internal`; it proposes candidates but never attempts login. |
-| `PTFLOW_AI_PROVIDER` | `ollama` (default, local) · `ollama-cloud` · `openrouter` · `huggingface` · `openai-compatible` · legacy `openai` / `claude-code` | Selects the runtime backend. Named providers supply their standard endpoint. |
+| `PTFLOW_AI_PROVIDER` | `ollama` (default, local) · `ollama-cloud` · `openrouter` · `huggingface` · `openai-compatible` · legacy `openai` | Selects the runtime backend. Named providers supply their standard endpoint. |
 | `PTFLOW_AI_MODEL` | required | Provider-specific model ID, kept explicit for reproducibility. |
 | `PTFLOW_AI_BASE_URL` | provider default | Overrides the endpoint; required for `openai-compatible`. |
 | `PTFLOW_AI_CACHE` | `on` | Reuses validated outputs from `<activity>/ai/cache/` for identical prompts/configuration. |

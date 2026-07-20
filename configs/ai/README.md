@@ -97,5 +97,6 @@ Set `ai.remote_secrets = "off"` to exclude those findings from remote prompts, o
 the rules of engagement explicitly allow it. Ollama Cloud uses `OLLAMA_API_KEY`; prefer local Ollama
 for data that must remain local.
 
-Claude Code is retained only as a legacy provider in the separate `ai-claude` extra. The post-merge
-documentation hook is independent of this runtime layer and still uses the `claude` CLI when present.
+The legacy Claude Agent SDK provider (`claude-code`) has been removed; the AI runtime layer is
+`openai`-compatible providers only. The post-merge documentation hook is a separate mechanism and
+still uses the `claude` CLI when present — unrelated to this runtime layer.
